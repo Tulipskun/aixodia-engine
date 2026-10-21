@@ -139,6 +139,7 @@ func runOnce(ctx context.Context, cfg Config) error {
 	}()
 
 	s := &session{cfg: cfg, c: c, terms: map[uint16]*termStream{}, uploads: map[string]*bytes.Buffer{}}
+	s.rtc = terminal.NewRTCServer(cfg.Term, func(raw []byte) error { return c.WriteMessage(wsock.OpText, raw) })
 	defer s.close()
 
 	pingCtx, stopPings := context.WithCancel(ctx)
@@ -174,6 +175,7 @@ type session struct {
 	chat    *pipeConn
 	terms   map[uint16]*termStream
 	uploads map[string]*bytes.Buffer
+	rtc     *terminal.RTCServer
 }
 
 func (s *session) close() {
@@ -185,7 +187,10 @@ func (s *session) close() {
 	}
 	s.terms = map[uint16]*termStream{}
 	s.chat = nil
+	rtc := s.rtc
+	s.rtc = nil
 	s.mu.Unlock()
+	if rtc != nil { rtc.Close() }
 	if chat != nil {
 		chat.Close()
 	}
@@ -265,6 +270,10 @@ func (s *session) text(payload []byte) error {
 		s.control(e)
 	case "term":
 		s.term(e)
+	case "rtc":
+		if s.rtc != nil {
+			if err := s.rtc.Handle(payload); err != nil { s.cfg.logf("relay: rejected rtc signaling: %v", err) }
+		}
 	case "rpc":
 		// Chunks arrive in order on one socket; buffering them here rather
 		// than in the goroutine keeps a later chunk from overtaking an earlier

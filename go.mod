@@ -3,6 +3,7 @@ module aixodia-engine
 go 1.26.0
 
 require (
+	github.com/pion/webrtc/v4 v4.0.13
 	golang.org/x/sys v0.48.0
 	modernc.org/sqlite v1.60.1
 )
