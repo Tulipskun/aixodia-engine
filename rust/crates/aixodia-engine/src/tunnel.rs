@@ -442,7 +442,11 @@ pub fn boot_time() -> i64 {
 /// shows off the boot time and keeps the process start for telling one engine from
 /// the next.
 pub fn version_string() -> String {
-    format!("{VERSION_TAG} started={} boot={}", started_at(), boot_time())
+    format!(
+        "{VERSION_TAG} started={} boot={}",
+        started_at(),
+        boot_time()
+    )
 }
 
 /// The current unix second.
@@ -509,7 +513,11 @@ mod tests {
     #[test]
     fn the_boot_time_is_the_machines_not_the_engines() {
         let Ok(raw) = std::fs::read_to_string("/proc/uptime") else {
-            assert_eq!(boot_time(), started_at(), "without a kernel clock the process start is the best answer");
+            assert_eq!(
+                boot_time(),
+                started_at(),
+                "without a kernel clock the process start is the best answer"
+            );
             return;
         };
         let uptime = raw
