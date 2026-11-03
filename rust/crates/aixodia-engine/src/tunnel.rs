@@ -415,10 +415,34 @@ pub fn set_started_at(started: i64) {
     STARTED_AT.store(started, Ordering::Relaxed);
 }
 
-/// The version column the daemon writes: the tag plus the unix second this
-/// process started, which the phone parses for uptime.
+/// When this machine started, in unix seconds, read off its own uptime clock.
+///
+/// The phone shows uptime from this, because the count a reader wants is the box's:
+/// a machine that has been up for nine days should say nine days after an engine
+/// update restarted the process an hour ago. Where there is no `/proc/uptime` the
+/// process start is the best answer left.
+pub fn boot_time() -> i64 {
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|raw| {
+            raw.split_whitespace()
+                .next()
+                .and_then(|head| head.parse::<f64>().ok())
+        })
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| seconds as i64);
+    match uptime {
+        Some(seconds) => now_unix() - seconds,
+        None => started_at(),
+    }
+}
+
+/// The version column the daemon writes: the tag, the unix second this process
+/// started, and the unix second the machine booted. The phone reads the uptime it
+/// shows off the boot time and keeps the process start for telling one engine from
+/// the next.
 pub fn version_string() -> String {
-    format!("{VERSION_TAG} started={}", started_at())
+    format!("{VERSION_TAG} started={} boot={}", started_at(), boot_time())
 }
 
 /// The current unix second.
@@ -479,6 +503,43 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
+
+    /// The clock the phone counts on is the machine's, not the process's: an
+    /// engine update restarts the process and must not restart the answer.
+    #[test]
+    fn the_boot_time_is_the_machines_not_the_engines() {
+        let Ok(raw) = std::fs::read_to_string("/proc/uptime") else {
+            assert_eq!(boot_time(), started_at(), "without a kernel clock the process start is the best answer");
+            return;
+        };
+        let uptime = raw
+            .split_whitespace()
+            .next()
+            .and_then(|head| head.parse::<f64>().ok())
+            .expect("kernel uptime") as i64;
+        let measured = now_unix() - boot_time();
+        assert!(
+            (measured - uptime).abs() <= 1,
+            "engine read {measured}, the kernel says {uptime}"
+        );
+    }
+
+    #[test]
+    fn the_version_column_carries_both_clocks() {
+        let version = version_string();
+        assert!(version.contains("started="), "{version}");
+        let boot = version
+            .split("boot=")
+            .nth(1)
+            .unwrap_or_default()
+            .parse::<i64>()
+            .expect("a boot time the phone can read");
+        assert!(boot > 0 && boot <= now_unix(), "{version}");
+        assert!(
+            version.find("started=").unwrap() < version.find("boot=").unwrap(),
+            "the reader that stops at the first number must still find the process start"
+        );
+    }
 
     /// Writes an executable stand-in for cloudflared. It logs to stderr, the
     /// stream cloudflared itself logs to, so the tests drive the real process
