@@ -1,0 +1,37 @@
+[package]
+name = "aixodia-io"
+description = "The HTTP/WS gateway: chat, sessions, providers, settings (port of io/gateway)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aixodia-backup = { path = "../aixodia-backup" }
+aixodia-config = { path = "../aixodia-config" }
+aixodia-db = { path = "../aixodia-db" }
+aixodia-goals = { path = "../aixodia-goals" }
+aixodia-imageprep = { path = "../aixodia-imageprep" }
+aixodia-provider = { path = "../aixodia-provider" }
+aixodia-session = { path = "../aixodia-session" }
+aixodia-tools = { path = "../aixodia-tools" }
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

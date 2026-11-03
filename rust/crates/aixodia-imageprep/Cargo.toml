@@ -1,0 +1,11 @@
+[package]
+name = "aixodia-imageprep"
+description = "Shrinks a picture to something a vision model can be sent (port of imageprep/)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }

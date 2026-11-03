@@ -1,0 +1,23 @@
+[package]
+name = "aixodia-backup"
+description = "Filesystem backup to a Hugging Face storage bucket: content-addressed objects, xet chunk dedup, parallel restore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+http.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zstd.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hf-xet = "1.8"
+xet-data = "1.8"
+xet-runtime = "1.8"

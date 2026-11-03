@@ -1,0 +1,21 @@
+[package]
+name = "aixodia-session"
+description = "D1-backed chat sessions, turns, display blocks and context window"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aixodia-db = { path = "../aixodia-db" }
+aixodia-provider = { path = "../aixodia-provider" }
+anyhow.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+unicode-general-category = "1"

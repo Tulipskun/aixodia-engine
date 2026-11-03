@@ -1,0 +1,20 @@
+[package]
+name = "aixodia-config"
+description = "Provider store over Workers KV (port of the Go config package)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aixodia-db = { path = "../aixodia-db" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+async-trait.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "aixodia-tools"
+description = "Builtin tools: declarations and execution (port of tools/)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aixodia-goals = { path = "../aixodia-goals" }
+aixodia-imageprep = { path = "../aixodia-imageprep" }
+aixodia-provider = { path = "../aixodia-provider" }
+anyhow.workspace = true
+base64.workspace = true
+chrono = "0.4"
+chrono-tz = "0.10"
+libc = "0.2"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["process", "time", "fs", "io-util", "rt"] }
+tracing.workspace = true
+url.workspace = true

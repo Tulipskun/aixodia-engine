@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aixodia-db",
+    "crates/aixodia-config",
+    "crates/aixodia-provider",
+    "crates/aixodia-session",
+    "crates/aixodia-imageprep",
+    "crates/aixodia-goals",
+    "crates/aixodia-tools",
+    "crates/aixodia-io",
+    "crates/aixodia-run",
+    "crates/aixodia-wsock",
+    "crates/aixodia-terminal",
+    "crates/aixodia-relay",
+    "crates/aixodia-mobile",
+    "crates/aixodia-selfupdate",
+    "crates/aixodia-backup",
+    "crates/aixodia-engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/Tulipskun/aixodia-engine"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "charset"] }
+async-trait = "0.1"
+url = "2"
+percent-encoding = "2"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+zstd = "0.14"
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+bytes = "1"
+http = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio-tungstenite = "0.24"
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif"] }
+chrono = "0.4"
+chrono-tz = "0.10"
+unicode-general-category = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"
