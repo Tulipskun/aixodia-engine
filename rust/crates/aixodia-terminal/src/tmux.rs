@@ -92,6 +92,66 @@ pub fn pane_pid(id: &str) -> Option<i32> {
     None
 }
 
+/// How far back a reattaching client is told to have seen, and the most bytes
+/// that answer is allowed to cost. tmux clamps a start line deeper than the
+/// pane's own history, so the number is a ceiling, not a promise.
+const HISTORY_LINES: usize = 2000;
+const HISTORY_BYTES: usize = 512 << 10;
+
+/// Everything the pane holds: its history, then its screen, with the colors the
+/// program last asked for.
+///
+/// The engine's ring only carries what this process has watched, so a tab that
+/// survived a restart reconnects to a pane thick with lines and an empty ring.
+/// tmux has them, and `capture-pane` is the only way to hand them over — which
+/// is also what makes a drag instant: the phone pans a scrollback it actually
+/// holds, and a pan is a repaint rather than a round trip to a server that
+/// repaints on its own clock.
+///
+/// The tail is what matters, so an oversized capture keeps the end of it. The
+/// cut lands on a line boundary: an escape sequence split in half would put the
+/// client's screen into a state no program asked for.
+pub fn capture_history(id: &str) -> Option<Vec<u8>> {
+    let start = format!("-{}", HISTORY_LINES);
+    let output = Command::new("tmux")
+        .args([
+            "-L",
+            TMUX_SOCKET,
+            "capture-pane",
+            "-p",
+            "-e",
+            "-S",
+            &start,
+            "-t",
+            &tmux_name(id),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut text = output.stdout;
+    if text.len() > HISTORY_BYTES {
+        let mut from = text.len() - HISTORY_BYTES;
+        while from < text.len() && text[from] != b'\n' {
+            from += 1;
+        }
+        if from < text.len() {
+            text = text.split_off(from + 1);
+        }
+    }
+    // A trailing newline would scroll the client's own screen up one line at the
+    // end of the replay, blanking the row the prompt is on.
+    while text.last() == Some(&b'\n') {
+        text.pop();
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// What the program in the pane last called itself (OSC 0/2). tmux keeps the
 /// title, so it survives a detached client, and `#{pane_title}` may carry the
 /// padding tmux adds up to `set-titles-string`'s width.
@@ -196,26 +256,26 @@ pub fn start(
     args.push(";".to_string());
     args.push("set-option".to_string());
     args.push("-t".to_string());
-    args.push(name.clone());
+    args.push(name);
     args.push("status".to_string());
     args.push("off".to_string());
-    // The phone's drag is a wheel, and only the mouse mode lets a pane's own
-    // history be read with it: the program inside repaints in place, so the
-    // lines above it are in tmux and nowhere else. Without this the wheel bytes
-    // reach the program, it has no use for them, and the reader cannot scroll.
-    args.push(";".to_string());
-    args.push("set-option".to_string());
-    args.push("-g".to_string());
-    args.push("mouse".to_string());
-    args.push("on".to_string());
     Pty::start("tmux", &args, cols, rows, dir)
 }
 
-/// Lets the wheel page a pane's history. Sessions outlive an engine restart, so
-/// a server this boot merely adopted may still have the mode off.
-pub fn enable_mouse() {
+/// Keeps tmux out of the phone's drags.
+///
+/// The mouse mode makes tmux announce mouse reporting to its client, so the
+/// phone's emulator sends every drag as wheel notches into copy-mode — and the
+/// pane's *state* moves instantly while its *paint* follows on tmux's own
+/// redraw clock, measured here at a fifth of a second for a burst and more than
+/// a second for a slow drag. The history belongs to the client instead, which
+/// `capture_history` hands over at attach so a drag pans a screen it holds.
+///
+/// This is a global option, and panes outlive an engine restart, so the server
+/// this boot merely adopted may still carry it on from a build that turned it on.
+pub fn disable_mouse() {
     let _ = Command::new("tmux")
-        .args(["-L", TMUX_SOCKET, "set-option", "-g", "mouse", "on"])
+        .args(["-L", TMUX_SOCKET, "set-option", "-g", "mouse", "off"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();

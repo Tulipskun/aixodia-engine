@@ -1,12 +1,13 @@
 GOAL:
-[COMPLETED] Stop an exclude rule from eating source (v1.170): `core.*` read like a core-dump rule and globed onto every `core.rs` in the tree, so no manifest ever named them and no restore could bring them back.
+[COMPLETED] Give a terminal client its pane's history (v1.171): the replay used to drop the ring under tmux, so the phone held no scrollback and a drag had to be paged through the multiplexer instead. `capture_history` now answers an attach with the pane's own history and screen.
 
 PLAN:
 (no active plan)
 
 ARCHIVE:
-v1.170 `DEFAULT_EXCLUDES` loses `core.*`; `sanitize_excludes` drops it from a stored scope on read, and the live scope really did carry it — 9 registry files (`tokio/…/task/core.rs`, both `miniz_oxide` cores, `serde_json/src/io/core.rs`, `cc/src/target/*`) were missing because nothing ever backed them up
-v1.169 `tmux::enable_mouse` at boot plus a chained `set -g mouse on` on session start; live probe: three wheel notches put the pane in copy-mode and showed lines 183-185 of 200
+v1.171 `tmux::capture_history` (capture-pane -p -e -S -2000, tail-trimmed) replays the pane's history at attach; `replay_frame` takes the history instead of dropping the ring; v1.169's `mouse on` reverted to `disable_mouse` at boot — mouse reporting made every drag a copy-mode round trip
+v1.170 `DEFAULT_EXCLUDES` loses `core.*`; `sanitize_excludes` drops it from a stored scope on read, and the live scope really did carry it — 9 registry files (`tokio/…/task/core.rs`, both `miniz_oxide` cores, `serde_json/src/io/core.rs`) were missing because nothing ever backed them up; `cc/src/target/*` was named in the same list and only came back in v1.171's registry sweep (8 files, 2 crates)
+v1.169 `tmux::enable_mouse` at boot plus a chained `set -g mouse on` on session start; superseded by v1.171 — the pane entered copy-mode on a wheel, and copy-mode paints on tmux's clock
 v1.168 `Config.includes` allowlist + `/api/backup/browse` + `/api/backup/preview`; live: preview 47,930 files = the run's 47,930, narrowed scope 328 = 328
 v1.167 auto-backup on CPU idle: poll /proc/stat, track streak, trigger via claim+spawn_job
 v1.166 packed shards: 39 zstd containers for the tree; cold restore 47.9s (18x), in-place over /root 34.6s 0 failed, warm backup 5.7s reusing 33/39
@@ -30,6 +31,8 @@ v1.148+ provider registry, tool rounds, keyless attempts, idle check, restart en
 earlier: gateway port from Go, session store, chat SSE, D1 history, mobile hub, terminal ws
 
 NOTE:
+- A multiplexer's copy-mode answers a wheel in *state* instantly and in *paint* on its own clock: measured here at 1253 ms median for one notch per 250 ms, 701 ms at /100 ms, 442 ms at /40 ms, 108 ms median (205 ms worst) for a 30-notch burst. Paging through the wire can never feel like a local drag, so the history is handed to the client instead.
+- `"target"` in `DEFAULT_EXCLUDES` is the same class of rule as `core.*` was: a plain name prunes any component named `target`, including a crate's own `src/target/`. The registry survives it only because the `.crate` tarballs are kept — repair is a per-crate diff of `registry/src/<name>` against the members of `registry/cache/<name>.crate`, writing the missing ones with the tarball's mode and mtime so cargo's fingerprints stay valid. No `rm -rf`, no rebuild.
 - An exclusion is a data-loss rule in disguise. A restore only ever adds and overwrites, so a file the scope hides does not come back as an error at restore time — it comes back later as a build that cannot compile.
 - A backup's minutes are spent reading the tree, not on the wire: 53.4 s idle for 4.6 GB was 37.9 s packing, 5.5 s uploading 517 MB (~94 MB/s), 6.8 s walking, 3.4 s publishing.
 - Backup slot is single: auto-backup cannot start during a manual run.

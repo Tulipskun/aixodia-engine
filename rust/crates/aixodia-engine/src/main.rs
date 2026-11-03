@@ -153,7 +153,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         aixodia_terminal::tmux_available() && std::env::var("AIXODIA_TMUX").as_deref() != Ok("0");
     if terminal_server.tmux {
         aixodia_terminal::tmux::hide_status_bars();
-        aixodia_terminal::tmux::enable_mouse();
+        aixodia_terminal::tmux::disable_mouse();
     }
     let terminal = Arc::new(terminal_server);
     terminal.set_logf(Arc::new(|message| {

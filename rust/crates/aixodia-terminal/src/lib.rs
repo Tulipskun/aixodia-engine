@@ -561,7 +561,15 @@ impl Server {
                 .replay();
             (ring, modes)
         };
-        let replay = replay_frame(self.tmux, &modes, &ring);
+        let replay = replay_frame(
+            if self.tmux {
+                tmux::capture_history(&id)
+            } else {
+                None
+            },
+            &modes,
+            &ring,
+        );
 
         let (mut reader, writer) = aixodia_wsock::ServerConn::new(stream).split();
         let ready = json!({
@@ -711,28 +719,35 @@ pub fn tmux_available() -> bool {
     tmux::available()
 }
 
-fn replay_frame(tmux: bool, modes: &[u8], ring: &[u8]) -> Vec<u8> {
-    let ring = if tmux {
-        Vec::new()
-    } else {
-        strip_queries(ring)
+/// The bytes that put a client's screen where the pane already is.
+///
+/// A tmux-backed pane speaks for itself: `capture_history` reads its history and
+/// its screen off the server, so the client gets lines the engine's ring never
+/// saw and the phone can page them without asking again. Anywhere else the ring
+/// is the only record, and it is replayed with the pane's queries stripped — an
+/// unanswered `DA`/`DSC` tail would have the client waiting on a device that is
+/// not there.
+fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8]) -> Vec<u8> {
+    let body = match history {
+        Some(pane) => pane,
+        None => strip_queries(ring),
     };
-    let mut out = Vec::with_capacity(RIS_RESET.len() + modes.len() + ring.len());
+    let mut out = Vec::with_capacity(RIS_RESET.len() + modes.len() + body.len());
     out.extend_from_slice(RIS_RESET);
     out.extend_from_slice(modes);
-    out.extend_from_slice(&ring);
+    out.extend_from_slice(&body);
     out
 }
 
 /// Whether a reattach must ask the client to paint the screen back.
 ///
-/// A size change is itself the signal — TIOCSWINSZ reaches the client as
-/// SIGWINCH and it redraws — and without tmux the ring replays the shell's tail
-/// instead. What is left is a same-size attach: under tmux the ring is dropped
-/// and the screen lives in the tmux server, which paints only when a SIGWINCH
-/// reaches its client. Without the kick a reconnected phone sat on a cleared
-/// grid until the keyboard changed the size. A plain shell needs it only on the
-/// alternate screen, where the program owns the whole grid.
+/// A size change is itself the signal: TIOCSWINSZ reached the client through the
+/// engine's pty and tmux redraws it. What is left is a same-size attach, where
+/// the replay above normally carries the whole screen already. It is still asked
+/// to paint because the capture can fail — and a pane this process merely
+/// adopted, with nothing in the ring either, would otherwise leave the phone
+/// sitting on a cleared grid until the keyboard changed the size. A plain shell
+/// needs the kick only on the alternate screen, where the program owns the grid.
 fn reattach_kick(tmux: bool, resized: bool, alt_screen: bool) -> bool {
     !resized && (tmux || alt_screen)
 }
@@ -860,7 +875,7 @@ async fn close(
 
 #[cfg(test)]
 mod tests {
-    use super::{reattach_kick, tmux};
+    use super::{reattach_kick, replay_frame, tmux};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -881,6 +896,57 @@ mod tests {
     #[test]
     fn a_plain_shell_reattaches_from_the_ring() {
         assert!(!reattach_kick(false, false, false));
+    }
+
+    #[test]
+    fn a_tmux_history_replaces_the_ring_it_never_watched() {
+        // The engine's ring is what this process saw; a pane that outlived a
+        // restart holds lines no ring does. Whichever the caller hands over wins,
+        // and the reset stays first so the client clears before it paints.
+        let replay = replay_frame(Some(b"old history".to_vec()), b"\x1b[?1h", b"ring tail");
+        assert_eq!(replay, b"\x1bc\x1b[?1hold history".to_vec());
+        let ring_only = replay_frame(None, b"\x1b[?1h", b"ring tail");
+        assert!(ring_only.ends_with(b"ring tail"));
+    }
+
+    /// Lines above the bottom of the screen only exist in the tmux server, so a
+    /// client that asks for the pane's history has to be answered from there. This
+    /// drives a real pane; skipped where tmux is not installed.
+    #[test]
+    fn a_pane_answers_with_its_history() {
+        if !tmux::available() {
+            return;
+        }
+        let id = format!("capturetest-{}", std::process::id());
+        let Ok(pty) = tmux::start(&id, "/bin/bash", 40, 12, Some("/tmp")) else {
+            return;
+        };
+        let _ = pty.write(b"for i in $(seq 1 200); do echo \"aa-$i\"; done\r");
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let history = loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let found = tmux::capture_history(&id).unwrap_or_default();
+            let text = String::from_utf8_lossy(&found).into_owned();
+            if text.contains("aa-200") {
+                break text;
+            }
+            if Instant::now() > deadline {
+                tmux::kill(&id);
+                panic!("the pane never printed its 200 lines");
+            }
+        };
+        tmux::kill(&id);
+        // Twelve rows of screen cannot hold two hundred lines, so the ones above
+        // it came from the history and the replay is the whole page.
+        let lines: Vec<&str> = history
+            .lines()
+            .map(|line| line.trim_end_matches('\r'))
+            .collect();
+        assert!(
+            lines.contains(&"aa-1"),
+            "the oldest line is missing: a client would page into nothing"
+        );
+        assert!(lines.contains(&"aa-200"), "the last line is missing");
     }
 
     #[test]
