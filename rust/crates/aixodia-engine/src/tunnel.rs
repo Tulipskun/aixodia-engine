@@ -467,7 +467,7 @@ pub struct HeartbeatDeps {
     /// Whether another process currently owns D1 discovery. This guards only
     /// publication; it must never cause the foreground engine to stop.
     pub newer: Box<dyn Fn(i64) -> BoxFuture<anyhow::Result<bool>> + Send + Sync>,
-    /// Refreshes `daemon/version` and `daemon/heartbeat`.
+    /// Publishes the current tunnel URL, version and heartbeat.
     pub publish: Box<dyn Fn(String, i64) -> BoxFuture<anyhow::Result<()>> + Send + Sync>,
     /// The current unix second.
     pub now: Box<dyn Fn() -> BoxFuture<i64> + Send + Sync>,
@@ -797,7 +797,7 @@ mod tests {
         let count = Arc::clone(&touched);
         let deps = HeartbeatDeps {
             newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(false) })),
-            touch: Box::new(move |_version: String, _at: i64| {
+            publish: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -820,7 +820,7 @@ mod tests {
             newer: Box::new(|_started: i64| {
                 Box::pin(async { Err::<bool, anyhow::Error>(anyhow::anyhow!("D1 unavailable")) })
             }),
-            touch: Box::new(move |_version: String, _at: i64| {
+            publish: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
                     count.fetch_add(1, Ordering::SeqCst);
@@ -841,7 +841,7 @@ mod tests {
         let count = Arc::clone(&touched);
         let deps = HeartbeatDeps {
             newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(true) })),
-            touch: Box::new(move |_version: String, _at: i64| {
+            publish: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
                     count.fetch_add(1, Ordering::SeqCst);
