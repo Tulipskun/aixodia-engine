@@ -490,7 +490,10 @@ pub async fn heartbeat_once(started: i64, alive: impl Fn() -> bool, deps: Heartb
             return;
         }
         Ok(false) => {}
-        Err(err) => tracing::warn!("heartbeat discovery guard: {err}"),
+        Err(err) => {
+            tracing::warn!("heartbeat discovery guard: {err}; skipping this discovery write");
+            return;
+        }
     }
     if let Err(err) = (deps.touch)(version_string(), (deps.now)().await).await {
         tracing::warn!("heartbeat: {err}");
@@ -807,6 +810,29 @@ mod tests {
 
         heartbeat_once(100, || true, deps).await;
         assert_eq!(touched.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_check_error_skips_heartbeat_write() {
+        let touched = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&touched);
+        let deps = HeartbeatDeps {
+            newer: Box::new(|_started: i64| {
+                Box::pin(async { Err::<bool, anyhow::Error>(anyhow::anyhow!("D1 unavailable")) })
+            }),
+            touch: Box::new(move |_version: String, _at: i64| {
+                let count = Arc::clone(&count);
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                })
+            }),
+            now: Box::new(|| Box::pin(async { 1_i64 })),
+            announce: None,
+        };
+
+        heartbeat_once(100, || true, deps).await;
+        assert_eq!(touched.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
