@@ -753,9 +753,8 @@ mod tests {
         );
     }
 
-    // The app reads a fresh daemon/heartbeat as "online". While the tunnel is
-    // down the heartbeat must not be refreshed, or the phone adopts a URL that
-    // is dead.
+    // The app reads a fresh service heartbeat as "online". While the tunnel is
+    // down the heartbeat must not be refreshed, or the phone adopts a dead URL.
     #[tokio::test]
     async fn heartbeat_skips_the_write_while_the_tunnel_is_down() {
         let touched = Arc::new(AtomicUsize::new(0));
@@ -772,10 +771,7 @@ mod tests {
             announce: None,
         };
 
-        assert!(
-            { heartbeat_once(|| false, deps).await; true },
-            "a dead tunnel must not stop the engine"
-        );
+        heartbeat_once(|| false, deps).await;
         assert_eq!(touched.load(Ordering::SeqCst), 0);
     }
 
@@ -795,10 +791,7 @@ mod tests {
             announce: None,
         };
 
-        assert!(
-            { heartbeat_once(|| true, deps).await; true },
-            "a live tunnel keeps the heartbeat running"
-        );
+        heartbeat_once(|| true, deps).await;
         assert_eq!(touched.load(Ordering::SeqCst), 1);
     }
 
