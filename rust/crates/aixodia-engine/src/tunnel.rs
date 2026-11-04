@@ -221,8 +221,7 @@ pub async fn start_cloudflared(cancel: CancellationToken, path: &Path) -> anyhow
     })
 }
 
-/// The name the keeper records its cloudflared pid under, beside the launcher's
-/// `aixodia.pid`.
+/// The name the keeper records its cloudflared child pid under in engine state.
 pub const PIDFILE: &str = "cloudflared.pid";
 
 /// Whether `pid` is a running cloudflared quick tunnel. A zombie has an empty
