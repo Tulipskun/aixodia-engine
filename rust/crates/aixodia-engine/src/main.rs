@@ -603,7 +603,8 @@ fn spawn_heartbeat(
     tokio::spawn(async move {
         loop {
             let newer_db = db.clone();
-            let touch_db = db.clone();
+            let publish_db = db.clone();
+            let publish_keeper = keeper.clone();
             let announce_hub = hub.clone();
             let announce_keeper = keeper.clone();
             let announce = Arc::new(move |version: String, beat: i64| {
@@ -620,10 +621,11 @@ fn spawn_heartbeat(
                     let db = newer_db.clone();
                     Box::pin(async move { newer_daemon_running(&db, started).await })
                 }),
-                touch: Box::new(move |version, beat| {
-                    let db = touch_db.clone();
+                publish: Box::new(move |version, beat| {
+                    let db = publish_db.clone();
+                    let url = publish_keeper.url();
                     Box::pin(async move {
-                        db.touch_daemon(&version, beat)
+                        db.save_daemon(&url, &version, beat)
                             .await
                             .map_err(|err| anyhow::anyhow!(err.to_string()))
                     })
