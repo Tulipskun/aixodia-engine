@@ -468,7 +468,7 @@ pub struct HeartbeatDeps {
     /// publication; it must never cause the foreground engine to stop.
     pub newer: Box<dyn Fn(i64) -> BoxFuture<anyhow::Result<bool>> + Send + Sync>,
     /// Refreshes `daemon/version` and `daemon/heartbeat`.
-    pub touch: Box<dyn Fn(String, i64) -> BoxFuture<anyhow::Result<()>> + Send + Sync>,
+    pub publish: Box<dyn Fn(String, i64) -> BoxFuture<anyhow::Result<()>> + Send + Sync>,
     /// The current unix second.
     pub now: Box<dyn Fn() -> BoxFuture<i64> + Send + Sync>,
     /// Pushes service state to phones after a heartbeat lands.
@@ -495,7 +495,7 @@ pub async fn heartbeat_once(started: i64, alive: impl Fn() -> bool, deps: Heartb
             return;
         }
     }
-    if let Err(err) = (deps.touch)(version_string(), (deps.now)().await).await {
+    if let Err(err) = (deps.publish)(version_string(), (deps.now)().await).await {
         tracing::warn!("heartbeat: {err}");
     } else if let Some(announce) = &deps.announce {
         announce(version_string(), (deps.now)().await);
@@ -776,7 +776,7 @@ mod tests {
         let count = Arc::clone(&touched);
         let deps = HeartbeatDeps {
             newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(false) })),
-            touch: Box::new(move |_version: String, _at: i64| {
+            publish: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
                     count.fetch_add(1, Ordering::SeqCst);
