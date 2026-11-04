@@ -27,6 +27,7 @@ aixodia
 it, and gives the prompt back.
 
 ```bash
+aixodia-engine --foreground  # run attached to this terminal (also works in notebooks)
 aixodia status      # up? at which url
 aixodia logs        # tail the engine log
 aixodia stop        # shut it down
@@ -50,7 +51,15 @@ and their API keys are in Workers KV.
 
 ## Configuration
 
-Only `CF_TOKEN` is required. No other environment variables are used.
+Only `CF_TOKEN` is required.
+
+For Kaggle, Colab, or another supervisor-managed environment, run the binary
+directly with `aixodia-engine --foreground`. This mode stays attached to the
+current process, prints logs to stdout/stderr, ignores the D1 newer-daemon guard
+(so it does not exit successfully just because another instance recently
+announced itself), and disables automatic self-update. Stop it with SIGINT or
+SIGTERM. The normal `aixodia` launcher continues to manage the background
+daemon as before.
 
 
 Chat history, settings, run logs and the note a session leaves for the one that
