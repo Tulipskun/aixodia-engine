@@ -620,9 +620,8 @@ fn spawn_heartbeat(
     });
 }
 
-/// The state directory, the same one the launcher keeps `aixodia.pid` in. The
-/// keeper's `cloudflared.pid` belongs beside it: after an `execve` handover the
-/// new image is where a stale tunnel gets reaped.
+/// The engine's local state directory. The keeper records only its child
+/// cloudflared pid here so an in-place executable update can reap an old tunnel.
 fn home_dir() -> std::path::PathBuf {
     match std::env::var_os("AIXODIA_HOME").filter(|home| !home.is_empty()) {
         Some(home) => std::path::PathBuf::from(home),
@@ -634,14 +633,7 @@ fn home_dir() -> std::path::PathBuf {
 }
 
 fn upload_dir() -> String {
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => std::path::PathBuf::from(home)
-            .join(".aixodia")
-            .join("uploads")
-            .to_string_lossy()
-            .into_owned(),
-        _ => "./uploads".to_string(),
-    }
+    home_dir().join("uploads").to_string_lossy().into_owned()
 }
 
 fn which(name: &str) -> Option<std::path::PathBuf> {
