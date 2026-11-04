@@ -462,44 +462,29 @@ pub fn now_unix() -> i64 {
 /// The boxed future the heartbeat's injected calls return.
 pub type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
-/// The daemon-key calls a heartbeat makes. They are a struct so a test can watch
-/// the write without D1.
+/// The service-key calls a heartbeat makes. They are a struct so a test can
+/// watch the write without D1.
 pub struct HeartbeatDeps {
-    /// Whether another engine started after this one.
-    pub newer: Box<dyn Fn(i64) -> BoxFuture<anyhow::Result<bool>> + Send + Sync>,
     /// Refreshes `daemon/version` and `daemon/heartbeat`.
     pub touch: Box<dyn Fn(String, i64) -> BoxFuture<anyhow::Result<()>> + Send + Sync>,
     /// The current unix second.
     pub now: Box<dyn Fn() -> BoxFuture<i64> + Send + Sync>,
-    /// Pushes the daemon state to the phones after a heartbeat beat lands, so
-    /// discovery moves from reading the D1 row to listening for the daemon
-    /// instead of polling.
+    /// Pushes service state to phones after a heartbeat lands.
     pub announce: Option<Box<dyn Fn(String, i64) + Send + Sync>>,
 }
 
-/// Performs one heartbeat and reports whether this engine should keep running.
-/// While the tunnel is down it stops refreshing `daemon/heartbeat`: the app
-/// reads a fresh heartbeat as "online", so touching it with a dead tunnel is
-/// exactly what makes the phone adopt a URL it cannot dial.
-pub async fn heartbeat_once(started: i64, alive: impl Fn() -> bool, deps: HeartbeatDeps) -> bool {
+/// Performs one heartbeat. A tunnel outage pauses publication but never stops
+/// the foreground engine process.
+pub async fn heartbeat_once(alive: impl Fn() -> bool, deps: HeartbeatDeps) {
     if !alive() {
-        tracing::info!("heartbeat: relay is down; not refreshing the daemon keys");
-        return true;
-    }
-    match (deps.newer)(started).await {
-        Ok(true) => {
-            tracing::info!("heartbeat: a newer aixodia-engine took over; stopping");
-            return false;
-        }
-        Ok(false) => {}
-        Err(err) => tracing::warn!("heartbeat guard: {err}"),
+        tracing::info!("heartbeat: relay is down; not refreshing the service keys");
+        return;
     }
     if let Err(err) = (deps.touch)(version_string(), (deps.now)().await).await {
         tracing::warn!("heartbeat: {err}");
     } else if let Some(announce) = &deps.announce {
         announce(version_string(), (deps.now)().await);
     }
-    true
 }
 
 #[cfg(test)]
@@ -776,7 +761,6 @@ mod tests {
         let touched = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&touched);
         let deps = HeartbeatDeps {
-            newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(false) })),
             touch: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
@@ -789,7 +773,7 @@ mod tests {
         };
 
         assert!(
-            heartbeat_once(100, || false, deps).await,
+            { heartbeat_once(|| false, deps).await; true },
             "a dead tunnel must not stop the engine"
         );
         assert_eq!(touched.load(Ordering::SeqCst), 0);
@@ -800,7 +784,6 @@ mod tests {
         let touched = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&touched);
         let deps = HeartbeatDeps {
-            newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(false) })),
             touch: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
@@ -813,26 +796,10 @@ mod tests {
         };
 
         assert!(
-            heartbeat_once(100, || true, deps).await,
+            { heartbeat_once(|| true, deps).await; true },
             "a live tunnel keeps the heartbeat running"
         );
         assert_eq!(touched.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn heartbeat_stops_when_a_newer_engine_took_over() {
-        let deps = HeartbeatDeps {
-            newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(true) })),
-            touch: Box::new(|_version: String, _at: i64| {
-                Box::pin(async { Ok::<(), anyhow::Error>(()) })
-            }),
-            now: Box::new(|| Box::pin(async { 1_i64 })),
-            announce: None,
-        };
-
-        assert!(
-            !heartbeat_once(100, || true, deps).await,
-            "a newer engine must stop this one"
-        );
-    }
 }
