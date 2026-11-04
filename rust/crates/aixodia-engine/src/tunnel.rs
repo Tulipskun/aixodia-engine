@@ -464,6 +464,9 @@ pub type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 /// The service-key calls a heartbeat makes. They are a struct so a test can
 /// watch the write without D1.
 pub struct HeartbeatDeps {
+    /// Whether another process currently owns D1 discovery. This guards only
+    /// publication; it must never cause the foreground engine to stop.
+    pub newer: Box<dyn Fn(i64) -> BoxFuture<anyhow::Result<bool>> + Send + Sync>,
     /// Refreshes `daemon/version` and `daemon/heartbeat`.
     pub touch: Box<dyn Fn(String, i64) -> BoxFuture<anyhow::Result<()>> + Send + Sync>,
     /// The current unix second.
@@ -472,12 +475,22 @@ pub struct HeartbeatDeps {
     pub announce: Option<Box<dyn Fn(String, i64) + Send + Sync>>,
 }
 
-/// Performs one heartbeat. A tunnel outage pauses publication but never stops
-/// the foreground engine process.
-pub async fn heartbeat_once(alive: impl Fn() -> bool, deps: HeartbeatDeps) {
+/// Performs one heartbeat. A tunnel outage or newer discovery owner pauses
+/// publication but never stops the foreground engine process.
+pub async fn heartbeat_once(started: i64, alive: impl Fn() -> bool, deps: HeartbeatDeps) {
     if !alive() {
         tracing::info!("heartbeat: relay is down; not refreshing the service keys");
         return;
+    }
+    match (deps.newer)(started).await {
+        Ok(true) => {
+            tracing::info!(
+                "heartbeat: a newer engine owns discovery; keeping this foreground process running"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(err) => tracing::warn!("heartbeat discovery guard: {err}"),
     }
     if let Err(err) = (deps.touch)(version_string(), (deps.now)().await).await {
         tracing::warn!("heartbeat: {err}");
@@ -759,6 +772,7 @@ mod tests {
         let touched = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&touched);
         let deps = HeartbeatDeps {
+            newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(false) })),
             touch: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
@@ -770,7 +784,7 @@ mod tests {
             announce: None,
         };
 
-        heartbeat_once(|| false, deps).await;
+        heartbeat_once(100, || false, deps).await;
         assert_eq!(touched.load(Ordering::SeqCst), 0);
     }
 
@@ -779,6 +793,7 @@ mod tests {
         let touched = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&touched);
         let deps = HeartbeatDeps {
+            newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(false) })),
             touch: Box::new(move |_version: String, _at: i64| {
                 let count = Arc::clone(&count);
                 Box::pin(async move {
@@ -790,7 +805,30 @@ mod tests {
             announce: None,
         };
 
-        heartbeat_once(|| true, deps).await;
+        heartbeat_once(100, || true, deps).await;
         assert_eq!(touched.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn newer_discovery_owner_suppresses_heartbeat_without_stopping_engine() {
+        let touched = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&touched);
+        let deps = HeartbeatDeps {
+            newer: Box::new(|_started: i64| Box::pin(async { Ok::<bool, anyhow::Error>(true) })),
+            touch: Box::new(move |_version: String, _at: i64| {
+                let count = Arc::clone(&count);
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                })
+            }),
+            now: Box::new(|| Box::pin(async { 1_i64 })),
+            announce: None,
+        };
+
+        // This returns normally without touching D1. The caller's process loop
+        // remains alive; only the stale instance's discovery write is skipped.
+        heartbeat_once(100, || true, deps).await;
+        assert_eq!(touched.load(Ordering::SeqCst), 0);
     }
 }
