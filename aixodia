@@ -1,299 +1,130 @@
 #!/usr/bin/env bash
-# aixodia — the AIxodia engine: a background process on 127.0.0.1:8787 behind a
-# Cloudflare quick tunnel. `aixodia` alone answers what is installed and how to
-# drive it; it never starts anything on its own.
-#
-# Only one secret is needed: CF_TOKEN, which the engine uses to publish its
-# tunnel URL and chat history to D1 so the phone can find it.
-#
-#   export CF_TOKEN=xxxxx
-#   aixodia             # version and usage
-#   aixodia start        # start in the background and print the log; Ctrl-C leaves it running
-#   aixodia status       # is it up, and at which url
-#   aixodia logs         # tail the engine log
-#   aixodia stop         # shut it down
-#   aixodia update       # install the published build and restart into it
-set -uo pipefail
+# AIxodia foreground launcher.
+# "start" replaces this shell with aixodia-engine; output remains attached to
+# the caller (Kaggle, Colab, terminal, or a process supervisor).
+set -euo pipefail
 
 AIXODIA_HOME="${AIXODIA_HOME:-$HOME/.aixodia}"
-PID_FILE="$AIXODIA_HOME/aixodia.pid"
-LOG_FILE="$AIXODIA_HOME/aixodia.log"
 ENGINE_BIN="${AIXODIA_ENGINE_BIN:-aixodia-engine}"
-TUNNEL_WAIT="${AIXODIA_TUNNEL_WAIT:-${AIXODIA_RELAY_WAIT:-90}}"
+LOCAL_URL="${AIXODIA_LOCAL_URL:-http://127.0.0.1:8787}"
 
-die() { echo "aixodia: $*" >&2; exit 1; }
-
-# running_pid prints the live pid and succeeds only if the pidfile names a
-# process that is still alive.
-running_pid() {
-  [ -f "$PID_FILE" ] || return 1
-  local pid
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  printf '%s' "$pid"
+die() {
+  echo "aixodia: $*" >&2
+  exit 1
 }
 
-# The engine starts cloudflared itself and logs the hostname once the tunnel
-# has registered with the edge, so the URL read here is one that resolves.
-tunnel_url() {
-  [ -f "$LOG_FILE" ] || return 1
-  grep -Eo 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' "$LOG_FILE" | tail -1
+engine_path() {
+  command -v "$ENGINE_BIN" 2>/dev/null || die "engine binary '$ENGINE_BIN' not found — reinstall with the install script"
 }
 
-# follow_log keeps the terminal reading the engine instead of handing the prompt
-# back. The engine is nohup'd and detached from this shell, so stopping the
-# follow with Ctrl-C stops the reading, not the engine. Only a real terminal
-# follows: a script or CI job that runs `aixodia start` gets its prompt back,
-# which is what it needs to reach `stop` next.
-follow_log() {
-  [ -t 1 ] || return 0
-  echo "aixodia: following the log — Ctrl-C leaves the engine running"
-  tail -n +1 -f "$LOG_FILE" 2>/dev/null || true
+healthz() {
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  curl -fsS --max-time 5 "$LOCAL_URL/healthz" 2>/dev/null
+}
+
+health_pid() {
+  printf '%s\n' "$1" |
+    sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+
+is_engine_pid() {
+  local pid="$1" exe
+  [ "$pid" -gt 1 ] 2>/dev/null || return 1
+  [ -r "/proc/$pid/exe" ] || return 1
+  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  case "${exe##*/}" in
+    aixodia-engine|aixodia-engine\ \(deleted\)) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 cmd_start() {
-  # `nofollow` is for a start that is a step of something else — the update
-  # restart — where the caller still has work to report.
-  local follow="${1:-follow}"
-  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set — run: export CF_TOKEN=xxxxx"
-
-  local pid
-  if pid="$(running_pid)"; then
-    echo "aixodia: already running (pid $pid, url $(tunnel_url 2>/dev/null || echo unknown))"
-    [ "$follow" = "follow" ] && follow_log
-    return 0
-  fi
-
+  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
   local resolved
-  resolved="$(command -v "$ENGINE_BIN" 2>/dev/null || true)"
-  [ -n "$resolved" ] || die "engine binary '$ENGINE_BIN' not found — reinstall with the install script"
+  resolved="$(engine_path)"
   command -v cloudflared >/dev/null 2>&1 || die "cloudflared not found in PATH — reinstall with the install script"
 
   mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
-  # A fresh log per start so the url read below cannot be a stale one.
-  : > "$LOG_FILE"
-
-  # The engine picks the database itself: ~/.aixodia/aixodia.db, the store's
-  # own directory, and ./aixodia.db when there is no home directory, which is
-  # this directory because the engine starts here.
+  export AIXODIA_HOME
   cd "$AIXODIA_HOME" || die "cannot enter $AIXODIA_HOME"
-  nohup "$resolved" >>"$LOG_FILE" 2>&1 &
-  pid=$!
-  echo "$pid" > "$PID_FILE"
 
-  local waited=0 url
-  while [ "$waited" -lt "$TUNNEL_WAIT" ]; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      echo "aixodia: engine exited during startup — last log lines:" >&2
-      tail -n 15 "$LOG_FILE" >&2
-      rm -f "$PID_FILE"
-      return 1
-    fi
-    url="$(tunnel_url || true)"
-    if [ -n "$url" ]; then
-      echo "aixodia: running (pid $pid)"
-      echo "aixodia: url $url"
-      echo "aixodia: log $LOG_FILE"
-      if [ "$follow" = "follow" ]; then follow_log; fi
-      return 0
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-
-  echo "aixodia: no tunnel url after ${TUNNEL_WAIT}s — engine still starting (pid $pid)" >&2
-  if [ "$follow" = "follow" ]; then
-    follow_log
-  else
-    echo "aixodia: follow it with: aixodia logs" >&2
-  fi
-  return 1
-}
-
-cmd_stop() {
-  local pid
-  if ! pid="$(running_pid)"; then
-    rm -f "$PID_FILE"
-    echo "aixodia: not running"
-    return 1
-  fi
-  kill "$pid" 2>/dev/null
-  local i
-  for i in $(seq 1 20); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.25
-  done
-  if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null; fi
-  rm -f "$PID_FILE"
-  echo "aixodia: stopped (pid $pid)"
+  echo "aixodia: starting in foreground; Ctrl-C stops the engine"
+  echo "aixodia: state $AIXODIA_HOME"
+  exec "$resolved"
 }
 
 cmd_status() {
-  local pid
-  if pid="$(running_pid)"; then
-    echo "aixodia: running (pid $pid, url $(tunnel_url 2>/dev/null || echo unknown))"
-    return 0
-  fi
-  echo "aixodia: not running"
-  return 1
+  local body
+  body="$(healthz)" || die "engine is not running"
+  printf '%s\n' "$body"
 }
 
-# healthz prints the engine's own /healthz body. AIXODIA_LOCAL_URL names the
-# address to ask; it defaults to the one the engine serves.
-healthz() {
-  command -v curl >/dev/null 2>&1 || return 1
-  curl -fsS --max-time 5 "${AIXODIA_LOCAL_URL:-http://127.0.0.1:8787}/healthz" 2>/dev/null
-}
-
-# update_pid prints the pid of the engine that answers /healthz, but only when
-# that engine (a) advertises the in-place update handshake and (b) is the one the
-# pidfile names. A build that predates the handshake does not handle SIGUSR1 at
-# all, so signalling it would kill it — the read is what makes the signal safe;
-# and a pidfile that disagrees with the server means we do not know which
-# process to touch, so neither is signalled.
-#
-# The patterns allow whitespace around the JSON colon: the engine writes compact
-# JSON today, but a launcher must not mistake a reformatted body for an engine
-# too old to signal.
-update_pid() {
-  local body live pid
-  body="$(healthz)" || return 1
-  case "$body" in
-    *'"update"'*'signal:USR1'*) ;;
-    *) return 1 ;;
-  esac
-  live="$(printf '%s' "$body" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
-  pid="$(running_pid)" || return 1
-  [ -n "$live" ] && [ "$live" = "$pid" ] || return 1
-  printf '%s' "$live"
-}
-
-# update_busy succeeds when the engine reports a chat in flight. The update then
-# waits for the turn instead of cutting it short.
-update_busy() {
-  case "$(healthz 2>/dev/null)" in
-    *'"idle"'*'false'*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# cmd_update installs the published build. When an engine that speaks the
-# handshake is running, it is asked to swap itself: same pid, same arguments,
-# same session — the deploy no longer stops and starts the daemon. A build that
-# predates the handshake keeps the old stop-and-start, which is why the fallback
-# stays.
-cmd_update() {
-  local resolved
-  resolved="$(command -v "$ENGINE_BIN" 2>/dev/null || true)"
-  [ -n "$resolved" ] || die "engine binary '$ENGINE_BIN' not found — reinstall with the install script"
-
-  local live
-  if live="$(update_pid)"; then
-    if update_busy; then
-      echo "aixodia: a chat is in flight; the engine applies the build when the turn ends"
-    fi
-    echo "aixodia: asking the running engine (pid $live) to update in place"
-    # Everything the engine logs after this offset is the answer: it either
-    # reports the published build already in place, or the new build announces
-    # itself with "engine started" after taking the pid over.
-    local mark waited tail_text
-    mark="$(wc -c <"$LOG_FILE" 2>/dev/null || echo 0)"
-    kill -"${AIXODIA_UPDATE_SIGNAL:-USR1}" "$live" 2>/dev/null || die "cannot signal pid $live"
-    waited=0
-    while [ "$waited" -lt "${AIXODIA_UPDATE_WAIT:-180}" ]; do
-      tail_text="$(tail -c +"$((mark + 1))" "$LOG_FILE" 2>/dev/null || true)"
-      case "$tail_text" in
-        *"already the published build"*)
-          echo "aixodia: already the published build (pid $live)"
-          return 0
-          ;;
-        *"engine started"*)
-          echo "aixodia: updated in place (pid $live)"
-          echo "aixodia: url $(tunnel_url 2>/dev/null || echo unknown)"
-          return 0
-          ;;
-      esac
-      kill -0 "$live" 2>/dev/null || die "pid $live exited while updating — last log lines:
-$(tail -n 15 "$LOG_FILE")"
-      sleep 1
-      waited=$((waited + 1))
-    done
-    echo "aixodia: no answer from pid $live after ${AIXODIA_UPDATE_WAIT:-180}s — follow it with: aixodia logs" >&2
-    return 1
-  fi
-
-  local pid
-  if ! pid="$(running_pid)"; then
-    "$resolved" update || return 1
-    echo "aixodia: the next start uses the new build"
-    return 0
-  fi
-
-  echo "aixodia: pid $pid does not answer the update handshake — restarting is the only way" >&2
-  "$resolved" update || return 1
-  if [ -z "${CF_TOKEN:-}" ]; then
-    echo "aixodia: installed, but the engine (pid $pid) still runs the old build" >&2
-    echo "aixodia: export CF_TOKEN and run: aixodia stop; aixodia" >&2
-    return 1
-  fi
-  echo "aixodia: restarting (pid $pid) so it runs the new build — this ends the attached session" >&2
-  cmd_stop
-  cmd_start nofollow
+cmd_stop() {
+  local body pid
+  body="$(healthz)" || die "engine is not running"
+  pid="$(health_pid "$body")"
+  [ -n "$pid" ] || die "healthz did not return an engine pid"
+  is_engine_pid "$pid" || die "pid $pid is not the aixodia-engine executable"
+  kill -TERM "$pid" || die "cannot send SIGTERM to pid $pid"
+  echo "aixodia: SIGTERM sent to foreground engine (pid $pid)"
+  echo "aixodia: the attached terminal or notebook owns the process output"
 }
 
 cmd_logs() {
-  if [ -f "$LOG_FILE" ]; then tail -n "${1:-40}" "$LOG_FILE"; else echo "aixodia: no log yet"; fi
+  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
+  local limit="${1:-40}"
+  case "$limit" in
+    ''|*[!0-9]*) die "log limit must be an integer from 1 to 2000" ;;
+  esac
+  [ "$limit" -ge 1 ] && [ "$limit" -le 2000 ] || die "log limit must be from 1 to 2000"
+  curl -fsS --max-time 10 \
+    -H "Authorization: Bearer $CF_TOKEN" \
+    "$LOCAL_URL/api/logs?limit=$limit"
+}
+
+cmd_update() {
+  local resolved body pid
+  resolved="$(engine_path)"
+  if body="$(healthz 2>/dev/null)"; then
+    pid="$(health_pid "$body")"
+    [ -n "$pid" ] || die "healthz did not return an engine pid"
+    is_engine_pid "$pid" || die "pid $pid is not the aixodia-engine executable"
+    case "$body" in
+      *'"update"'*'signal:USR1'*) ;;
+      *) die "the running engine does not support in-place updates; stop it with Ctrl-C and run aixodia update again" ;;
+    esac
+    kill -USR1 "$pid" || die "cannot request update from pid $pid"
+    echo "aixodia: update requested from foreground engine (pid $pid)"
+    echo "aixodia: update output remains in the engine's attached terminal"
+    return 0
+  fi
+
+  "$resolved" update
 }
 
 usage() {
   cat <<'USAGE'
 usage: aixodia <command>
 
-  start      start the engine in the background, then print its log
-             (Ctrl-C stops the reading; the engine keeps running)
-  stop       shut the engine down
-  status     whether it is up, and at which url
-  logs [n]   the last n lines of the engine log (default 40)
-  update     install the published build and restart into it
+  start       run the engine in the foreground; Ctrl-C stops it
+  status      print the running engine's health
+  logs [n]    print the latest n engine log entries (default 40)
+  stop        send SIGTERM to the running engine
+  update      update the running engine in place, or install when stopped
 
 CF_TOKEN must be set before start.
 USAGE
 }
 
-# engine_version prints what the running engine calls itself. That is the only
-# version the launcher can know: the binary it starts takes no --version, and a
-# guess printed in its place would be a lie about what is installed.
-engine_version() {
-  local body
-  body="$(healthz)" || return 1
-  printf '%s' "$body" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
-}
-
-# The bare command answers the two questions a person at a prompt have: what is
-# here, and what can I ask it to do.
-cmd_show() {
-  local version
-  version="$(engine_version 2>/dev/null || true)"
-  if [ -n "$version" ]; then
-    echo "aixodia $version"
-  else
-    echo "aixodia: engine not running, so no version to report"
-  fi
-  echo
-  usage
-}
-
 case "${1:-}" in
-  ""|help|-h|--help) cmd_show ;;
-  start|up) cmd_start ;;
-  stop) cmd_stop ;;
+  start|run|up) cmd_start ;;
   status) cmd_status ;;
   logs) cmd_logs "${2:-40}" ;;
+  stop) cmd_stop ;;
   update) cmd_update ;;
+  ''|help|-h|--help) usage ;;
   *)
     echo "aixodia: unknown command '$1'" >&2
-    echo >&2
     usage >&2
     exit 2
     ;;
