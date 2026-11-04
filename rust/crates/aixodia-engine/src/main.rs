@@ -49,6 +49,7 @@ fn main() {
 }
 
 async fn async_main() {
+    let foreground = std::env::args().any(|arg| arg == "--foreground");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -106,12 +107,16 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     d1log::info("engine started");
     tracing::info!("engine started");
 
-    if newer_daemon_running(&db, tunnel::started_at())
-        .await
-        .unwrap_or(false)
+    if !foreground
+        && newer_daemon_running(&db, tunnel::started_at())
+            .await
+            .unwrap_or(false)
     {
         tracing::info!("a newer aixodia-engine is already serving; exiting");
         return Ok(());
+    }
+    if foreground {
+        tracing::info!("foreground mode enabled; ignoring the D1 newer-daemon guard");
     }
 
     let store = Arc::new(D1::new(db.clone()));
@@ -247,7 +252,13 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         async move { keeper.run(cancel).await }
     });
 
-    spawn_heartbeat(cancel.clone(), keeper.clone(), db.clone(), hub.clone());
+    spawn_heartbeat(
+        cancel.clone(),
+        keeper.clone(),
+        db.clone(),
+        hub.clone(),
+        !foreground,
+    );
 
     aixodia_io::auto_backup::spawn(gateway.clone(), cancel.clone());
 
@@ -262,8 +273,12 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
                 && !gateway.owes_backups()
         }
     };
-    tokio::spawn(selfupdate::run_loop(cancel.clone(), idle.clone()));
-    let _update = selfupdate::notify_update(idle);
+    if !foreground {
+        tokio::spawn(selfupdate::run_loop(cancel.clone(), idle.clone()));
+        let _update = selfupdate::notify_update(idle);
+    } else {
+        tracing::info!("foreground mode: automatic self-update is disabled");
+    }
 
     let shutdown = cancel.clone();
     let server = axum::serve(listener, mux.into_make_service())
@@ -592,6 +607,7 @@ fn spawn_heartbeat(
     keeper: Arc<tunnel::Keeper>,
     db: DbClient,
     hub: Arc<Hub>,
+    check_newer: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -611,7 +627,13 @@ fn spawn_heartbeat(
             let deps = tunnel::HeartbeatDeps {
                 newer: Box::new(move |started| {
                     let db = newer_db.clone();
-                    Box::pin(async move { newer_daemon_running(&db, started).await })
+                    Box::pin(async move {
+                        if check_newer {
+                            newer_daemon_running(&db, started).await
+                        } else {
+                            Ok(false)
+                        }
+                    })
                 }),
                 touch: Box::new(move |version, beat| {
                     let db = touch_db.clone();
