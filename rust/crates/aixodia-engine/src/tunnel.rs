@@ -793,5 +793,4 @@ mod tests {
         heartbeat_once(|| true, deps).await;
         assert_eq!(touched.load(Ordering::SeqCst), 1);
     }
-
 }
