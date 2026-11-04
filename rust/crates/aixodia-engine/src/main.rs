@@ -210,14 +210,20 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
             let hub = publisher_hub.clone();
             let noted = noted.clone();
             tokio::spawn(async move {
-                if newer_daemon_running(&db, tunnel::started_at())
-                    .await
-                    .unwrap_or(false)
-                {
-                    tracing::info!(
-                        "tunnel: a newer engine owns discovery; keeping this foreground process running without publishing"
-                    );
-                    return;
+                match newer_daemon_running(&db, tunnel::started_at()).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            "tunnel: a newer engine owns discovery; keeping this foreground process running without publishing"
+                        );
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "tunnel: cannot verify discovery ownership; keeping this foreground process running without publishing: {err}"
+                        );
+                        return;
+                    }
                 }
                 if let Err(err) = db.save_daemon(&url, &version_string(), now_unix()).await {
                     tracing::warn!("save daemon: {err}");
