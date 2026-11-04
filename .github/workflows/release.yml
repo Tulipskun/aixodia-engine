@@ -24,6 +24,12 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             cmake ninja-build clang libclang-dev
 
+      - name: Test foreground engine and launcher
+        run: |
+          cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+          cargo test --manifest-path rust/Cargo.toml -p aixodia-engine
+          bash aixodia_test.sh
+
       - name: Build amd64
         working-directory: rust
         env:
