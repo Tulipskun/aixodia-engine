@@ -37,11 +37,15 @@ aixodia update      # update the running engine in place
 ```
 
 `status`, `logs`, `stop` and `update` are control commands; none starts a
-second engine. `stop` sends SIGTERM to the process reported by the local
-`/healthz` endpoint. `logs` reads the engine's local `/api/logs` endpoint.
-`update` sends SIGUSR1 to the running process; the engine waits for active
-chats to finish, installs the published build and execs the new image in the
-same process. Its output remains attached to the original terminal or notebook.
+second engine. A process that sees a newer D1 discovery owner remains alive
+in the foreground but pauses its own discovery writes; it does not exit with
+status 0 or stop serving its local API. If that owner becomes stale, the
+foreground process can publish its current tunnel URL again.
+`stop` sends SIGTERM to the process reported by the local `/healthz` endpoint.
+`logs` reads the engine's local `/api/logs` endpoint. `update` sends SIGUSR1
+to the running process; the engine waits for active chats to finish, installs
+the published build and execs the new image in the same process. Its output
+remains attached to the original terminal or notebook.
 
 The engine also checks for a published build every ten minutes and applies it
 only while no chat is in flight. The update is an in-place exec, not a
