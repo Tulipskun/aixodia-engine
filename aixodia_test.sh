@@ -19,7 +19,7 @@ make_cloudflared() {
 make_engine() {
   cat > "$1" <<'STUB'
 #!/usr/bin/env bash
-if [ "\${1:-}" = "update" ]; then
+if [ "$#" -gt 0 ] && [ "$1" = "update" ]; then
   echo "installed the build published"
   exit 0
 fi
