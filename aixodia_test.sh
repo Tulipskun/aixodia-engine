@@ -128,7 +128,7 @@ else
 fi
 
 # Guard against reintroducing launcher-level detachment or file redirection.
-if ! grep -Eq 'nohup|PID_FILE|LOG_FILE|>[[:space:]]*&|[[:space:]]&[[:space:]]*$' "$LAUNCHER"; then
+if ! grep -Eq 'nohup|PID_FILE|LOG_FILE|(^|[[:space:]])&([[:space:]]|$|#)' "$LAUNCHER"; then
   pass "launcher contains no daemonization, pidfile, or log redirection"
 else
   fail "daemonization or redirected logging remains in launcher"
