@@ -12,54 +12,50 @@ curl -fsSL https://raw.githubusercontent.com/Tulipskun/aixodia-engine/main/insta
 Installs to `/usr/local/bin`: `aixodia-engine`, `aixodia`, and `cloudflared` (if it
 is not already on your PATH). Linux x86_64 and arm64.
 
-Updating is the same command: `aixodia update` installs the published build and
-hands it to the running engine, which swaps the binary and carries on under the
-same pid. A running build too old to accept the handshake is restarted instead.
+Updating replaces the published binary without detaching or restarting
+the running foreground process. The engine swaps its executable image in place,
+keeping the same pid, working directory, standard streams and active session.
 
 ## Run
 
 ```bash
-export CF_TOKEN=xxxxx    # the only secret; used to publish the tunnel url to D1
-aixodia
+export CF_TOKEN=xxxxx    # used to publish the tunnel URL to D1
+aixodia start
 ```
 
-`aixodia` starts the engine in the background, waits for the tunnel URL, prints
-it, and gives the prompt back.
+**The engine always runs in the foreground.** `aixodia start` replaces the
+launcher shell with `aixodia-engine`; it does not fork, use `nohup`, redirect
+output to a file, or return the prompt. Logs are written directly to stdout and
+stderr, so they appear in the same terminal or Kaggle/Colab cell. Ctrl-C sends
+SIGINT and stops the engine.
 
 ```bash
-aixodia-engine --foreground  # run attached to this terminal (also works in notebooks)
-aixodia status      # up? at which url
-aixodia logs        # tail the engine log
-aixodia stop        # shut it down
-aixodia update      # install the published build and update in place
+aixodia status      # read the running engine's health
+aixodia logs        # fetch recent engine logs from its local API
+aixodia stop        # send SIGTERM to the foreground engine
+aixodia update      # update the running engine in place
 ```
 
-`aixodia update` does not stop the engine. It sends `SIGUSR1` to the pid the
-engine reports on `GET /healthz`, and the engine installs the build and execs
-itself: same pid, same arguments, same session. A chat in flight is not cut
-short — the engine notes the request and applies the build when the turn ends.
-Only a build that predates the handshake (no `update` key on `/healthz`) is
-stopped and started, which ends the attached session.
+`status`, `logs`, `stop` and `update` are control commands; none starts a
+second engine. `stop` sends SIGTERM to the process reported by the local
+`/healthz` endpoint. `logs` reads the engine's local `/api/logs` endpoint.
+`update` sends SIGUSR1 to the running process; the engine waits for active
+chats to finish, installs the published build and execs the new image in the
+same process. Its output remains attached to the original terminal or notebook.
 
-The engine also installs a published build by itself, ten minutes at a time and
-only while no chat is in flight (`selfupdate: installing the build published
-...` in the log); `aixodia update` is the same swap on demand.
+The engine also checks for a published build every ten minutes and applies it
+only while no chat is in flight. The update is an in-place exec, not a
+background restart.
 
-Only local state lives in `~/.aixodia/` (`aixodia.pid`, `aixodia.log`,
-`aixodia-logs.db`, `uploads/`). Chat history and settings are in D1; providers
-and their API keys are in Workers KV.
+Only local state lives in `~/.aixodia/` (`aixodia-logs.db`, `uploads/` and
+the cloudflared child-process pid file). There is no engine pid file or
+background log file. Chat history and settings are in D1; providers and their
+API keys are in Workers KV.
 
 ## Configuration
 
-Only `CF_TOKEN` is required.
-
-For Kaggle, Colab, or another supervisor-managed environment, run the binary
-directly with `aixodia-engine --foreground`. This mode stays attached to the
-current process, prints logs to stdout/stderr, ignores the D1 newer-daemon guard
-(so it does not exit successfully just because another instance recently
-announced itself), and disables automatic self-update. Stop it with SIGINT or
-SIGTERM. The normal `aixodia` launcher continues to manage the background
-daemon as before.
+`CF_TOKEN` is required. `AIXODIA_HOME` can override the local state directory;
+`AIXODIA_LOCAL_URL` can override the local control API address.
 
 
 Chat history, settings, run logs and the note a session leaves for the one that
