@@ -153,7 +153,7 @@ async fn try_start_auto_backup(g: &Gateway) -> bool {
     if !backup::ready(&config, backup::BACKUP_RUN) {
         return false;
     }
-    backup::claim_and_spawn_backup(config)
+    backup::claim_and_spawn_backup(config, store)
 }
 
 // --- /proc/stat CPU usage measurement ---
