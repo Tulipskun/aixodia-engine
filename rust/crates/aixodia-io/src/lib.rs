@@ -15,6 +15,7 @@ pub mod backup;
 pub mod breaker;
 pub mod chat;
 pub mod gateway;
+pub mod files;
 pub mod models;
 pub mod remind;
 pub mod restart;
