@@ -37,10 +37,10 @@ aixodia update      # update the running engine in place
 ```
 
 `status`, `logs`, `stop` and `update` are control commands; none starts a
-second engine. A process that sees a newer D1 discovery owner remains alive
-in the foreground but pauses its own discovery writes; it does not exit with
-status 0 or stop serving its local API. If that owner becomes stale, the
-foreground process can publish its current tunnel URL again.
+second engine. The engine does not use D1 timestamps or discovery ownership
+checks to suppress its tunnel publication or terminate its process. Start only
+one engine per account unless multiple active tunnels are intentionally
+required, because each active instance publishes its own current tunnel URL.
 `stop` sends SIGTERM to the process reported by the local `/healthz` endpoint.
 `logs` reads the engine's local `/api/logs` endpoint. `update` sends SIGUSR1
 to the running process; the engine waits for active chats to finish, installs
