@@ -657,15 +657,17 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         };
         let file_type = meta.file_type();
         let is_link = file_type.is_symlink();
-        let can_enter = file_type.is_dir() && !is_link;
+        let is_dir = file_type.is_dir()
+            || (is_link && std::fs::metadata(&child).map(|target| target.is_dir()).unwrap_or(false));
+        let can_enter = is_dir;
         let entry = json!({
             "name": name,
             "path": joined(&text, &name),
-            "is_dir": file_type.is_dir(),
+            "is_dir": is_dir,
             "is_symlink": is_link,
             "can_enter": can_enter,
         });
-        rows.push((name, file_type.is_dir(), entry));
+        rows.push((name, is_dir, entry));
     }
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let truncated = rows.len() > BROWSE_MAX;
