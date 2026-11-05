@@ -90,6 +90,15 @@ pub fn is_excluded(rel: &str, excludes: &[String]) -> bool {
         if pattern.is_empty() {
             continue;
         }
+        // A trailing slash is the UI's explicit directory pick. Match that
+        // exact path and its descendants, not every same-named folder elsewhere.
+        if pattern.ends_with('/') {
+            let directory = pattern.trim_end_matches('/');
+            if !directory.is_empty() && (rel == directory || rel.starts_with(pattern)) {
+                return true;
+            }
+            continue;
+        }
         if pattern.contains('/') {
             if glob_match(pattern, rel) {
                 return true;
