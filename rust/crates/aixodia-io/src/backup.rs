@@ -28,6 +28,8 @@ use crate::gateway::{write_error, write_json, Gateway};
 
 /// The D1 state key holding the backup configuration.
 pub const BACKUP_CONFIG_KEY: &str = "backup/config";
+/// Last successful backup report, persisted independently of the engine process.
+pub const LAST_BACKUP_KEY: &str = "backup/last_success";
 
 /// One running operation and the result of the last one to finish.
 #[derive(Default)]
@@ -140,6 +142,13 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
         Err(err) => return write_error(StatusCode::BAD_GATEWAY, "database_error", &err),
     };
     let config = resolve(stored.as_deref());
+    let Some(store) = g.state_store() else {
+        return write_error(StatusCode::BAD_GATEWAY, "database_error", "the engine state store is not open");
+    };
+    let persisted_last = match store.get_state(LAST_BACKUP_KEY).await {
+        Ok(raw) => raw.and_then(|value| serde_json::from_str::<Value>(&value).ok()).unwrap_or(Value::Null),
+        Err(err) => return write_error(StatusCode::BAD_GATEWAY, "database_error", &err.to_string()),
+    };
     let slots = slots().lock().unwrap_or_else(|e| e.into_inner());
     let active = slots.active.as_ref().map(|active| {
         json!({
@@ -148,6 +157,16 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
             "progress": active.reporter.snapshot(),
         })
     });
+    let current_last = if slots.finished["operation"] == "backup" && slots.finished["summary"]["ok"] == true {
+        slots.finished.clone()
+    } else {
+        Value::Null
+    };
+    let last_backup = if current_last["finished_at"].as_i64().unwrap_or(0) > persisted_last["finished_at"].as_i64().unwrap_or(0) {
+        current_last
+    } else {
+        persisted_last
+    };
     write_json(
         StatusCode::OK,
         json!({
@@ -163,6 +182,7 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
             "token": mask(&config.token),
             "active": active,
             "finished": slots.finished,
+            "last_backup": last_backup,
             "auto": auto_status_with_config(stored.as_deref()),
         }),
     )
@@ -269,7 +289,8 @@ pub async fn api_backup_start(State(g): State<Arc<Gateway>>) -> Response {
     let Some(reporter) = claim("backup") else {
         return busy();
     };
-    spawn_job("backup", move || {
+    let store = g.state_store();
+    spawn_job("backup", store, move || {
         aixodia_backup::backup(&config, &reporter)
             .and_then(json_of)
             .map_err(|err| err.to_string())
@@ -324,7 +345,7 @@ pub async fn api_backup_restore(State(g): State<Arc<Gateway>>, body: Bytes) -> R
     // where the tree lands.
     let root = config.root.clone();
     let label = root.display().to_string();
-    spawn_job("restore", move || {
+    spawn_job("restore", None, move || {
         aixodia_backup::restore(&config, &root, &reporter)
             .and_then(json_of)
             .map_err(|err| err.to_string())
@@ -420,21 +441,46 @@ fn busy() -> Response {
 /// including panicking, which must not leave the slot claimed forever.
 fn spawn_job(
     operation: &'static str,
+    store: Option<Arc<dyn crate::gateway::StateStore>>,
     work: impl FnOnce() -> Result<Value, String> + Send + 'static,
 ) {
     let started_at = aixodia_backup::now_unix();
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
             .unwrap_or_else(|_| Err("the backup worker panicked".to_string()));
-        finish(operation, started_at, outcome);
+        finish(operation, started_at, outcome, store);
     });
 }
 
-fn finish(operation: &str, started_at: i64, outcome: Result<Value, String>) {
+fn finish(
+    operation: &str,
+    started_at: i64,
+    outcome: Result<Value, String>,
+    store: Option<Arc<dyn crate::gateway::StateStore>>,
+) {
     let summary = match &outcome {
         Ok(report) => json!({"ok": true, "report": report}),
         Err(err) => json!({"ok": false, "error": err}),
     };
+    let finished = json!({
+        "operation": operation,
+        "started_at": started_at,
+        "finished_at": aixodia_backup::now_unix(),
+        "summary": summary,
+    });
+    if operation == "backup" && finished["summary"]["ok"] == true {
+        if let Some(store) = store {
+            let raw = finished.to_string();
+            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => {
+                    if let Err(err) = runtime.block_on(store.put_state(LAST_BACKUP_KEY, &raw)) {
+                        tracing::warn!("backup succeeded but last-backup persistence failed: {err}");
+                    }
+                }
+                Err(err) => tracing::warn!("backup succeeded but persistence runtime could not start: {err}"),
+            }
+        }
+    }
     let mut slots = slots().lock().unwrap_or_else(|e| e.into_inner());
     if slots
         .active
@@ -444,12 +490,7 @@ fn finish(operation: &str, started_at: i64, outcome: Result<Value, String>) {
     {
         slots.active = None;
     }
-    slots.finished = json!({
-        "operation": operation,
-        "started_at": started_at,
-        "finished_at": aixodia_backup::now_unix(),
-        "summary": summary,
-    });
+    slots.finished = finished;
     match outcome {
         Ok(_) => tracing::info!("backup {operation}: {summary}"),
         Err(err) => tracing::warn!("backup {operation} failed: {err}"),
@@ -474,11 +515,14 @@ pub(crate) fn auto_status_with_config(stored_raw: Option<&str>) -> Value {
 }
 
 /// Claim the backup slot and spawn the job. Returns true if started.
-pub(crate) fn claim_and_spawn_backup(config: aixodia_backup::Config) -> bool {
+pub(crate) fn claim_and_spawn_backup(
+    config: aixodia_backup::Config,
+    store: Arc<dyn crate::gateway::StateStore>,
+) -> bool {
     let Some(reporter) = claim("backup") else {
         return false;
     };
-    spawn_job("backup", move || {
+    spawn_job("backup", Some(store), move || {
         aixodia_backup::backup(&config, &reporter)
             .and_then(json_of)
             .map_err(|err| err.to_string())
