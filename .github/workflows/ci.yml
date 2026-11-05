@@ -22,6 +22,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Format
+        working-directory: rust
+        run: cargo fmt --all
+
       - name: Build
         working-directory: rust
         run: cargo build --workspace
