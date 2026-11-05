@@ -909,6 +909,14 @@ pub fn fetch_manifest(hub: &Hub, name: &str) -> Result<Manifest> {
 /// they are, so a restore onto a live tree only ever adds and overwrites. The
 /// run always goes through the whole manifest and reports what it could not
 /// write, so a partial tree is never the surprise ending of a failed call.
+fn restore_target_root(configured_root: &Path, requested_root: &Path, manifest_root: &str) -> PathBuf {
+    if requested_root == configured_root && Path::new(manifest_root).is_absolute() {
+        PathBuf::from(manifest_root)
+    } else {
+        requested_root.to_path_buf()
+    }
+}
+
 pub fn restore(cfg: &Config, root: &Path, reporter: &Reporter) -> Result<RestoreReport> {
     let started = std::time::Instant::now();
     cfg.validate()?;
@@ -916,6 +924,11 @@ pub fn restore(cfg: &Config, root: &Path, reporter: &Reporter) -> Result<Restore
     let reading = std::time::Instant::now();
     let manifest = latest_manifest(&hub)?
         .ok_or_else(|| Error::Config("the bucket holds no backup yet".into()))?;
+    // A legacy manifest stores paths relative to its original root. When the
+    // API asks for the configured root, restore to that recorded root so an
+    // upgrade from a single-root backup cannot write files into the wrong place.
+    let target_root = restore_target_root(&cfg.root, root, &manifest.root);
+    let root = target_root.as_path();
     tracing::info!(
         "restore: manifest {} holds {} entries, read in {}ms",
         manifest.name,
@@ -1849,6 +1862,22 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restore_uses_manifest_root_for_configured_target_but_keeps_explicit_override() {
+        assert_eq!(
+            restore_target_root(Path::new("/"), Path::new("/"), "/root"),
+            PathBuf::from("/root")
+        );
+        assert_eq!(
+            restore_target_root(Path::new("/"), Path::new("/"), "/"),
+            PathBuf::from("/")
+        );
+        assert_eq!(
+            restore_target_root(Path::new("/"), Path::new("/tmp/restore-test"), "/root"),
+            PathBuf::from("/tmp/restore-test")
+        );
+    }
+
     use super::*;
     use crate::ShardRef;
     use std::io::{Read, Write};
