@@ -210,21 +210,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
             let hub = publisher_hub.clone();
             let noted = noted.clone();
             tokio::spawn(async move {
-                match newer_daemon_running(&db, tunnel::started_at()).await {
-                    Ok(true) => {
-                        tracing::info!(
-                            "tunnel: a newer engine owns discovery; keeping this foreground process running without publishing"
-                        );
-                        return;
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            "tunnel: cannot verify discovery ownership; keeping this foreground process running without publishing: {err}"
-                        );
-                        return;
-                    }
-                }
                 if let Err(err) = db.save_daemon(&url, &version_string(), now_unix()).await {
                     tracing::warn!("save daemon: {err}");
                     return;
@@ -602,7 +587,6 @@ fn spawn_heartbeat(
 ) {
     tokio::spawn(async move {
         loop {
-            let newer_db = db.clone();
             let publish_db = db.clone();
             let publish_keeper = keeper.clone();
             let announce_hub = hub.clone();
@@ -617,10 +601,6 @@ fn spawn_heartbeat(
                 });
             });
             let deps = tunnel::HeartbeatDeps {
-                newer: Box::new(move |started| {
-                    let db = newer_db.clone();
-                    Box::pin(async move { newer_daemon_running(&db, started).await })
-                }),
                 publish: Box::new(move |version, beat| {
                     let db = publish_db.clone();
                     let url = publish_keeper.url();
@@ -633,47 +613,13 @@ fn spawn_heartbeat(
                 now: Box::new(|| Box::pin(async { now_unix() })),
                 announce: Some(Box::new(move |version, beat| announce(version, beat))),
             };
-            tunnel::heartbeat_once(tunnel::started_at(), || keeper.alive(), deps).await;
+            tunnel::heartbeat_once(|| keeper.alive(), deps).await;
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
         }
     });
-}
-
-async fn newer_daemon_running(db: &DbClient, started: i64) -> anyhow::Result<bool> {
-    let rows = db
-        .query(
-            "SELECT key, value FROM system_state WHERE key IN ('daemon/version','daemon/heartbeat')",
-            &[],
-        )
-        .await?;
-    let mut version = String::new();
-    let mut beat = 0i64;
-    for row in rows {
-        let key = row.get("key").and_then(Value::as_str).unwrap_or("");
-        let value = row.get("value").and_then(Value::as_str).unwrap_or("");
-        match key {
-            "daemon/version" => version = value.to_string(),
-            "daemon/heartbeat" => beat = value.parse().unwrap_or(0),
-            _ => {}
-        }
-    }
-    let other = parse_started(&version);
-    let fresh = now_unix() - 120 < beat;
-    Ok(fresh && other > started)
-}
-
-fn parse_started(version: &str) -> i64 {
-    let Some(index) = version.find("started=") else {
-        return 0;
-    };
-    let digits: String = version[index + 8..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().unwrap_or(0)
 }
 
 /// The engine's local state directory. The keeper records only its child
