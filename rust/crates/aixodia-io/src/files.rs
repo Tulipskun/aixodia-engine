@@ -16,7 +16,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
@@ -24,7 +24,10 @@ use crate::gateway::{write_error, write_json};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-pub fn router() -> Router {
+pub fn router<S>() -> Router<S>
+where
+    S: Send + Sync + 'static,
+{
     Router::new()
         .route("/api/files", get(list).delete(remove))
         .route("/api/files/download", get(download))
