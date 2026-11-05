@@ -1001,11 +1001,15 @@ mod tests {
         );
         assert!(listing["parent"].is_string(), "the picker needs a way back");
         let entries = listing["entries"].as_array().unwrap();
-        assert_eq!(entries[0]["name"], json!("projects"));
-        assert_eq!(entries[0]["is_dir"], json!(true));
-        assert_eq!(entries[0]["can_enter"], json!(true));
+        assert!(entries[0]["is_dir"].as_bool().unwrap());
+        let project = entries
+            .iter()
+            .find(|entry| entry["name"] == json!("projects"))
+            .unwrap();
+        assert_eq!(project["is_dir"], json!(true));
+        assert_eq!(project["can_enter"], json!(true));
         assert_eq!(
-            entries[0]["path"],
+            project["path"],
             json!(format!(
                 "{}/projects",
                 dir.canonicalize().unwrap().display()
