@@ -90,9 +90,9 @@ pub fn is_excluded(rel: &str, excludes: &[String]) -> bool {
 
 /// `true` when `rel` is inside the selected-path list. An empty list selects nothing.
 ///
-/// An entry names a path *from the root*, not a folder that may appear anywhere.
-/// A directory is kept when it is at or under an entry, and also when an entry
-/// lies below it, so the walk can reach the pick.
+/// Each entry is a path relative to the filesystem root. A directory is kept
+/// when it is at or below an entry, and ancestors are walked when an entry lies
+/// below them so the scanner can reach the selected path.
 pub fn is_included(rel: &str, includes: &[String]) -> bool {
     if includes.is_empty() {
         return false;
