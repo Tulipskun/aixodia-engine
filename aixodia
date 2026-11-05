@@ -117,12 +117,12 @@ USAGE
 }
 
 case "${1:-}" in
-  start|run|up) cmd_start ;;
+  ''|start|run|up) cmd_start ;;
   status) cmd_status ;;
   logs) cmd_logs "${2:-40}" ;;
   stop) cmd_stop ;;
   update) cmd_update ;;
-  ''|help|-h|--help) usage ;;
+  help|-h|--help) usage ;;
   *)
     echo "aixodia: unknown command '$1'" >&2
     usage >&2
