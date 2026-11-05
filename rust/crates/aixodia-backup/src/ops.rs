@@ -187,8 +187,13 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
 
     reporter.set(Phase::Scanning, "reading the previous manifest");
     let previous = latest_manifest(&hub)?;
+    // Paths in a manifest are relative to its root. Reusing hashes or carrying
+    // entries forward across a root change would silently map old files elsewhere.
+    let compatible_previous = previous
+        .as_ref()
+        .filter(|manifest| manifest.root == cfg.root.display().to_string());
     let mut known: HashSet<String> = HashSet::new();
-    match previous.as_ref() {
+    match compatible_previous {
         Some(manifest) => known.extend(manifest.absolute(&cfg.prefix)),
         None => reporter.set(Phase::Scanning, "no previous backup: this one is full"),
     }
@@ -216,7 +221,7 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
     let mut plan = scan::plan(
         &cfg.root,
         scanned,
-        previous.as_ref(),
+        compatible_previous,
         &known,
         &cfg.prefix,
         &mut unreadable,
@@ -241,7 +246,7 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
     let mut shards = pack_shards(
         cfg,
         &mut plan.entries,
-        previous.as_ref(),
+        compatible_previous,
         &known,
         &scratch,
         reporter,
@@ -283,7 +288,7 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
 
     let previous_shards = merge_scope_entries(
         &mut plan.entries,
-        previous.as_ref(),
+        compatible_previous,
         &cfg.includes,
         &cfg.excludes,
     );
