@@ -44,7 +44,7 @@ pub const REQUEST_MAX_BODY: usize = 8 << 20;
 
 /// The release tag, baked in at build time. Bump on every release so a live
 /// service can be identified via `GET /healthz`.
-pub const VERSION: &str = "v1.173";
+pub const VERSION: &str = "v1.174";
 
 /// The rule a client-supplied draft id has to follow, as a readable pattern.
 pub const SESSION_ID_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
@@ -398,6 +398,7 @@ impl Gateway {
 
     fn register_api(self: &Arc<Self>) -> Router<Arc<Self>> {
         Router::new()
+            .merge(crate::files::router())
             .route(
                 "/api/providers",
                 get(crate::api::api_list_providers).post(crate::api::api_add_provider),
