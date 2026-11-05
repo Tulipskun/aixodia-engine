@@ -183,7 +183,7 @@ impl Default for Config {
             endpoint: DEFAULT_ENDPOINT.to_string(),
             root: PathBuf::from("/root"),
             prefix: DEFAULT_PREFIX.to_string(),
-            excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
+            excludes: Vec::new(),
             includes: Vec::new(),
             timeout_secs: 120,
         }
