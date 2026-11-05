@@ -951,7 +951,7 @@ mod tests {
     /// omitted field keeps what the engine holds, and an explicit empty list is
     /// the operator answering "everything", not silence.
     #[test]
-    fn a_write_that_does_not_mention_includes_leaves_them_alone() {
+    fn a_write_can_clear_all_selected_paths() {
         let previous: Stored =
             serde_json::from_str(r#"{"includes":[".codex","projects"]}"#).unwrap();
         let untouched: Stored = serde_json::from_str(r#"{"bucket":"me/bucket"}"#).unwrap();
@@ -962,8 +962,8 @@ mod tests {
         );
 
         let previous: Stored = serde_json::from_str(r#"{"includes":[".codex"]}"#).unwrap();
-        let widened: Stored = serde_json::from_str(r#"{"includes":[]}"#).unwrap();
-        let merged = widened.includes.clone().or(previous.includes);
+        let cleared: Stored = serde_json::from_str(r#"{"includes":[]}"#).unwrap();
+        let merged = cleared.includes.clone().or(previous.includes);
         assert_eq!(
             merged,
             Some(Vec::new()),
