@@ -100,6 +100,26 @@ whole list. D1's `system_state` also carries the daemon discovery keys
 finds the current tunnel. `CF_TOKEN` therefore needs D1 and Workers KV
 read/write.
 
+## File manager
+
+The authenticated `/api/files` API exposes the Linux filesystem from the engine's
+process permissions. When the engine runs as root, the file manager has root
+access. Directory listings include file type, size, modification time, mode,
+uid and gid. Uploads and downloads stream through disk and network buffers;
+large files are not held in memory.
+
+- `GET /api/files?path=/` lists one directory.
+- `GET /api/files/download?path=/absolute/file` streams a file.
+- `POST /api/files/upload?path=/absolute/dir&name=file` streams an upload.
+- `POST /api/files/mkdir` with `{"path":"/absolute/new-folder"}`.
+- `POST /api/files/rename` with `{"from":"/old/path","to":"/new/path"}`.
+- `PUT /api/files/permissions` with `{"path":"/absolute/file","mode":493}` (octal 0755).
+- `DELETE /api/files?path=/absolute/file` removes a file; add `recursive=true` to remove a directory tree.
+
+All routes use the same bearer token as the rest of the engine API. Paths are
+absolute paths on the Linux host. Recursive deletion is explicit; the filesystem
+root itself cannot be deleted or renamed.
+
 ## Runs and terminal
 
 Chat is a run, not a request that dies with the phone. The phone creates one
