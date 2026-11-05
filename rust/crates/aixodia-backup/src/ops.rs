@@ -275,9 +275,7 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
                 *index += shard_offset;
             }
         }
-        retained.append(&mut plan.entries);
-        retained.sort_by(|a, b| a.path.cmp(&b.path));
-        plan.entries = retained;
+        plan.entries.append(&mut retained);
     }
 
     // Which bytes belong to which object key, so a file that turns out to be
