@@ -242,9 +242,9 @@ pub fn scan(
         .dev();
 
     let mut out: Vec<Scanned> = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut stack: Vec<(PathBuf, u64)> = vec![(root.to_path_buf(), root_dev)];
 
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, parent_dev)) = stack.pop() {
         let rel_dir = relative(root, &dir);
         let read = match fs::read_dir(&dir) {
             Ok(read) => read,
@@ -298,8 +298,16 @@ pub fn scan(
                 continue;
             }
             if file_type.is_dir() {
-                if meta.dev() != root_dev {
-                    skipped.push(format!("{rel} (different filesystem, not crossed)"));
+                if meta.dev() != parent_dev
+                    && !includes.iter().any(|picked| {
+                        let picked = picked.trim().trim_matches('/');
+                        !picked.is_empty()
+                            && (picked == rel
+                                || picked.starts_with(&format!("{rel}/"))
+                                || rel.starts_with(&format!("{picked}/")))
+                    })
+                {
+                    skipped.push(format!("{rel} (different filesystem, not selected)"));
                     continue;
                 }
                 out.push(Scanned {
@@ -311,7 +319,7 @@ pub fn scan(
                     target: None,
                     dev: meta.dev(),
                 });
-                stack.push(child);
+                stack.push((child, meta.dev()));
                 continue;
             }
             if !file_type.is_file() {
