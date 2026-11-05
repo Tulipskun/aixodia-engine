@@ -642,7 +642,8 @@ fn pack_shards(
             format!("packing {whole} file(s) into {} container(s) using {workers} workers", tasks.len()),
         );
 
-        let built: Vec<(usize, Vec<usize>, String, PathBuf, Result<pack::Built>)> =
+        type BuiltShard = (usize, Vec<usize>, String, PathBuf, Result<pack::Built>);
+        let built: Vec<BuiltShard> =
             std::thread::scope(|scope| -> Result<Vec<_>> {
                 let mut handles = Vec::new();
                 for chunk in tasks.chunks(tasks.len().div_ceil(workers)) {
