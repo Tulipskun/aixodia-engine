@@ -668,15 +668,9 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         };
         let file_type = meta.file_type();
         let is_link = file_type.is_symlink();
-        // The walker does not follow a link and does not cross into another
-        // filesystem, so the picker must not offer either as a place to go:
-        // a folder that looks selectable and cannot be backed up is worse than
-        // no folder, because the operator finds out at restore time.
-        let can_enter = file_type.is_dir()
-            && !is_link
-            && std::fs::metadata(&child)
-                .map(|target| Some(target.dev()) == here)
-                .unwrap_or(false);
+        // A selected source folder may itself be a mount point. The scanner
+        // crosses that boundary only when the folder is explicitly included.
+        let can_enter = file_type.is_dir() && !is_link;
         let entry = json!({
             "name": name,
             "path": joined(&text, &name),
