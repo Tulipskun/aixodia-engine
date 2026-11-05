@@ -168,10 +168,8 @@ pub struct Config {
     pub prefix: String,
     /// Exclusion patterns; see [`scan`].
     pub excludes: Vec<String>,
-    /// Inclusion patterns; see [`scan::is_included`]. Empty means the whole
-    /// tree, which is the point: this field narrows a backup when the operator
-    /// picks folders and never narrows it by being unknown, unset, or written
-    /// by an older app.
+    /// Inclusion patterns; see [`scan::is_included`]. Only explicitly selected
+    /// paths are included; an empty list selects no paths.
     pub includes: Vec<String>,
     /// Extra seconds added to every request timeout, for a slow uplink.
     pub timeout_secs: u64,
