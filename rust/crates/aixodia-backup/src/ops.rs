@@ -731,11 +731,8 @@ fn pack_shards(
     }
 
     let mut shards = Vec::with_capacity(slots.len());
-    for (position, slot) in slots.into_iter().enumerate() {
-        let shard = slot.ok_or_else(|| Error::Api {
-            operation: "pack".into(),
-            message: format!("container {position} did not finish"),
-        })?;
+    for shard in slots.into_iter().flatten() {
+        let position = shards.len();
         for index in &shard.group {
             entries[*index].shard = Some(position);
         }
