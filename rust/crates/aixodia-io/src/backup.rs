@@ -64,10 +64,8 @@ pub(crate) struct Stored {
     root: Option<String>,
     #[serde(default)]
     excludes: Option<Vec<String>>,
-    /// The allowlist the picker writes. `None` and `Some(vec![])` mean the same
-    /// thing to a run — the whole tree — but not to a write: an omitted field
-    /// keeps what is stored, an explicit empty list is the operator choosing
-    /// "everything" over a narrowed scope.
+    /// The picker writes selected paths. An omitted field keeps the stored
+    /// selection; an explicit empty list clears the selection.
     #[serde(default)]
     includes: Option<Vec<String>>,
     #[serde(default)]
@@ -969,7 +967,7 @@ mod tests {
         assert_eq!(
             merged,
             Some(Vec::new()),
-            "switching back to everything is a real answer, not silence"
+            "an empty list clears the selection"
         );
         let stored = Stored {
             includes: merged,
@@ -979,7 +977,11 @@ mod tests {
             resolve(Some(&serde_json::to_string(&stored).unwrap()))
                 .includes
                 .is_empty(),
-            "and an empty allowlist resolves to the whole tree"
+            "and an empty selection resolves to no included paths"
+        );
+        assert!(
+            !aixodia_backup::scan::is_included("anything", &resolve(Some(&serde_json::to_string(&stored).unwrap())).includes),
+            "an empty selection must not include any path"
         );
     }
 
