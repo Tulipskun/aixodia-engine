@@ -12,7 +12,6 @@
 //! otherwise the engine could never back up again.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -656,7 +655,6 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         ));
     }
     let read = std::fs::read_dir(&real).map_err(|err| format!("{text} cannot be listed: {err}"))?;
-    let here = std::fs::metadata(&real).map(|meta| meta.dev()).ok();
 
     let mut rows: Vec<(String, bool, Value)> = Vec::new();
     for item in read.flatten() {
