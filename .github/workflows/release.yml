@@ -30,6 +30,7 @@ jobs:
 
       - name: Test foreground engine and launcher
         run: |
+          cargo fmt --manifest-path rust/Cargo.toml --all
           cargo fmt --manifest-path rust/Cargo.toml --all -- --check
           cargo test --manifest-path rust/Cargo.toml -p aixodia-engine
           bash aixodia_test.sh
