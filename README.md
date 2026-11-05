@@ -3,6 +3,34 @@
 The AIxodia engine: serves the chat API on `127.0.0.1:8787`, puts a Cloudflare
 quick tunnel in front of it, and tells the phone the tunnel URL via D1.
 
+## Remote filesystem API
+
+The engine exposes a root-level Linux file manager over the existing authenticated
+API. It operates with the operating-system permissions of the engine process;
+when the engine runs as root, these endpoints can access the whole host filesystem.
+Treat the engine token as a root password: anyone holding it can read, replace or
+delete system files.
+
+All requests use `Authorization: Bearer $CF_TOKEN` and absolute Linux paths.
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/files?path=/` | List a directory and file metadata |
+| GET | `/api/files/download?path=/path/file` | Stream a file to the client |
+| POST | `/api/files/upload?path=/target/dir&name=file.bin` | Stream a file into a directory |
+| POST | `/api/files/upload?path=/target/dir&name=file.bin&overwrite=true` | Replace an existing file |
+| POST | `/api/files/mkdir` | Create a directory; JSON body: `{"path":"/target/new-dir"}` |
+| POST | `/api/files/rename` | Move or rename; JSON body: `{"from":"/old","to":"/new"}` |
+| PUT | `/api/files/permissions` | Change Unix mode; JSON body: `{"path":"/file","mode":493}` (493 = 0755) |
+| DELETE | `/api/files?path=/target` | Delete a file or empty directory |
+| DELETE | `/api/files?path=/target&recursive=true` | Recursively delete a directory |
+
+Uploads and downloads stream data instead of buffering complete files in memory.
+Uploads are written to a temporary file and published only after the transfer
+finishes. Existing files are not overwritten unless `overwrite=true` is sent.
+The API does not restrict paths to HOME; `/`, `/content`, `/tmp`, and other
+mounted filesystems are available subject to Linux permissions.
+
 ## Install / update
 
 ```bash
