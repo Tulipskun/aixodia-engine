@@ -551,6 +551,33 @@ mod tests {
     }
 
     #[test]
+    fn selected_files_and_independent_paths_are_scanned_without_siblings() {
+        let dir = std::env::temp_dir().join(format!("aix-file-picks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("first")).unwrap();
+        fs::create_dir_all(dir.join("second/bin")).unwrap();
+        fs::write(dir.join("first/.profile"), b"profile").unwrap();
+        fs::write(dir.join("first/other.txt"), b"other").unwrap();
+        fs::write(dir.join("second/bin/tool"), b"tool").unwrap();
+        fs::write(dir.join("second/bin/unselected"), b"other").unwrap();
+
+        let includes = vec!["first/.profile".to_string(), "second/bin/tool".to_string()];
+        let mut skipped = Vec::new();
+        let found = scan(&dir, &[], &includes, &mut skipped).unwrap();
+        let paths: Vec<&str> = found.iter().map(|entry| entry.path.as_str()).collect();
+
+        assert!(paths.contains(&"first"));
+        assert!(paths.contains(&"first/.profile"));
+        assert!(paths.contains(&"second"));
+        assert!(paths.contains(&"second/bin"));
+        assert!(paths.contains(&"second/bin/tool"));
+        assert!(!paths.contains(&"first/other.txt"));
+        assert!(!paths.contains(&"second/bin/unselected"));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn included_folder_pulls_its_subtree() {
         let includes = vec![".codex".to_string()];
         assert!(is_included(".codex", &includes));
