@@ -126,8 +126,7 @@ pub fn is_excluded(rel: &str, excludes: &[String]) -> bool {
     false
 }
 
-/// `true` when `rel` is inside the allowlist, and an empty allowlist keeps
-/// everything.
+/// `true` when `rel` is inside the selected-path list. An empty list selects nothing.
 ///
 /// Emptiness meaning *all* rather than *none* is what makes the field safe to
 /// add: a config written before there was a picker, and one the operator never
@@ -143,7 +142,7 @@ pub fn is_excluded(rel: &str, excludes: &[String]) -> bool {
 /// can reach the pick.
 pub fn is_included(rel: &str, includes: &[String]) -> bool {
     if includes.is_empty() {
-        return true;
+        return false;
     }
     includes.iter().map(|p| p.trim()).any(|pattern| {
         if pattern.is_empty() {
@@ -234,12 +233,10 @@ pub fn scan(
     includes: &[String],
     skipped: &mut Vec<String>,
 ) -> Result<Vec<Scanned>> {
-    let root_dev = fs::metadata(root)
-        .map_err(|source| Error::Io {
-            path: root.display().to_string(),
-            source,
-        })?
-        .dev();
+    fs::metadata(root).map_err(|source| Error::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
 
     let mut out: Vec<Scanned> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -594,12 +591,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_includes_backs_up_the_whole_tree() {
-        // The compatibility case: an unset allowlist must not read as "keep
-        // nothing", or every config written before the picker loses its scope.
+    fn empty_includes_selects_nothing() {
+        // No selection means no entries are selected.
         let includes: Vec<String> = Vec::new();
-        assert!(is_included("anything/at/all", &includes));
-        assert!(is_included("target/x", &includes));
+        assert!(!is_included("anything/at/all", &includes));
+        assert!(!is_included("target/x", &includes));
     }
 
     #[test]
