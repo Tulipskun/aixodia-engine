@@ -586,9 +586,6 @@ pub(crate) fn claim_and_spawn_backup(
 
 /// Engine plumbing. A listing of these would offer the operator a scope whose
 /// "files" have sizes that mean nothing and readers that hang.
-/// One directory is shown whole or not at all; a picker that renders fifty
-/// thousand entries is not a picker.
-const BROWSE_MAX: usize = 2000;
 /// How many folders a preview names. Past this the answer is "look at the first
 /// few", which is what the number is for.
 const PREVIEW_FOLDERS: usize = 12;
@@ -670,13 +667,11 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         rows.push((name, is_dir, entry));
     }
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let truncated = rows.len() > BROWSE_MAX;
-    rows.truncate(BROWSE_MAX);
     Ok(json!({
         "path": text,
         "parent": real.parent().map(|p| p.display().to_string()),
         "entries": rows.into_iter().map(|(_, _, entry)| entry).collect::<Vec<Value>>(),
-        "truncated": truncated,
+        "truncated": false,
     }))
 }
 
