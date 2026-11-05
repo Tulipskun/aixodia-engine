@@ -136,6 +136,41 @@ impl ShardBuild {
     }
 }
 
+/// Merge a narrowed run with the part of the previous manifest outside its
+/// scope. New entries stay first because the repair path indexes their shard
+/// groups against this vector; old shard indexes remain valid in the prefix
+/// of the combined shard table.
+fn merge_scope_entries(
+    current: &mut Vec<Entry>,
+    previous: Option<&Manifest>,
+    includes: &[String],
+    excludes: &[String],
+) -> Vec<crate::ShardRef> {
+    let Some(old) = previous else {
+        return Vec::new();
+    };
+    let current_paths: HashSet<String> =
+        current.iter().map(|entry| entry.path.clone()).collect();
+    let mut retained: Vec<Entry> = old
+        .entries
+        .iter()
+        .filter(|entry| {
+            !current_paths.contains(&entry.path)
+                && !scan::is_included(&entry.path, includes)
+                && !scan::is_excluded(&entry.path, excludes)
+        })
+        .cloned()
+        .collect();
+    let old_shards = old.shards.clone();
+    for entry in current.iter_mut() {
+        if let Some(index) = entry.shard.as_mut() {
+            *index += old_shards.len();
+        }
+    }
+    current.append(&mut retained);
+    old_shards
+}
+
 pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
     let started = std::time::Instant::now();
     cfg.validate()?;
@@ -246,37 +281,12 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
         );
     }
 
-    // A narrowed allowlist is additive: paths outside the new scope remain
-    // in the manifest so changing the picker cannot make an older backup
-    // disappear from Restore. Paths explicitly excluded are intentionally
-    // removed. New entries win on path collisions.
-    let previous_shards = previous
-        .as_ref()
-        .map(|manifest| manifest.shards.clone())
-        .unwrap_or_default();
-    if let Some(old) = previous.as_ref() {
-        let current_paths: HashSet<String> =
-            plan.entries.iter().map(|entry| entry.path.clone()).collect();
-        let mut retained: Vec<Entry> = old
-            .entries
-            .iter()
-            .filter(|entry| {
-                !current_paths.contains(&entry.path)
-                    && !scan::is_included(&entry.path, &cfg.includes)
-                    && !scan::is_excluded(&entry.path, &cfg.excludes)
-            })
-            .cloned()
-            .collect();
-        // New shard indexes start at zero. Keep the previous shard table intact
-        // and move only the new entries past it; old entries keep their indexes.
-        let shard_offset = previous_shards.len();
-        for entry in &mut plan.entries {
-            if let Some(index) = entry.shard.as_mut() {
-                *index += shard_offset;
-            }
-        }
-        plan.entries.append(&mut retained);
-    }
+    let previous_shards = merge_scope_entries(
+        &mut plan.entries,
+        previous.as_ref(),
+        &cfg.includes,
+        &cfg.excludes,
+    );
 
     // Which bytes belong to which object key, so a file that turns out to be
     // missing from the bucket can be sent again by name. A packed entry names no
@@ -3234,5 +3244,88 @@ mod tests {
             "a short body is asked for again, up to the attempts a file gets"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod scope_migration_tests {
+    use super::*;
+
+    fn file(path: &str, shard: Option<usize>) -> Entry {
+        Entry {
+            path: path.to_string(),
+            kind: Kind::File,
+            size: 1,
+            sha256: Some("00".repeat(32)),
+            shard,
+            ..Entry::default()
+        }
+    }
+
+    fn manifest(entries: Vec<Entry>, shards: Vec<crate::ShardRef>) -> Manifest {
+        Manifest {
+            version: 2,
+            name: "previous".into(),
+            created_at: 0,
+            host: "test".into(),
+            root: "/data".into(),
+            counts: Counts::default(),
+            uploaded_bytes: 0,
+            skipped: Vec::new(),
+            entries,
+            shards,
+        }
+    }
+
+    #[test]
+    fn narrowing_scope_keeps_old_entries_and_shard_indexes() {
+        let old = manifest(
+            vec![file("apps/old.bin", Some(0)), file("docs/readme", None)],
+            vec![crate::ShardRef {
+                sha256: "11".repeat(32),
+                fingerprint: "old".into(),
+                size: 10,
+                members: 1,
+                raw: 1,
+            }],
+        );
+        let mut current = vec![file("apps/new.bin", Some(0))];
+        let old_shards = merge_scope_entries(
+            &mut current,
+            Some(&old),
+            &["apps".into()],
+            &[],
+        );
+        assert_eq!(old_shards.len(), 1);
+        assert_eq!(current[0].path, "apps/new.bin");
+        assert_eq!(current[0].shard, Some(1));
+        assert_eq!(current[1].path, "docs/readme");
+        assert_eq!(current[1].shard, None);
+    }
+
+    #[test]
+    fn explicit_exclusion_drops_old_entries_instead_of_migrating_them() {
+        let old = manifest(vec![file("cache/old.bin", None)], Vec::new());
+        let mut current = Vec::new();
+        merge_scope_entries(
+            &mut current,
+            Some(&old),
+            &[],
+            &["cache/".into()],
+        );
+        assert!(current.is_empty());
+    }
+
+    #[test]
+    fn full_scope_keeps_only_entries_not_replaced_by_current_scan() {
+        let old = manifest(
+            vec![file("apps/current.bin", None), file("docs/readme", None)],
+            Vec::new(),
+        );
+        let mut current = vec![file("apps/current.bin", None)];
+        merge_scope_entries(&mut current, Some(&old), &[], &[]);
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].path, "apps/current.bin");
     }
 }
