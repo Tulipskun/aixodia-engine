@@ -103,6 +103,23 @@ else
   fail "legacy daemon files were created"
 fi
 
+# The historical bare command remains a foreground start, not a daemon.
+home=$(tmpdir)
+fakebin=$(tmpdir)
+bin="$fakebin/aixodia-engine"
+make_engine "$bin"
+make_cloudflared "$fakebin"
+out_file="$home/out"
+CF_TOKEN=test-token AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
+  ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" ENGINE_HOME_FILE="$home/engine-home" \
+  PATH="$fakebin:$PATH" bash "$LAUNCHER" >"$out_file" 2>&1
+rc=$?
+if [ "$rc" -eq 37 ] && grep -q "engine stdout: attached" "$out_file"; then
+  pass "bare aixodia invocation starts the engine in the foreground"
+else
+  fail "bare aixodia invocation (rc=$rc, output=$(cat "$out_file"))"
+fi
+
 # A stopped engine can still use the updater command to install the published
 # binary; this command does not start a service.
 home=$(tmpdir)
