@@ -654,13 +654,10 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         let is_link = file_type.is_symlink();
         let is_dir = file_type.is_dir()
             || (is_link && std::fs::metadata(&child).map(|target| target.is_dir()).unwrap_or(false));
-        let can_enter = is_dir;
         let entry = json!({
             "name": name,
             "path": joined(&text, &name),
             "is_dir": is_dir,
-            "is_symlink": is_link,
-            "can_enter": can_enter,
         });
         rows.push((name, is_dir, entry));
     }
@@ -1007,7 +1004,6 @@ mod tests {
             .find(|entry| entry["name"] == json!("projects"))
             .unwrap();
         assert_eq!(project["is_dir"], json!(true));
-        assert_eq!(project["can_enter"], json!(true));
         assert_eq!(
             project["path"],
             json!(format!(
@@ -1019,15 +1015,12 @@ mod tests {
             .iter()
             .find(|entry| entry["name"] == json!("escape"))
             .unwrap();
-        assert_eq!(link["is_symlink"], json!(true));
         assert_eq!(link["is_dir"], json!(true));
-        assert_eq!(link["can_enter"], json!(true));
         let file = entries
             .iter()
             .find(|entry| entry["name"] == json!("notes.txt"))
             .unwrap();
         assert_eq!(file["is_dir"], json!(false));
-        assert_eq!(file["can_enter"], json!(false));
         std::fs::remove_dir_all(&dir).ok();
     }
 
