@@ -2,7 +2,7 @@ GOAL:
 [IN_PROCESS] Add a root-capable SFTP-style file manager API (v1.174): browse, stream upload/download, mkdir, rename/move and delete across the Linux filesystem, protected by the existing API token.
 
 PLAN:
-[IN_PROCESS] Fix router state bounds and validate the root filesystem API with CI.
+[IN_PROCESS] Verify the root filesystem API and document the authenticated file operations.
 [IN_PROCESS] Add tests, wire routes, bump engine version and run CI/Release.
 
 ARCHIVE:
