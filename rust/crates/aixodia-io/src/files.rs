@@ -12,7 +12,7 @@ use axum::body::Body;
 use axum::extract::Query;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -34,6 +34,7 @@ where
         .route("/api/files/upload", post(upload))
         .route("/api/files/mkdir", post(mkdir))
         .route("/api/files/rename", post(rename))
+        .route("/api/files/permissions", put(chmod))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -173,11 +174,12 @@ async fn list(Query(query): Query<PathQuery>) -> Response {
                 .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
         })
     });
+    let count = entries.len();
     write_json(StatusCode::OK, json!({
         "path": dir.to_string_lossy(),
         "parent": dir.parent().map(|p| p.to_string_lossy().into_owned()),
         "entries": entries,
-        "count": entries.len()
+        "count": count
     }))
 }
 
@@ -277,10 +279,21 @@ async fn upload(Query(query): Query<UploadQuery>, headers: HeaderMap, body: Body
         let _ = tokio::fs::remove_file(&temp).await;
         return write_error(StatusCode::CONFLICT, "already_exists", "destination appeared during upload");
     }
-    if let Err(err) = tokio::fs::rename(&temp, &destination).await {
+    let publish = if query.overwrite {
+        tokio::fs::rename(&temp, &destination).await
+    } else {
+        tokio::fs::hard_link(&temp, &destination).await
+    };
+    if let Err(err) = publish {
         let _ = tokio::fs::remove_file(&temp).await;
-        return write_error(StatusCode::INSUFFICIENT_STORAGE, "filesystem_error", &err.to_string());
+        let status = if err.kind() == std::io::ErrorKind::AlreadyExists {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INSUFFICIENT_STORAGE
+        };
+        return write_error(status, "filesystem_error", &err.to_string());
     }
+    let _ = tokio::fs::remove_file(&temp).await;
     let mime = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream");
     write_json(StatusCode::CREATED, json!({
         "path": destination.to_string_lossy(),
@@ -323,6 +336,45 @@ async fn rename(Json(request): Json<RenameRequest>) -> Response {
     match tokio::fs::rename(&source, &target).await {
         Ok(()) => write_json(StatusCode::OK, json!({"ok": true, "from": source.to_string_lossy(), "to": target.to_string_lossy()})),
         Err(err) => write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PermissionsRequest {
+    #[serde(default)]
+    path: String,
+    mode: u32,
+}
+
+async fn chmod(Json(request): Json<PermissionsRequest>) -> Response {
+    let path = match absolute_path(&request.path) {
+        Ok(path) => path,
+        Err(err) => return bad_path(err),
+    };
+    if request.mode > 0o7777 {
+        return bad_path("mode must be between 0000 and 7777");
+    }
+    let real = match tokio::fs::canonicalize(&path).await {
+        Ok(path) => path,
+        Err(err) => return write_error(StatusCode::NOT_FOUND, "not_found", &err.to_string()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(request.mode);
+        match tokio::fs::set_permissions(&real, permissions).await {
+            Ok(()) => write_json(StatusCode::OK, json!({
+                "ok": true,
+                "path": real.to_string_lossy(),
+                "mode": format!("{:04o}", request.mode)
+            })),
+            Err(err) => write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = real;
+        write_error(StatusCode::NOT_IMPLEMENTED, "unsupported", "permission changes require a Unix host")
     }
 }
 
@@ -372,6 +424,19 @@ mod tests {
     fn percent_encoding_is_header_safe() {
         assert_eq!(percent_encode("a b.txt"), "a%20b.txt");
         assert_eq!(percent_encode("ไฟล์.txt").contains('%'), true);
+    }
+
+    #[tokio::test]
+    async fn directory_listing_returns_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("hello.txt"), b"hello").await.unwrap();
+        let response = list(Query(PathQuery { path: dir.path().display().to_string() })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["entries"][0]["name"], "hello.txt");
+        assert_eq!(value["entries"][0]["size"], 5);
     }
 
     #[tokio::test]
