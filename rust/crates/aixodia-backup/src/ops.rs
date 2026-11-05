@@ -286,12 +286,8 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
         );
     }
 
-    let previous_shards = merge_scope_entries(
-        &mut plan.entries,
-        compatible_previous,
-        &cfg.includes,
-        &cfg.excludes,
-    );
+    // The manifest contains only paths selected in this run.
+    let previous_shards: Vec<crate::ShardRef> = Vec::new();
 
     // Which bytes belong to which object key, so a file that turns out to be
     // missing from the bucket can be sent again by name. A packed entry names no
