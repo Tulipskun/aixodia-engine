@@ -567,8 +567,6 @@ fn pack_shards(
     let mut shifting: Vec<usize> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         if entry.kind != Kind::File || entry.sha256.is_none() {
-            // A directory and a link carry nothing a frame could hold, and a file
-            // whose content was never read has no identity to pack.
             continue;
         }
         if scan::is_excluded(&entry.path, &volatile) {
@@ -577,13 +575,6 @@ fn pack_shards(
             steady.push(index);
         }
     }
-    reporter.set(
-        Phase::Uploading,
-        format!(
-            "packing {} file(s) into shards",
-            steady.len() + shifting.len()
-        ),
-    );
 
     let previous_by_fingerprint: HashMap<&str, &crate::ShardRef> = previous
         .map(|manifest| {
@@ -595,13 +586,17 @@ fn pack_shards(
         })
         .unwrap_or_default();
 
-    let mut shards: Vec<ShardBuild> = Vec::new();
+    // Keep the final shard order deterministic, but build changed containers in
+    // parallel. Packing used to read and compress every changed shard on one
+    // thread after the parallel hash pass, leaving the machine mostly idle during
+    // the second full read of a first backup.
+    let mut slots: Vec<Option<ShardBuild>> = Vec::new();
+    let mut tasks: Vec<(usize, Vec<usize>, Vec<pack::Member>, String)> = Vec::new();
     let whole = steady.len() + shifting.len();
-    let mut read = 0usize;
+
     for set in [steady, shifting] {
         let sizes: Vec<u64> = set.iter().map(|&index| entries[index].size).collect();
         for group in pack::group(&sizes) {
-            // Positions in `entries`, so a shard can be rebuilt by name alone.
             let group: Vec<usize> = group.into_iter().map(|at| set[at]).collect();
             let members: Vec<pack::Member> = group
                 .iter()
@@ -612,100 +607,151 @@ fn pack_shards(
                 })
                 .collect();
             let fingerprint = pack::fingerprint(&members);
-            // Two halves to a reuse claim: the member list must match, and the
-            // object its bytes live in must actually be in the bucket.
             let standing = previous_by_fingerprint
                 .get(fingerprint.as_str())
                 .filter(|shard| known.contains(&cfg.shard_key(&shard.sha256)))
                 .map(|shard| (shard.sha256.clone(), shard.size));
-            // The files this container actually holds, at the sizes and digests it
-            // actually wrote. The group as scanned is a plan, not a promise: a live
-            // tree loses files and grows logs while the container is being built, and
-            // the manifest that publishes has to describe the bytes inside it.
-            let (sha256, size, fingerprint, temp, held) = match standing {
-                Some((sha256, size)) => (sha256, size, fingerprint, None, group),
-                None => {
-                    let temp = scratch.join(format!("{fingerprint}.shard"));
-                    let built = pack::build(&members, &cfg.root, &temp)?;
-                    if built.sha256.is_empty() {
-                        // Every file in the group had gone. There is no container to
-                        // name, and the files it would have carried are reported.
-                        lost_names.extend(built.lost);
-                        continue;
-                    }
-                    let mut held: Vec<usize> = Vec::with_capacity(group.len());
-                    let mut as_packed: Vec<pack::Member> = Vec::with_capacity(group.len());
-                    for (index, member) in group.into_iter().zip(members) {
-                        if built.lost.contains(&member.path) {
-                            continue;
-                        }
-                        let member = match built.drifted.iter().find(|d| d.path == member.path) {
-                            Some(d) => {
-                                // The container holds the new bytes, so this is the
-                                // entry that names them; a restore that asked for the
-                                // scan's version would refuse a file it could write.
-                                entries[index].size = d.size;
-                                entries[index].sha256 = Some(d.sha256.clone());
-                                pack::Member {
-                                    path: d.path.clone(),
-                                    size: d.size,
-                                    sha256: d.sha256.clone(),
-                                }
-                            }
-                            None => member,
-                        };
-                        as_packed.push(member);
-                        held.push(index);
-                    }
-                    if !built.drifted.is_empty() {
-                        tracing::info!(
-                            "backup: {} file(s) moved while they were packed; the manifest names \
-                             what was read: {}",
-                            built.drifted.len(),
-                            built.drifted[0].path
-                        );
-                    }
-                    lost_names.extend(built.lost);
-                    // Fewer files, or different bytes, than the list it was asked for:
-                    // the identity a later reuse is decided by describes the container
-                    // that exists rather than the one that was planned.
-                    (
-                        built.sha256,
-                        built.size,
-                        pack::fingerprint(&as_packed),
-                        Some(temp),
-                        held,
-                    )
+
+            let position = slots.len();
+            if let Some((sha256, size)) = standing {
+                slots.push(Some(ShardBuild {
+                    key: cfg.shard_key(&sha256),
+                    size,
+                    raw: group.iter().map(|&index| entries[index].size).sum(),
+                    members: group.len(),
+                    temp: None,
+                    group,
+                    sha256,
+                    fingerprint,
+                }));
+            } else {
+                slots.push(None);
+                tasks.push((position, group, members, fingerprint));
+            }
+        }
+    }
+
+    if !tasks.is_empty() {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(tasks.len())
+            .min(8);
+        reporter.set(
+            Phase::Uploading,
+            format!("packing {whole} file(s) into {} container(s) using {workers} workers", tasks.len()),
+        );
+
+        let built: Vec<(usize, Vec<usize>, String, PathBuf, Result<pack::Built>)> =
+            std::thread::scope(|scope| -> Result<Vec<_>> {
+                let mut handles = Vec::new();
+                for chunk in tasks.chunks(tasks.len().div_ceil(workers)) {
+                    handles.push(scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|(position, group, members, fingerprint)| {
+                                let temp = scratch.join(format!("{fingerprint}.shard"));
+                                let result = pack::build(members, &cfg.root, &temp);
+                                (*position, group.clone(), fingerprint.clone(), temp, result)
+                            })
+                            .collect::<Vec<_>>()
+                    }));
                 }
-            };
-            if temp.is_some() {
-                // A minute of reading twenty-five thousand files is a long time to
-                // show nobody's progress, and a reused container reads nothing.
-                read += held.len();
-                reporter.set(
-                    Phase::Uploading,
-                    format!(
-                        "packing {whole} file(s): {read} read, {} container(s) built",
-                        shards.len()
-                    ),
+                let mut out = Vec::with_capacity(tasks.len());
+                for handle in handles {
+                    out.extend(handle.join().map_err(|_| Error::Api {
+                        operation: "pack".into(),
+                        message: "a shard worker panicked".into(),
+                    })?);
+                }
+                Ok(out)
+            })?;
+
+        for (position, group, _fingerprint, temp, built) in built {
+            let built = built?;
+            if built.sha256.is_empty() {
+                lost_names.extend(built.lost);
+                continue;
+            }
+            let mut held: Vec<usize> = Vec::with_capacity(group.len());
+            let mut as_packed: Vec<pack::Member> = Vec::with_capacity(group.len());
+            for (index, member) in group.into_iter().zip(
+                // The task's member list and group have the same stable order.
+                // Recreate the member from the manifest entry after drift is applied.
+                built
+                    .drifted
+                    .iter()
+                    .filter(|d| d.path.is_empty())
+                    .map(|_| unreachable!())
+                    .collect::<Vec<_>>(),
+            ) {
+                let _ = (index, member);
+            }
+            // Reconcile the files the container actually held with the scan. A
+            // live file may have changed or disappeared between the two passes.
+            // The original member list is reconstructed from the current entries
+            // and the build's drift/lost reports, preserving the same group order.
+            let lost: HashSet<&str> = built.lost.iter().map(String::as_str).collect();
+            let drifted: HashMap<&str, &pack::Drift> = built
+                .drifted
+                .iter()
+                .map(|item| (item.path.as_str(), item))
+                .collect();
+            for index in group {
+                let path = entries[index].path.clone();
+                if lost.contains(path.as_str()) {
+                    continue;
+                }
+                let member = if let Some(drift) = drifted.get(path.as_str()) {
+                    entries[index].size = drift.size;
+                    entries[index].sha256 = Some(drift.sha256.clone());
+                    pack::Member {
+                        path: drift.path.clone(),
+                        size: drift.size,
+                        sha256: drift.sha256.clone(),
+                    }
+                } else {
+                    pack::Member {
+                        path: path.clone(),
+                        size: entries[index].size,
+                        sha256: entries[index].sha256.clone().unwrap_or_default(),
+                    }
+                };
+                as_packed.push(member);
+                held.push(index);
+            }
+            if !built.drifted.is_empty() {
+                tracing::info!(
+                    "backup: {} file(s) moved while they were packed; the manifest names what was read: {}",
+                    built.drifted.len(),
+                    built.drifted[0].path
                 );
             }
-            let position = shards.len();
-            let shard = ShardBuild {
-                key: cfg.shard_key(&sha256),
-                size,
+            lost_names.extend(built.lost);
+            let fingerprint = pack::fingerprint(&as_packed);
+            slots[position] = Some(ShardBuild {
+                key: cfg.shard_key(&built.sha256),
+                size: built.size,
                 raw: held.iter().map(|&index| entries[index].size).sum(),
                 members: held.len(),
-                temp,
+                temp: Some(temp),
                 group: held,
-                sha256,
+                sha256: built.sha256,
                 fingerprint,
-            };
-            for index in &shard.group {
-                entries[*index].shard = Some(position);
-            }
-            shards.push(shard);
+            });
         }
+    }
+
+    let mut shards = Vec::with_capacity(slots.len());
+    for (position, slot) in slots.into_iter().enumerate() {
+        let shard = slot.ok_or_else(|| Error::Api {
+            operation: "pack".into(),
+            message: format!("container {position} did not finish"),
+        })?;
+        for index in &shard.group {
+            entries[*index].shard = Some(position);
+        }
+        shards.push(shard);
     }
     Ok(shards)
 }
