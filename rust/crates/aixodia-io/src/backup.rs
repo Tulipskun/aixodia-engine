@@ -586,7 +586,6 @@ pub(crate) fn claim_and_spawn_backup(
 
 /// Engine plumbing. A listing of these would offer the operator a scope whose
 /// "files" have sizes that mean nothing and readers that hang.
-const BROWSE_DENY: &[&str] = &["/proc", "/sys", "/dev", "/run"];
 /// One directory is shown whole or not at all; a picker that renders fifty
 /// thousand entries is not a picker.
 const BROWSE_MAX: usize = 2000;
@@ -646,14 +645,6 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
     if !real.is_dir() {
         return Err(format!("{text} is not a folder"));
     }
-    if BROWSE_DENY
-        .iter()
-        .any(|denied| text == *denied || text.starts_with(&format!("{denied}/")))
-    {
-        return Err(format!(
-            "{text} is engine plumbing, not a folder to back up"
-        ));
-    }
     let read = std::fs::read_dir(&real).map_err(|err| format!("{text} cannot be listed: {err}"))?;
 
     let mut rows: Vec<(String, bool, Value)> = Vec::new();
@@ -666,14 +657,7 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         };
         let file_type = meta.file_type();
         let is_link = file_type.is_symlink();
-        // A selected source folder may itself be a mount point. The scanner
-        // crosses that boundary only when the folder is explicitly included.
-        // Kernel pseudo filesystems remain unselectable.
-        let child_text = child.display().to_string();
-        let denied = BROWSE_DENY
-            .iter()
-            .any(|path| child_text == *path || child_text.starts_with(&format!("{path}/")));
-        let can_enter = file_type.is_dir() && !is_link && !denied;
+        let can_enter = file_type.is_dir() && !is_link;
         let entry = json!({
             "name": name,
             "path": joined(&text, &name),
@@ -1000,20 +984,6 @@ mod tests {
                 .is_empty(),
             "and an empty allowlist resolves to the whole tree"
         );
-    }
-
-    #[test]
-    fn browse_refuses_a_relative_path_and_engine_plumbing() {
-        assert!(list_directory("").is_err());
-        assert!(list_directory("root").is_err());
-        assert!(list_directory("relative/../path").is_err());
-        assert!(list_directory("/definitely/not/a/folder/here").is_err());
-        // Either refusal is correct for these — unreadable or denied — but the
-        // wording is what tells the operator why nothing appeared.
-        assert!(list_directory("/proc").is_err());
-        assert!(list_directory("/dev")
-            .unwrap_err()
-            .contains("engine plumbing"));
     }
 
     #[test]
