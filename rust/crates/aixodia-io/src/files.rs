@@ -26,7 +26,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn router<S>() -> Router<S>
 where
-    S: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     Router::new()
         .route("/api/files", get(list).delete(remove))
