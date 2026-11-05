@@ -192,18 +192,6 @@ fn leads_to_match(above: &str, below: &str) -> bool {
     upper.len() < lower.len() && upper.iter().zip(&lower).all(|(a, b)| glob_match(b, a))
 }
 
-/// Whether a filesystem boundary is on the path to, or inside, a selected
-/// source folder. Unselected mount points remain closed.
-fn selected_mountpoint(rel: &str, includes: &[String]) -> bool {
-    includes.iter().any(|picked| {
-        let picked = picked.trim().trim_matches('/');
-        !picked.is_empty()
-            && (picked == rel
-                || picked.starts_with(&format!("{rel}/"))
-                || rel.starts_with(&format!("{picked}/")))
-    })
-}
-
 /// Iterative glob: `*` spans everything including `/`, `?` is one character.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let (pat, txt) = (pattern.as_bytes(), text.as_bytes());
@@ -254,9 +242,9 @@ pub fn scan(
         .dev();
 
     let mut out: Vec<Scanned> = Vec::new();
-    let mut stack: Vec<(PathBuf, u64)> = vec![(root.to_path_buf(), root_dev)];
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
 
-    while let Some((dir, parent_dev)) = stack.pop() {
+    while let Some(dir) = stack.pop() {
         let rel_dir = relative(root, &dir);
         let read = match fs::read_dir(&dir) {
             Ok(read) => read,
@@ -280,13 +268,6 @@ pub fn scan(
             } else {
                 format!("{rel_dir}/{name}")
             };
-            // These root-level pseudo filesystems are live kernel interfaces,
-            // not backup data. Never walk them even when "/" is the source root.
-            if root == Path::new("/")
-                && matches!(rel.as_str(), "proc" | "sys" | "dev" | "run")
-            {
-                continue;
-            }
             if is_excluded(&rel, excludes) || !is_included(&rel, includes) {
                 continue;
             }
@@ -317,10 +298,6 @@ pub fn scan(
                 continue;
             }
             if file_type.is_dir() {
-                if meta.dev() != parent_dev && !selected_mountpoint(&rel, includes) {
-                    skipped.push(format!("{rel} (different filesystem, not selected)"));
-                    continue;
-                }
                 out.push(Scanned {
                     path: rel,
                     kind: Kind::Dir,
@@ -330,7 +307,7 @@ pub fn scan(
                     target: None,
                     dev: meta.dev(),
                 });
-                stack.push((child, meta.dev()));
+                stack.push(child);
                 continue;
             }
             if !file_type.is_file() {
@@ -687,17 +664,6 @@ mod tests {
         assert!(!paths.contains(&"drop/b.txt"), "nobody picked drop");
         assert!(skipped.is_empty(), "{skipped:?}");
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn only_selected_mount_points_are_crossed() {
-        let includes = vec!["root".to_string(), "usr/local".to_string()];
-        assert!(selected_mountpoint("root", &includes));
-        assert!(selected_mountpoint("usr", &includes));
-        assert!(selected_mountpoint("usr/local", &includes));
-        assert!(!selected_mountpoint("usr/share", &includes));
-        assert!(!selected_mountpoint("opt", &includes));
-        assert!(!selected_mountpoint("usr", &[]));
     }
 
     #[test]
