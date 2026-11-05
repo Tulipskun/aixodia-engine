@@ -246,6 +246,40 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
         );
     }
 
+    // A narrowed allowlist is additive: paths outside the new scope remain
+    // in the manifest so changing the picker cannot make an older backup
+    // disappear from Restore. Paths explicitly excluded are intentionally
+    // removed. New entries win on path collisions.
+    let previous_shards = previous
+        .as_ref()
+        .map(|manifest| manifest.shards.clone())
+        .unwrap_or_default();
+    if let Some(old) = previous.as_ref() {
+        let current_paths: HashSet<String> =
+            plan.entries.iter().map(|entry| entry.path.clone()).collect();
+        let mut retained: Vec<Entry> = old
+            .entries
+            .iter()
+            .filter(|entry| {
+                !current_paths.contains(&entry.path)
+                    && !scan::is_included(&entry.path, &cfg.includes)
+                    && !scan::is_excluded(&entry.path, &cfg.excludes)
+            })
+            .cloned()
+            .collect();
+        // New shard indexes start at zero. Keep the previous shard table intact
+        // and move only the new entries past it; old entries keep their indexes.
+        let shard_offset = previous_shards.len();
+        for entry in &mut plan.entries {
+            if let Some(index) = entry.shard.as_mut() {
+                *index += shard_offset;
+            }
+        }
+        retained.append(&mut plan.entries);
+        retained.sort_by(|a, b| a.path.cmp(&b.path));
+        plan.entries = retained;
+    }
+
     // Which bytes belong to which object key, so a file that turns out to be
     // missing from the bucket can be sent again by name. A packed entry names no
     // key of its own, so what is left here is the short list of files that still
@@ -366,7 +400,10 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
         uploaded_bytes,
         skipped: skipped.clone(),
         entries: plan.entries,
-        shards: shards.iter().map(ShardBuild::reference).collect(),
+        shards: previous_shards
+            .into_iter()
+            .chain(shards.iter().map(ShardBuild::reference))
+            .collect(),
     };
 
     // A manifest naming an object the bucket does not hold is how a restore comes
