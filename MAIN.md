@@ -1,10 +1,9 @@
 GOAL:
-[COMPLETED] Run AIxodia exclusively in the foreground (v1.173): the launcher execs the engine in place, output remains attached to the caller, and neither startup nor heartbeat shuts down an instance because another D1 heartbeat is newer.
-[COMPLETED] Publish the machine's boot next to the engine's start (v1.172): the phone's uptime counter restarted on every engine update because it counted the process the update replaces. `version_string` now carries `boot=` read off `/proc/uptime`.
-[COMPLETED] Give a terminal client its pane's history (v1.171): the replay used to drop the ring under tmux, so the phone held no scrollback and a drag had to be paged through the multiplexer instead. `capture_history` now answers an attach with the pane's own history and screen.
+[IN_PROCESS] Add a root-capable SFTP-style file manager API (v1.174): browse, stream upload/download, mkdir, rename/move and delete across the Linux filesystem, protected by the existing API token.
 
 PLAN:
-(no active plan)
+[IN_PROCESS] Implement authenticated filesystem routes with streaming I/O and safe path handling.
+[IN_PROCESS] Add tests, wire routes, bump engine version and run CI/Release.
 
 ARCHIVE:
 v1.173 `aixodia start` execs the engine in the caller's foreground; no nohup, forked launcher, engine pidfile or redirected log. A newer D1 discovery owner gates only URL/version/heartbeat writes; it never shuts down the older foreground process. When the newer heartbeat expires, the still-running process can republish its current tunnel URL.
