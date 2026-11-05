@@ -287,7 +287,6 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
     }
 
     // The manifest contains only paths selected in this run.
-    let previous_shards: Vec<crate::ShardRef> = Vec::new();
 
     // Which bytes belong to which object key, so a file that turns out to be
     // missing from the bucket can be sent again by name. A packed entry names no
@@ -409,10 +408,7 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
         uploaded_bytes,
         skipped: skipped.clone(),
         entries: plan.entries,
-        shards: previous_shards
-            .into_iter()
-            .chain(shards.iter().map(ShardBuild::reference))
-            .collect(),
+        shards: shards.iter().map(ShardBuild::reference).collect(),
     };
 
     // A manifest naming an object the bucket does not hold is how a restore comes
