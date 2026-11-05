@@ -587,6 +587,17 @@ mod tests {
     }
 
     #[test]
+    fn explicit_directory_exclusion_only_matches_that_path() {
+        let excludes = vec!["projects/cache/".to_string(), "cache/".to_string()];
+        assert!(is_excluded("cache", &excludes));
+        assert!(is_excluded("cache/pip/wheel.whl", &excludes));
+        assert!(is_excluded("projects/cache", &excludes));
+        assert!(is_excluded("projects/cache/item", &excludes));
+        assert!(!is_excluded("other/cache/item", &excludes));
+        assert!(!is_excluded("projects/cache-old/item", &excludes));
+    }
+
+    #[test]
     fn empty_includes_backs_up_the_whole_tree() {
         // The compatibility case: an unset allowlist must not read as "keep
         // nothing", or every config written before the picker loses its scope.
