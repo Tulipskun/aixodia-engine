@@ -195,7 +195,7 @@ async fn download(Query(query): Query<PathQuery>) -> Response {
         Ok(_) => return bad_path("download target is not a regular file"),
         Err(err) => return write_error(StatusCode::NOT_FOUND, "not_found", &err.to_string()),
     };
-    let name = real.file_name().unwrap_or_default().to_string_lossy().replace(['"', '\\r', '\\n'], "_");
+    let name = real.file_name().unwrap_or_default().to_string_lossy().replace('"', "_").replace('\r', "_").replace('\n', "_");
     let file = match tokio::fs::File::open(&real).await {
         Ok(file) => file,
         Err(err) => return write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
