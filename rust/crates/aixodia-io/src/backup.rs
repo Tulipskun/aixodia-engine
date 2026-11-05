@@ -984,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_puts_folders_first_and_marks_what_cannot_be_entered() {
+    fn browse_puts_folders_first_and_allows_directory_symlinks() {
         let dir = std::env::temp_dir().join(format!("aix-browse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("projects/app")).unwrap();
@@ -1014,11 +1014,8 @@ mod tests {
             .find(|entry| entry["name"] == json!("escape"))
             .unwrap();
         assert_eq!(link["is_symlink"], json!(true));
-        assert_eq!(
-            link["can_enter"],
-            json!(false),
-            "the walker does not follow a link, so neither may the picker"
-        );
+        assert_eq!(link["is_dir"], json!(true));
+        assert_eq!(link["can_enter"], json!(true));
         let file = entries
             .iter()
             .find(|entry| entry["name"] == json!("notes.txt"))
