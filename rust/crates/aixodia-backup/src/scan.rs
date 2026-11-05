@@ -90,18 +90,9 @@ pub fn is_excluded(rel: &str, excludes: &[String]) -> bool {
 
 /// `true` when `rel` is inside the selected-path list. An empty list selects nothing.
 ///
-/// Emptiness meaning *all* rather than *none* is what makes the field safe to
-/// add: a config written before there was a picker, and one the operator never
-/// narrowed, keep backing up the whole tree — including folders created after
-/// the day it was saved. A phone that seeded "every top-level folder ticked"
-/// would silently drop tomorrow's work, which is the same failure the allowlist
-/// was chosen to avoid, only pointing the other way.
-///
 /// An entry names a path *from the root*, not a folder that may appear anywhere.
-/// That is deliberately stricter than [`is_excluded`]: leaving something out can
-/// afford to be loose, taking something in cannot. A directory is kept when it
-/// is at or under an entry, and also when an entry lies below it, so the walk
-/// can reach the pick.
+/// A directory is kept when it is at or under an entry, and also when an entry
+/// lies below it, so the walk can reach the pick.
 pub fn is_included(rel: &str, includes: &[String]) -> bool {
     if includes.is_empty() {
         return false;
@@ -181,11 +172,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     p == pat.len()
 }
 
-/// Walks `root` and returns every entry that survives the allowlist and the
-/// exclusions, sorted by path. Nothing is crossed into another filesystem, so a
-/// bind mount inside the tree is left alone, and symlinks are recorded as
-/// symlinks rather than followed — a link to `/` must not become a link to
-/// everything.
+/// Walks `root` and returns entries matching the selected paths and any
+/// explicit exclusions, sorted by path. Directories are traversed across
+/// filesystem boundaries. Symlinks are recorded as symlinks, not traversed.
 ///
 /// Only metadata is read. That is what makes a preview cheap: the walk a preview
 /// does is the walk a backup would do anyway, minus the hashing.
