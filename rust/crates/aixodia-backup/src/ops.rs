@@ -3345,20 +3345,25 @@ mod scope_migration_tests {
         merge_scope_entries(
             &mut current,
             Some(&old),
-            &[],
+            &["cache".into()],
             &["cache/".into()],
         );
         assert!(current.is_empty());
     }
 
     #[test]
-    fn full_scope_keeps_only_entries_not_replaced_by_current_scan() {
+    fn selected_scope_keeps_only_entries_not_replaced_by_current_scan() {
         let old = manifest(
             vec![file("apps/current.bin", None), file("docs/readme", None)],
             Vec::new(),
         );
         let mut current = vec![file("apps/current.bin", None)];
-        merge_scope_entries(&mut current, Some(&old), &[], &[]);
+        merge_scope_entries(
+            &mut current,
+            Some(&old),
+            &["apps".into(), "docs".into()],
+            &[],
+        );
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].path, "apps/current.bin");
     }
