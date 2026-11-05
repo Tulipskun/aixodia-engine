@@ -668,7 +668,12 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         let is_link = file_type.is_symlink();
         // A selected source folder may itself be a mount point. The scanner
         // crosses that boundary only when the folder is explicitly included.
-        let can_enter = file_type.is_dir() && !is_link;
+        // Kernel pseudo filesystems remain unselectable.
+        let child_text = child.display().to_string();
+        let denied = BROWSE_DENY
+            .iter()
+            .any(|path| child_text == *path || child_text.starts_with(&format!("{path}/")));
+        let can_enter = file_type.is_dir() && !is_link && !denied;
         let entry = json!({
             "name": name,
             "path": joined(&text, &name),
