@@ -268,6 +268,13 @@ pub fn scan(
             } else {
                 format!("{rel_dir}/{name}")
             };
+            // These root-level pseudo filesystems are live kernel interfaces,
+            // not backup data. Never walk them even when "/" is the source root.
+            if root == Path::new("/")
+                && matches!(rel.as_str(), "proc" | "sys" | "dev" | "run")
+            {
+                continue;
+            }
             if is_excluded(&rel, excludes) || !is_included(&rel, includes) {
                 continue;
             }
