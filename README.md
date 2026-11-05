@@ -20,7 +20,8 @@ keeping the same pid, working directory, standard streams and active session.
 
 ```bash
 export CF_TOKEN=xxxxx    # used to publish the tunnel URL to D1
-aixodia start
+aixodia                 # foreground start
+# or: aixodia start
 ```
 
 **The engine always runs in the foreground.** `aixodia start` replaces the
