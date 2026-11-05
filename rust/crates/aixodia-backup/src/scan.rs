@@ -10,46 +10,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Kind, Manifest, Result};
 
-/// Directories that are either a cache or part of the image rather than the
-/// operator's data. A pattern without a `/` is matched against every path
-/// component, so `target` prunes `aixodia-engine/rust/target` wherever it
-/// appears; a pattern with `/` is matched against the whole relative path.
-///
-/// The Rust toolchain is deliberately not on this list. A machine that has been
-/// restored but cannot build is indistinguishable, from the operator's side,
-/// from a restore that lost the tree — and it is what the old scope was doing:
-/// `.cargo` and `.rustup` here cost a reinstall of the toolchain after every
-/// rebuild, which reads as an incomplete restore.
-///
-/// Nothing here targets core dumps. `core.*` did, and it globed onto every
-/// `core.rs`, `core.py` and `core.h` in the tree — those files never entered a
-/// manifest, and a file no manifest names is a file no restore can bring back.
-/// There is no safe replacement either: `core` alone would prune a `core/`
-/// source directory. A dump is the operator's to delete.
-pub const DEFAULT_EXCLUDES: &[&str] = &[
-    "target",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "poetry-cache",
-    ".cache",
-    ".npm",
-    ".npm/_cacache",
-    ".julia",
-    ".qoder",
-    ".qodersec",
-    ".local/share/Trash",
-    ".Trash",
-    "lost+found",
-    ".git/lfs/objects",
-    "*.pyc",
-    "*.swp",
-    // A restore writes each file's pieces into one of these and renames it over
-    // the final name, so a half-run leaves them behind. They are a stopped run's
-    // debris, never the operator's data.
-    "*.aixodia-part",
-];
+/// No paths are excluded unless the operator explicitly selects an exclusion.
+pub const DEFAULT_EXCLUDES: &[&str] = &[];
 
 /// Patterns an older build shipped in the defaults that a stored scope may still
 /// carry. A scope is corrected when it is read, so a machine that picked the
@@ -517,8 +479,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn component_pattern_prunes_any_depth() {
-        let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+    fn explicit_exclusion_patterns_prune_any_depth() {
+        let excludes: Vec<String> = ["target", "__pycache__", ".cache", "*.pyc", "*.aixodia-part"]
+            .iter().map(|s| s.to_string()).collect();
         assert!(is_excluded("aixodia-engine/rust/target/debug/x", &excludes));
         assert!(is_excluded(".cache/pip/wheel.whl", &excludes));
         assert!(is_excluded("a/b/__pycache__/c.pyc", &excludes));
@@ -540,7 +503,7 @@ mod tests {
     /// a backup, cargo registries included.
     #[test]
     fn a_source_file_named_core_is_backed_up() {
-        let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        let excludes: Vec<String> = Vec::new();
         for path in [
             "src/core.rs",
             "app/core.py",
@@ -643,7 +606,7 @@ mod tests {
         fs::create_dir_all(dir.join("drop")).unwrap();
         fs::write(dir.join("drop/b.txt"), b"b").unwrap();
 
-        let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        let excludes = vec!["target".to_string()];
         let includes = vec!["keep".to_string()];
         let mut skipped = Vec::new();
         let found = scan(&dir, &excludes, &includes, &mut skipped).unwrap();
@@ -682,9 +645,10 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc", dir.join("sub/escape")).unwrap();
 
-        let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        let excludes = vec!["target".to_string()];
+        let includes = vec!["sub".to_string(), "target".to_string()];
         let mut skipped = Vec::new();
-        let found = scan(&dir, &excludes, &[], &mut skipped).unwrap();
+        let found = scan(&dir, &excludes, &includes, &mut skipped).unwrap();
         let paths: Vec<&str> = found.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.contains(&"sub"), "got {paths:?}");
         assert!(paths.contains(&"sub/a.txt"));
