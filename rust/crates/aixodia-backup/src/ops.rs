@@ -675,18 +675,6 @@ fn pack_shards(
             }
             let mut held: Vec<usize> = Vec::with_capacity(group.len());
             let mut as_packed: Vec<pack::Member> = Vec::with_capacity(group.len());
-            for (index, member) in group.into_iter().zip(
-                // The task's member list and group have the same stable order.
-                // Recreate the member from the manifest entry after drift is applied.
-                built
-                    .drifted
-                    .iter()
-                    .filter(|d| d.path.is_empty())
-                    .map(|_| unreachable!())
-                    .collect::<Vec<_>>(),
-            ) {
-                let _ = (index, member);
-            }
             // Reconcile the files the container actually held with the scan. A
             // live file may have changed or disappeared between the two passes.
             // The original member list is reconstructed from the current entries
