@@ -145,10 +145,65 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
     let Some(store) = g.state_store() else {
         return write_error(StatusCode::BAD_GATEWAY, "database_error", "the engine state store is not open");
     };
-    let persisted_last = match store.get_state(LAST_BACKUP_KEY).await {
-        Ok(raw) => raw.and_then(|value| serde_json::from_str::<Value>(&value).ok()).unwrap_or(Value::Null),
+    let persisted_raw = match store.get_state(LAST_BACKUP_KEY).await {
+        Ok(raw) => raw,
         Err(err) => return write_error(StatusCode::BAD_GATEWAY, "database_error", &err.to_string()),
     };
+    let mut persisted_last = persisted_raw
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or(Value::Null);
+    if persisted_last["none"] == true {
+        persisted_last = Value::Null;
+    }
+    // Migrate the timestamp from the bucket's existing manifest on the first
+    // read after upgrading from an engine that kept its result only in memory.
+    // A small sentinel prevents a bucket with no backup from being queried on
+    // every status poll.
+    if persisted_raw.is_none() && ready(&config, RESTORE_RUN) {
+        let lookup_config = config.clone();
+        let legacy = tokio::task::spawn_blocking(move || -> Result<Option<Value>, String> {
+            let hub = aixodia_backup::Hub::new(&lookup_config).map_err(|err| err.to_string())?;
+            let Some(manifest) = aixodia_backup::latest_manifest(&hub).map_err(|err| err.to_string())? else {
+                return Ok(None);
+            };
+            Ok(Some(json!({
+                "operation": "backup",
+                "started_at": manifest.created_at,
+                "finished_at": manifest.created_at,
+                "summary": {
+                    "ok": true,
+                    "report": {
+                        "name": manifest.name,
+                        "bucket": lookup_config.bucket,
+                        "root": manifest.root,
+                        "files": manifest.counts.files,
+                        "dirs": manifest.counts.dirs,
+                        "symlinks": manifest.counts.symlinks,
+                        "bytes": manifest.counts.bytes,
+                        "uploaded_bytes": manifest.uploaded_bytes,
+                        "skipped": manifest.skipped,
+                        "duration_ms": 0
+                    }
+                }
+            })))
+        }).await;
+        match legacy {
+            Ok(Ok(Some(record))) => {
+                if let Err(err) = store.put_state(LAST_BACKUP_KEY, &record.to_string()).await {
+                    tracing::warn!("could not persist migrated last-backup manifest: {err}");
+                }
+                persisted_last = record;
+            }
+            Ok(Ok(None)) => {
+                if let Err(err) = store.put_state(LAST_BACKUP_KEY, r#"{"none":true}"#).await {
+                    tracing::warn!("could not persist empty last-backup marker: {err}");
+                }
+            }
+            Ok(Err(err)) => tracing::warn!("could not read legacy last-backup manifest: {err}"),
+            Err(err) => tracing::warn!("legacy last-backup lookup worker failed: {err}"),
+        }
+    }
     let slots = slots().lock().unwrap_or_else(|e| e.into_inner());
     let active = slots.active.as_ref().map(|active| {
         json!({
