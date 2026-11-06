@@ -517,6 +517,9 @@ fn finish(
         "finished_at": aixodia_backup::now_unix(),
         "summary": summary,
     });
+    if operation == "restore" && finished["summary"]["ok"] == true {
+        crate::auto_backup::mark_restore_complete();
+    }
     if operation == "backup" && finished["summary"]["ok"] == true {
         if let Some(store) = store {
             let raw = finished.to_string();
