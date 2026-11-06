@@ -112,10 +112,7 @@ pub(crate) fn resolve(stored: Option<&str>) -> aixodia_backup::Config {
         endpoint,
         prefix: parsed.prefix.unwrap_or(defaults.prefix),
         root,
-        excludes: parsed
-            .excludes
-            .map(|stored| aixodia_backup::scan::sanitize_excludes(&stored))
-            .unwrap_or(defaults.excludes),
+        excludes: Vec::new(),
         includes: parsed.includes.unwrap_or(defaults.includes),
         timeout_secs: defaults.timeout_secs,
     }
