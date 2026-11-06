@@ -531,7 +531,7 @@ mod tests {
             "n=$(cat \"$0.n\" 2>/dev/null || echo 0)\n\
              n=$((n+1))\n\
              echo $n > \"$0.n\"\n\
-             echo \"INF Your quick Tunnel has been created! Visit it at https://t$n.trycloudflare.com\" >&2\n\
+             echo \"INF Starting configured Named Tunnel $n\" >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              if [ \"$n\" -ge 2 ]; then sleep 30; else sleep 1; fi\n",
         );
