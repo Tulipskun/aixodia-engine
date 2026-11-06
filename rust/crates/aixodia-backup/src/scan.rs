@@ -525,6 +525,28 @@ mod tests {
     }
 
     #[test]
+    fn selected_parent_excludes_only_the_unchecked_subtree() {
+        let rules = vec!["root".to_string(), "!root/.cache".to_string()];
+        assert!(is_included("root", &rules));
+        assert!(is_included("root/.config", &rules));
+        assert!(!is_included("root/.cache", &rules));
+        assert!(!is_included("root/.cache/pip", &rules));
+        assert!(!is_included("root-sibling/file", &rules));
+    }
+
+    #[test]
+    fn a_nested_positive_rule_can_reinclude_a_subtree() {
+        let rules = vec![
+            "root".to_string(),
+            "!root/.cache".to_string(),
+            "root/.cache/needed".to_string(),
+        ];
+        assert!(is_included("root/.cache/needed", &rules));
+        assert!(is_included("root/.cache/needed/file", &rules));
+        assert!(!is_included("root/.cache/other", &rules));
+    }
+
+    #[test]
     fn selected_files_and_independent_paths_are_scanned_without_siblings() {
         let dir = std::env::temp_dir().join(format!("aix-file-picks-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
