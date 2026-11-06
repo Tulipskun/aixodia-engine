@@ -40,7 +40,7 @@ bin="$fakebin/aixodia-engine"
 make_engine "$bin"
 make_cloudflared "$fakebin"
 out_file="$home/out"
-env -u CF_TOKEN -u CF_TUNNEL_TOKEN -u CLOUDFLARE_TUNNEL_TOKEN AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
+env -u CF_TOKEN AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
   ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" ENGINE_HOME_FILE="$home/engine-home" \
   PATH="$fakebin:$PATH" bash "$LAUNCHER" start >"$out_file" 2>&1
 rc=$?
