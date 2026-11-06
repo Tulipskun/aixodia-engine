@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -244,7 +244,6 @@ pub struct Keeper {
     url: String,
     publish: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pidfile: PathBuf,
-    mu: Mutex<Option<Tunnel>>,
 }
 
 impl Keeper {
@@ -265,12 +264,7 @@ impl Keeper {
             url: url.into(),
             publish,
             pidfile: pidfile.into(),
-            mu: Mutex::new(None),
         }
-    }
-
-    fn set(&self, tunnel: Option<Tunnel>) {
-        *self.mu.lock().unwrap() = tunnel;
     }
 
     /// Keeps a tunnel up for the life of `cancel`.
@@ -283,20 +277,17 @@ impl Keeper {
                 Ok(tunnel) => {
                     record_pid(&self.pidfile, tunnel.pid);
                     let url = tunnel.url().to_string();
-                    let active_tunnel = tunnel.clone();
-                    self.set(Some(tunnel));
                     tracing::info!("tunnel url: {url}");
                     if let Some(publish) = &self.publish {
                         publish(url);
                     }
                     tokio::select! {
                         _ = cancel.cancelled() => {
-                            active_tunnel.kill();
+                            tunnel.kill();
                             return;
                         }
-                        _ = active_tunnel.done() => {}
+                        _ = tunnel.done() => {}
                     }
-                    self.set(None);
                     tracing::warn!("tunnel: cloudflared exited; restarting");
                 }
                 Err(err) => {
