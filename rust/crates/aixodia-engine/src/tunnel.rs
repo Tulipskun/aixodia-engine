@@ -283,18 +283,18 @@ impl Keeper {
                 Ok(tunnel) => {
                     record_pid(&self.pidfile, tunnel.pid);
                     let url = tunnel.url().to_string();
+                    let active_tunnel = tunnel.clone();
                     self.set(Some(tunnel));
                     tracing::info!("tunnel url: {url}");
                     if let Some(publish) = &self.publish {
                         publish(url);
                     }
-                    let tunnel = self.current().expect("tunnel was just set");
                     tokio::select! {
                         _ = cancel.cancelled() => {
-                            tunnel.kill();
+                            active_tunnel.kill();
                             return;
                         }
-                        _ = tunnel.done() => {}
+                        _ = active_tunnel.done() => {}
                     }
                     self.set(None);
                     tracing::warn!("tunnel: cloudflared exited; restarting");
