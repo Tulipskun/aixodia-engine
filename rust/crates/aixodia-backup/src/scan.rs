@@ -74,33 +74,37 @@ pub fn is_excluded(rel: &str, excludes: &[String]) -> bool {
     false
 }
 
-/// `true` when `rel` is inside the selected-path list. An empty list selects nothing.
-///
-/// Each entry is a path relative to the filesystem root. A directory is kept
-/// when it is at or below an entry, and ancestors are walked when an entry lies
-/// below them so the scanner can reach the selected path.
+/// A rule is a selected path, or an excluded path prefixed with !.
+/// The most specific matching rule wins, so selecting root and excluding
+/// !root/.cache backs up the whole tree except that subtree.
+fn selected_by_rules(rel: &str, includes: &[String]) -> bool {
+    includes.iter()
+        .filter_map(|raw| {
+            let raw = raw.trim();
+            let (excluded, path) = raw.strip_prefix('!')
+                .map(|path| (true, path))
+                .unwrap_or((false, raw));
+            if path.is_empty() || !(rel == path || rel.starts_with(&format!("{path}/"))) {
+                return None;
+            }
+            Some((path.len(), !excluded))
+        })
+        .max_by_key(|(length, _)| *length)
+        .map(|(_, selected)| selected)
+        .unwrap_or(false)
+}
+
+/// true when rel is selected or is an ancestor needed to reach a selected path.
+/// An empty list selects nothing.
 pub fn is_included(rel: &str, includes: &[String]) -> bool {
-    if includes.is_empty() {
-        return false;
+    if selected_by_rules(rel, includes) {
+        return true;
     }
-    includes.iter().map(|p| p.trim()).any(|pattern| {
-        if pattern.is_empty() {
-            return false;
-        }
-        // The pick itself, or anything inside it.
-        if rel == pattern || rel.starts_with(&format!("{pattern}/")) {
-            return true;
-        }
-        // The pick is below here, so this directory has to be walked.
-        if pattern.starts_with(&format!("{rel}/")) {
-            return true;
-        }
-        if !(pattern.contains('*') || pattern.contains('?')) {
-            return false;
-        }
-        // A wildcard entry can also match a path it is not a literal prefix of,
-        // and can sit below a directory whose name it matches component-wise.
-        prefix_matches(pattern, rel) || leads_to_match(rel, pattern)
+    includes.iter().any(|raw| {
+        let raw = raw.trim();
+        !raw.starts_with('!')
+            && raw.starts_with(&format!("{rel}/"))
+            && selected_by_rules(raw, includes)
     })
 }
 
