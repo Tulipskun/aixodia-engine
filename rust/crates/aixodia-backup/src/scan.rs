@@ -77,6 +77,17 @@ pub fn is_excluded(rel: &str, excludes: &[String]) -> bool {
 /// A rule is a selected path, or an excluded path prefixed with !.
 /// The most specific matching rule wins, so selecting root and excluding
 /// !root/.cache backs up the whole tree except that subtree.
+fn rule_matches_or_reaches(pattern: &str, rel: &str) -> bool {
+    if rel == pattern || rel.starts_with(&format!("{pattern}/")) {
+        return true;
+    }
+    if pattern.contains('*') || pattern.contains('?') {
+        prefix_matches(pattern, rel) || leads_to_match(rel, pattern)
+    } else {
+        false
+    }
+}
+
 fn selected_by_rules(rel: &str, includes: &[String]) -> bool {
     includes.iter()
         .filter_map(|raw| {
@@ -84,7 +95,7 @@ fn selected_by_rules(rel: &str, includes: &[String]) -> bool {
             let (excluded, path) = raw.strip_prefix('!')
                 .map(|path| (true, path))
                 .unwrap_or((false, raw));
-            if path.is_empty() || !(rel == path || rel.starts_with(&format!("{path}/"))) {
+            if path.is_empty() || !rule_matches_or_reaches(path, rel) {
                 return None;
             }
             Some((path.len(), !excluded))
@@ -102,9 +113,15 @@ pub fn is_included(rel: &str, includes: &[String]) -> bool {
     }
     includes.iter().any(|raw| {
         let raw = raw.trim();
-        !raw.starts_with('!')
-            && raw.starts_with(&format!("{rel}/"))
-            && selected_by_rules(raw, includes)
+        if raw.starts_with('!') || raw.is_empty() {
+            return false;
+        }
+        let pattern = raw;
+        if pattern.starts_with(&format!("{rel}/")) {
+            return selected_by_rules(pattern, includes);
+        }
+        (pattern.contains('*') || pattern.contains('?'))
+            && leads_to_match(rel, pattern)
     })
 }
 
