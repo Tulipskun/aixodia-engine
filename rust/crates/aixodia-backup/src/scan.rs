@@ -552,6 +552,27 @@ mod tests {
     }
 
     #[test]
+    fn scanning_a_selected_parent_prunes_an_excluded_child_folder() {
+        let dir = std::env::temp_dir().join(format!("aix-nested-exclude-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("root/.cache")).unwrap();
+        fs::create_dir_all(dir.join("root/.config")).unwrap();
+        fs::write(dir.join("root/.cache/secret"), b"excluded").unwrap();
+        fs::write(dir.join("root/.config/keep"), b"included").unwrap();
+
+        let includes = vec!["root".to_string(), "!root/.cache".to_string()];
+        let mut skipped = Vec::new();
+        let scanned = scan(&dir, &[], &includes, &mut skipped).unwrap();
+        let paths: Vec<&str> = scanned.iter().map(|entry| entry.path.as_str()).collect();
+        assert!(paths.contains(&"root"));
+        assert!(paths.contains(&"root/.config"));
+        assert!(paths.contains(&"root/.config/keep"));
+        assert!(!paths.iter().any(|path| path.starts_with("root/.cache")));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_nested_positive_rule_can_reinclude_a_subtree() {
         let rules = vec![
             "root".to_string(),
