@@ -6,7 +6,8 @@
 //! path as a manual trigger). Disabled until explicitly turned on via config.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -21,12 +22,33 @@ const DEFAULT_COOLDOWN_SECS: u64 = 1800;
 
 /// Live state visible to the API layer for status reporting.
 static AUTO_STATE: OnceLock<AutoState> = OnceLock::new();
+static CPU_HISTORY: OnceLock<Mutex<VecDeque<f64>>> = OnceLock::new();
+
+const CPU_HISTORY_LIMIT: usize = 60;
+
+fn cpu_history() -> &'static Mutex<VecDeque<f64>> {
+    CPU_HISTORY.get_or_init(|| Mutex::new(VecDeque::with_capacity(CPU_HISTORY_LIMIT)))
+}
+
+fn record_cpu_sample(value: f64) {
+    let mut history = cpu_history().lock().unwrap_or_else(|e| e.into_inner());
+    if history.len() == CPU_HISTORY_LIMIT {
+        history.pop_front();
+    }
+    history.push_back(value.clamp(0.0, 100.0));
+}
+
+/// Auto-backup stays locked until this process has completed a successful restore.
+pub fn mark_restore_complete() {
+    state().restore_ready.store(true, Ordering::Release);
+}
 
 pub struct AutoState {
     pub idle_streak_secs: AtomicU64,
     pub cpu_current_pct: AtomicU64,
     pub last_auto_backup_at: AtomicI64,
     pub enabled: AtomicBool,
+    pub restore_ready: AtomicBool,
 }
 
 fn state() -> &'static AutoState {
@@ -35,6 +57,7 @@ fn state() -> &'static AutoState {
         cpu_current_pct: AtomicU64::new(0),
         last_auto_backup_at: AtomicI64::new(0),
         enabled: AtomicBool::new(false),
+        restore_ready: AtomicBool::new(false),
     })
 }
 
@@ -45,6 +68,8 @@ pub fn auto_status_json() -> serde_json::Value {
         "idle_streak_secs": s.idle_streak_secs.load(Ordering::Relaxed),
         "cpu_current": s.cpu_current_pct.load(Ordering::Relaxed) as f64 / 10.0,
         "last_auto_backup_at": s.last_auto_backup_at.load(Ordering::Relaxed),
+        "restore_ready": s.restore_ready.load(Ordering::Acquire),
+        "cpu_history": cpu_history().lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect::<Vec<_>>(),
     })
 }
 
@@ -95,6 +120,12 @@ pub fn spawn(g: Arc<Gateway>, cancel: CancellationToken) {
             state()
                 .cpu_current_pct
                 .store((cpu_pct * 10.0) as u64, Ordering::Relaxed);
+            record_cpu_sample(cpu_pct);
+
+            if !state().restore_ready.load(Ordering::Acquire) {
+                state().idle_streak_secs.store(0, Ordering::Relaxed);
+                continue;
+            }
 
             if cpu_pct < cfg.cpu_threshold {
                 let streak = state()
