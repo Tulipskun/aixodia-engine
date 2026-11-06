@@ -218,8 +218,8 @@ impl Config {
     /// that can never match does not fail loudly — it backs up a smaller tree and
     /// reports success — which is the one mistake this tool cannot take back.
     pub fn validate_scope(&self) -> Result<()> {
-        for pattern in &self.includes {
-            let pattern = pattern.trim();
+        for raw in &self.includes {
+            let pattern = raw.trim().strip_prefix('!').unwrap_or(raw.trim());
             if pattern.is_empty() {
                 continue;
             }
