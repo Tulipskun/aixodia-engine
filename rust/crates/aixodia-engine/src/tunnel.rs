@@ -83,79 +83,42 @@ impl Tunnel {
     }
 }
 
-/// Finds the leftmost `https://*.trycloudflare.com` URL in one log line.
-///
-/// This is the Go `tunnelURL` regexp (`https://[A-Za-z0-9.-]+\.trycloudflare\.com`)
-/// written out by hand: the workspace has no `regex` dependency, and the
-/// leftmost match the regexp produces is easy to reproduce directly — take the
-/// longest run of URL characters after `https://` that still ends in the
-/// trycloudflare suffix.
-pub fn find_tunnel_url(line: &str) -> Option<&str> {
-    let bytes = line.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = line[from..].find(URL_PREFIX) {
-        let start = from + offset;
-        let after = start + URL_PREFIX.len();
-        let mut end = after;
-        while end < bytes.len() && is_url_char(bytes[end]) {
-            end += 1;
-        }
-        // The `+` in the regexp needs at least one character before the suffix.
-        let min_end = after + 1 + URL_SUFFIX.len();
-        let mut stop = end;
-        while stop >= min_end {
-            if &line[stop - URL_SUFFIX.len()..stop] == URL_SUFFIX {
-                return Some(&line[start..stop]);
-            }
-            stop -= 1;
-        }
-        from = after;
-    }
-    None
-}
-
-/// Whether one byte may appear in the hostname part of a quick-tunnel URL.
-fn is_url_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-'
-}
-
-/// Runs cloudflared and waits until the quick tunnel has registered with the
-/// edge, so the URL it returns is one that actually resolves. It needs the
-/// cloudflared binary on the given path.
+/// Starts the account-managed Named Tunnel and waits until cloudflared has
+/// registered at least one edge connection. The stable public URL is supplied
+/// by CF_TUNNEL_URL; Cloudflare owns hostname-to-origin routing in its dashboard.
 pub async fn start_cloudflared(cancel: CancellationToken, path: &Path) -> anyhow::Result<Tunnel> {
+    let token = std::env::var("CF_TUNNEL_TOKEN")
+        .or_else(|_| std::env::var("CLOUDFLARE_TUNNEL_TOKEN"))
+        .unwrap_or_default();
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!("CF_TUNNEL_TOKEN is not set");
+    }
+
+    let url = std::env::var("CF_TUNNEL_URL")
+        .unwrap_or_else(|_| "https://aixodia.dpdns.org".to_string());
+    let url = url.trim().trim_end_matches('/').to_string();
+    if !url.starts_with("https://") || url.len() <= "https://".len() {
+        anyhow::bail!("CF_TUNNEL_URL must be an https:// URL");
+    }
+
     let mut command = tokio::process::Command::new(path);
-    command.args([
-        "tunnel",
-        "--no-autoupdate",
-        "--metrics",
-        "127.0.0.1:0",
-        "--url",
-        "http://127.0.0.1:8787",
-    ]);
-    command.stderr(std::process::Stdio::piped());
-    command.kill_on_drop(true);
+    command
+        .args(["tunnel", "--no-autoupdate", "--metrics", "127.0.0.1:0", "run"])
+        .env("TUNNEL_TOKEN", token)
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     let mut child = command.spawn()?;
     let pid = child.id();
 
-    let stderr = child
-        .stderr
-        .take()
+    let stderr = child.stderr.take()
         .ok_or_else(|| anyhow::anyhow!("cloudflared: no stderr pipe"))?;
-
-    // The URL is announced before the tunnel is reachable; only the
-    // registration line means the hostname actually resolves.
     let (ready_tx, ready_rx) = oneshot::channel::<String>();
     tokio::spawn(async move {
         let mut lines = BufReader::with_capacity(64 * 1024, stderr).lines();
-        let mut url = String::new();
         let mut ready_tx = Some(ready_tx);
         while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(found) = find_tunnel_url(&line) {
-                url = found.to_string();
-            }
-            if !url.is_empty() && line.contains(REGISTERED_LINE) {
-                // The Go reader sends into a buffered channel with a `default`
-                // arm, so only the first registration is published.
+            if line.contains(REGISTERED_LINE) {
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(url.clone());
                 }
@@ -171,9 +134,7 @@ pub async fn start_cloudflared(cancel: CancellationToken, path: &Path) -> anyhow
         let mut kill_rx = kill_rx;
         let killed = {
             let wait = child.wait();
-            let stop = async {
-                let _ = kill_rx.changed().await;
-            };
+            let stop = async { let _ = kill_rx.changed().await; };
             tokio::pin!(wait, stop);
             tokio::select! {
                 _ = &mut wait => false,
@@ -194,23 +155,17 @@ pub async fn start_cloudflared(cancel: CancellationToken, path: &Path) -> anyhow
         ready = ready_rx => ready.ok(),
         _ = done_wait.changed() => None,
         _ = tokio::time::sleep(REGISTER_TIMEOUT) => {
-            if let Some(tx) = kill.take() {
-                let _ = tx.send(true);
-            }
-            anyhow::bail!("timed out waiting for the trycloudflare URL");
+            if let Some(tx) = kill.take() { let _ = tx.send(true); }
+            anyhow::bail!("timed out waiting for the Named Tunnel to register");
         }
         _ = cancel.cancelled() => {
-            if let Some(tx) = kill.take() {
-                let _ = tx.send(true);
-            }
+            if let Some(tx) = kill.take() { let _ = tx.send(true); }
             anyhow::bail!("cloudflared cancelled");
         }
     };
     let Some(url) = url else {
-        if let Some(tx) = kill.take() {
-            let _ = tx.send(true);
-        }
-        anyhow::bail!("cloudflared exited before the tunnel registered");
+        if let Some(tx) = kill.take() { let _ = tx.send(true); }
+        anyhow::bail!("cloudflared exited before the Named Tunnel registered");
     };
 
     Ok(Tunnel {
