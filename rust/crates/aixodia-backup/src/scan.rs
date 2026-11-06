@@ -13,20 +13,6 @@ use crate::{Error, Kind, Manifest, Result};
 /// No paths are excluded unless the operator explicitly selects an exclusion.
 pub const DEFAULT_EXCLUDES: &[&str] = &[];
 
-/// Patterns an older build shipped in the defaults that a stored scope may still
-/// carry. A scope is corrected when it is read, so a machine that picked the
-/// scope before this rule existed captures its source files on the next run.
-pub const LEGACY_EXCLUDES: &[&str] = &["core.*"];
-
-/// Drops the retired patterns from a scope the operator wrote.
-pub fn sanitize_excludes(excludes: &[String]) -> Vec<String> {
-    excludes
-        .iter()
-        .filter(|pattern| !LEGACY_EXCLUDES.contains(&pattern.trim()))
-        .cloned()
-        .collect()
-}
-
 /// One filesystem entry as found on disk, before it is decided whether its
 /// content has to be read.
 #[derive(Clone, Debug)]
