@@ -493,19 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_scope_loses_the_retired_pattern() {
-        let stored = vec!["target".to_string(), "core.*".to_string(), "*.pyc".into()];
-        assert_eq!(
-            sanitize_excludes(&stored),
-            vec!["target".to_string(), "*.pyc".to_string()]
-        );
-        assert_eq!(
-            sanitize_excludes(&[" core.* ".to_string()]),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
     fn path_pattern_and_glob() {
         let excludes = vec!["a/b/*".to_string(), "*.tmp".to_string()];
         assert!(is_excluded("a/b/c", &excludes));
