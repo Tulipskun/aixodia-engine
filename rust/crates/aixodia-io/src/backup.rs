@@ -266,6 +266,14 @@ pub async fn api_backup_config_put(State(g): State<Arc<Gateway>>, body: Bytes) -
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok())
         .unwrap_or_default();
+    let previous_restore_identity = (
+        previous.token.clone(),
+        previous.bucket.clone(),
+        previous.prefix.clone(),
+        previous.root.clone(),
+        previous.excludes.clone(),
+        previous.includes.clone(),
+    );
     let merged = Stored {
         token: incoming
             .token
@@ -282,6 +290,14 @@ pub async fn api_backup_config_put(State(g): State<Arc<Gateway>>, body: Bytes) -
         auto_cpu_threshold: incoming.auto_cpu_threshold.or(previous.auto_cpu_threshold),
         auto_cooldown_secs: incoming.auto_cooldown_secs.or(previous.auto_cooldown_secs),
     };
+    let restore_identity_changed = previous_restore_identity != (
+        merged.token.clone(),
+        merged.bucket.clone(),
+        merged.prefix.clone(),
+        merged.root.clone(),
+        merged.excludes.clone(),
+        merged.includes.clone(),
+    );
     let raw = match serde_json::to_string(&merged) {
         Ok(raw) => raw,
         Err(err) => {
@@ -305,6 +321,9 @@ pub async fn api_backup_config_put(State(g): State<Arc<Gateway>>, body: Bytes) -
     }
     if let Err(err) = store.put_state(BACKUP_CONFIG_KEY, &raw).await {
         return write_error(StatusCode::BAD_GATEWAY, "database_error", &err.to_string());
+    }
+    if restore_identity_changed {
+        crate::auto_backup::require_restore();
     }
     let config = resolve(Some(&raw));
     write_json(
@@ -517,7 +536,12 @@ fn finish(
         "finished_at": aixodia_backup::now_unix(),
         "summary": summary,
     });
-    if operation == "restore" && finished["summary"]["ok"] == true {
+    if operation == "restore"
+        && finished["summary"]["ok"] == true
+        && finished["summary"]["report"]["failed"]
+            .as_array()
+            .map_or(true, |failed| failed.is_empty())
+    {
         crate::auto_backup::mark_restore_complete();
     }
     if operation == "backup" && finished["summary"]["ok"] == true {
