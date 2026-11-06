@@ -203,8 +203,6 @@ struct OutFrame {
     daemon_url: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     daemon_version: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    daemon_heartbeat: i64,
     daemon_started: i64,
     daemon_online: bool,
 }
@@ -308,14 +306,13 @@ impl Hub {
             .retain(|other| !Arc::ptr_eq(other, peer));
     }
 
-    /// Pushes one daemon frame to every connected phone, so discovery listens for
-    /// the daemon's own announcements instead of reading the D1 row on a timer.
+    /// Pushes one daemon frame to every connected phone, carrying only the
+    /// stable endpoint and process version. No heartbeat is stored or sent.
     /// No phones connected, no frame sent.
     pub async fn broadcast_daemon(
         &self,
         url: &str,
         version: &str,
-        heartbeat: i64,
         started: i64,
         online: bool,
     ) -> Option<WsError> {
@@ -324,7 +321,6 @@ impl Hub {
             kind: "daemon".to_string(),
             daemon_url: url.to_string(),
             daemon_version: version.to_string(),
-            daemon_heartbeat: heartbeat,
             daemon_started: started,
             daemon_online: online,
             ..OutFrame::default()
