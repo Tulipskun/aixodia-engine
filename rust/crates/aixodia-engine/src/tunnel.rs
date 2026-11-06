@@ -35,7 +35,7 @@ pub struct Tunnel {
     /// next process image can reap it: `execve` keeps the engine's pid but
     /// leaves the children of the image it replaced running, and a crash leaves
     /// them to init — either way the old Named Tunnel stays up and keeps
-    /// answering on a URL D1 no longer names.
+    /// answering on an endpoint KV no longer names.
     pid: Option<u32>,
     done: watch::Receiver<bool>,
     kill: watch::Sender<bool>,
@@ -50,6 +50,7 @@ impl Tunnel {
     /// Whether cloudflared is still running. It is the daemon's real health:
     /// the HTTP server can keep serving while the tunnel that makes it
     /// reachable is already gone.
+    #[cfg(test)]
     pub fn alive(&self) -> bool {
         !*self.done.borrow()
     }
@@ -266,22 +267,6 @@ impl Keeper {
             pidfile: pidfile.into(),
             mu: Mutex::new(None),
         }
-    }
-
-    /// Whether the tunnel is up right now. The engine checks this before retrying a dead tunnel.
-    pub fn alive(&self) -> bool {
-        self.current().map(|tunnel| tunnel.alive()).unwrap_or(false)
-    }
-
-    /// The tunnel this keeper currently has up, empty while it has none.
-    pub fn url(&self) -> String {
-        self.current()
-            .map(|tunnel| tunnel.url().to_string())
-            .unwrap_or_default()
-    }
-
-    fn current(&self) -> Option<Tunnel> {
-        self.mu.lock().unwrap().clone()
     }
 
     fn set(&self, tunnel: Option<Tunnel>) {
