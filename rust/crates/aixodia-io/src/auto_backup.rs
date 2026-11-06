@@ -43,6 +43,12 @@ pub fn mark_restore_complete() {
     state().restore_ready.store(true, Ordering::Release);
 }
 
+/// A change to the bucket or selected tree invalidates the previous restore.
+pub fn require_restore() {
+    state().restore_ready.store(false, Ordering::Release);
+    state().idle_streak_secs.store(0, Ordering::Relaxed);
+}
+
 pub struct AutoState {
     pub idle_streak_secs: AtomicU64,
     pub cpu_current_pct: AtomicU64,
