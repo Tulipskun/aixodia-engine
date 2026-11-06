@@ -81,5 +81,5 @@ fi
 log "installed: $PREFIX/{aixodia-engine, aixodia}$(command -v cloudflared >/dev/null 2>&1 && echo "" || echo ", cloudflared")"
 echo
 echo "Start it with:"
-echo "  export CF_TOKEN=xxxxx   # the engine publishes its tunnel url to D1 with this"
+echo "  export CF_TOKEN=xxxxx   # reads Named Tunnel config and publishes endpoint to Workers KV"
 echo "  aixodia start"
