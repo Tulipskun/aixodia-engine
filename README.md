@@ -1,7 +1,7 @@
 # AIxodia
 
 The AIxodia engine: serves the chat API on `127.0.0.1:8787`, puts a Cloudflare
-quick tunnel in front of it, and tells the phone the tunnel URL via D1.
+Named Tunnel in front of it, and tells the phone the tunnel URL via D1.
 
 ## Remote filesystem API
 
@@ -47,7 +47,9 @@ keeping the same pid, working directory, standard streams and active session.
 ## Run
 
 ```bash
-export CF_TOKEN=xxxxx    # used to publish the tunnel URL to D1
+export CF_TOKEN=xxxxx              # Cloudflare Worker/D1 API token
+export CF_TUNNEL_TOKEN=xxxxx       # Named Tunnel connector token
+export CF_TUNNEL_URL=https://aixodia.dpdns.org
 aixodia                 # foreground start
 # or: aixodia start
 ```
@@ -157,6 +159,6 @@ release, which is what `install.sh` downloads.
 ## Terminal transport
 
 There is no P2P/WebRTC/TURN path. The terminal is a normal WebSocket over the
-same Cloudflare quick tunnel as the API, with a short-lived single-use ticket
+same Cloudflare Named Tunnel as the API, with a short-lived single-use ticket
 instead of putting the long-lived API token in a WebView URL. Shell ownership
 stays in the engine and, with tmux, survives an engine restart.
