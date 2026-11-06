@@ -112,6 +112,11 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .await?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("Workers KV key tunnel_url is missing or empty"))?;
+    let parsed_tunnel_url = url::Url::parse(tunnel_url.trim())
+        .map_err(|_| anyhow::anyhow!("Workers KV key tunnel_url is not a valid URL"))?;
+    if parsed_tunnel_url.scheme() != "https" || parsed_tunnel_url.host_str().is_none() {
+        anyhow::bail!("Workers KV key tunnel_url must be an https:// URL");
+    }
 
     d1log::start()?;
     d1log::info("engine started");
