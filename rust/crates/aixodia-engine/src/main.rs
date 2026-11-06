@@ -2,8 +2,8 @@
 //!
 //! Port of the Go `main` package: verify the token, open D1, build the gateway,
 //! the run manager, the phone hub and the terminal, serve them on
-//! `127.0.0.1:8787`, put a Cloudflare quick tunnel in front and keep the daemon
-//! keys fresh.
+//! `127.0.0.1:8787`, put a Cloudflare Named Tunnel in front, and publish its
+//! stable endpoint through Workers KV.
 
 #[allow(dead_code)]
 mod d1log;
@@ -99,7 +99,23 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         anyhow::bail!("CF_TOKEN is invalid");
     }
     if let Err(err) = db.verify_kv().await {
-        tracing::warn!("kv: {err}");
+        tracing::warn!("provider kv: {err}");
+    }
+    db.verify_config_kv().await?;
+    let tunnel_token = db
+        .config_kv_get("tunnel_token")
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Workers KV key tunnel_token is missing or empty"))?;
+    let tunnel_url = db
+        .config_kv_get("tunnel_url")
+        .await?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Workers KV key tunnel_url is missing or empty"))?;
+    let parsed_tunnel_url = url::Url::parse(tunnel_url.trim())
+        .map_err(|_| anyhow::anyhow!("Workers KV key tunnel_url is not a valid URL"))?;
+    if parsed_tunnel_url.scheme() != "https" || parsed_tunnel_url.host_str().is_none() {
+        anyhow::bail!("Workers KV key tunnel_url must be an https:// URL");
     }
 
     d1log::start()?;
@@ -205,24 +221,28 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let noted = Arc::new(AtomicI64::new(0));
     let keeper = Arc::new(tunnel::Keeper::new(
         cloudflared,
+        tunnel_token,
+        tunnel_url,
         Some(Arc::new(move |url: String| {
             let db = publisher_db.clone();
             let hub = publisher_hub.clone();
             let noted = noted.clone();
             tokio::spawn(async move {
-                if let Err(err) = db.save_daemon(&url, &version_string(), now_unix()).await {
-                    tracing::warn!("save daemon: {err}");
+                let version = version_string();
+                match db.config_kv_put_if_changed("daemon/url", &url).await {
+                    Ok(true) => tracing::info!("daemon url updated in Workers KV"),
+                    Ok(false) => tracing::debug!("daemon url unchanged in Workers KV"),
+                    Err(err) => {
+                        tracing::warn!("publish daemon url: {err}");
+                        return;
+                    }
+                }
+                if let Err(err) = db.config_kv_put_if_changed("daemon/version", &version).await {
+                    tracing::warn!("publish daemon version: {err}");
                     return;
                 }
-                tracing::info!("daemon url saved");
                 let _ = hub
-                    .broadcast_daemon(
-                        &url,
-                        &version_string(),
-                        now_unix(),
-                        tunnel::started_at(),
-                        true,
-                    )
+                    .broadcast_daemon(&url, &version, tunnel::started_at(), true)
                     .await;
                 if noted.swap(1, Ordering::SeqCst) == 0 {
                     handover::publish_handover(&url).await;
@@ -238,8 +258,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         let cancel = cancel.clone();
         async move { keeper.run(cancel).await }
     });
-
-    spawn_heartbeat(cancel.clone(), keeper.clone(), db.clone(), hub.clone());
 
     aixodia_io::auto_backup::spawn(gateway.clone(), cancel.clone());
 
@@ -574,49 +592,6 @@ fn spawn_config_reloader(cancel: CancellationToken, db: DbClient) {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = ticker.tick() => load(db.clone()).await,
-            }
-        }
-    });
-}
-
-fn spawn_heartbeat(
-    cancel: CancellationToken,
-    keeper: Arc<tunnel::Keeper>,
-    db: DbClient,
-    hub: Arc<Hub>,
-) {
-    tokio::spawn(async move {
-        loop {
-            let publish_db = db.clone();
-            let publish_keeper = keeper.clone();
-            let announce_hub = hub.clone();
-            let announce_keeper = keeper.clone();
-            let announce = Arc::new(move |version: String, beat: i64| {
-                let hub = announce_hub.clone();
-                let url = announce_keeper.url();
-                tokio::spawn(async move {
-                    let _ = hub
-                        .broadcast_daemon(&url, &version, beat, tunnel::started_at(), true)
-                        .await;
-                });
-            });
-            let deps = tunnel::HeartbeatDeps {
-                publish: Box::new(move |version, beat| {
-                    let db = publish_db.clone();
-                    let url = publish_keeper.url();
-                    Box::pin(async move {
-                        db.save_daemon(&url, &version, beat)
-                            .await
-                            .map_err(|err| anyhow::anyhow!(err.to_string()))
-                    })
-                }),
-                now: Box::new(|| Box::pin(async { now_unix() })),
-                announce: Some(Box::new(move |version, beat| announce(version, beat))),
-            };
-            tunnel::heartbeat_once(|| keeper.alive(), deps).await;
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
         }
     });

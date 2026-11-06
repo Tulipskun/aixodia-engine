@@ -24,6 +24,7 @@ pub const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
 /// Title of the KV namespace holding the providers.
 pub const KV_NAMESPACE_TITLE: &str = "aixodia-providers";
+pub const CONFIG_KV_NAMESPACE_TITLE: &str = "AIXODIA_CONFIG";
 
 /// One D1 row. D1 numbers arrive as `f64`, so columns are dynamically typed.
 pub type Row = Map<String, Value>;
@@ -159,6 +160,7 @@ struct Credentials {
     account_id: String,
     db_id: String,
     kv_namespace: String,
+    config_kv_namespace: String,
 }
 
 struct Inner {
@@ -208,6 +210,10 @@ impl Client {
 
     fn kv_namespace(&self) -> String {
         self.inner.cred.read().unwrap().kv_namespace.clone()
+    }
+
+    fn config_kv_namespace(&self) -> String {
+        self.inner.cred.read().unwrap().config_kv_namespace.clone()
     }
 
     /// Whether [`verify`](Self::verify) has succeeded.
@@ -318,33 +324,6 @@ impl Client {
         .map(|_| ())
     }
 
-    /// Writes this daemon's address, version and first heartbeat, which is how
-    /// a client finds the engine and reads its uptime.
-    pub async fn save_daemon(&self, url: &str, version: &str, heartbeat: i64) -> Result<()> {
-        let url = url.trim();
-        if url.is_empty() {
-            return Err(Error::EmptyDaemonUrl);
-        }
-        for (key, value) in [
-            ("daemon/url", url.to_string()),
-            ("daemon/version", version.to_string()),
-            ("daemon/heartbeat", heartbeat.to_string()),
-        ] {
-            self.upsert_state(key, &value).await?;
-        }
-        Ok(())
-    }
-
-    /// Refreshes the daemon version and heartbeat keys.
-    pub async fn touch_daemon(&self, version: &str, heartbeat: i64) -> Result<()> {
-        for (key, value) in [
-            ("daemon/version", version.to_string()),
-            ("daemon/heartbeat", heartbeat.to_string()),
-        ] {
-            self.upsert_state(key, &value).await?;
-        }
-        Ok(())
-    }
 
     // --- D1 --------------------------------------------------------------
 
@@ -403,9 +382,8 @@ impl Client {
 
     // --- KV --------------------------------------------------------------
 
-    /// Finds the providers namespace, creating it when the token may. Separate
-    /// from [`verify`](Self::verify) so a boot that cannot reach KV still serves
-    /// the built-in provider; the config reloader retries it.
+    /// Finds the provider namespace, creating it when permitted. The config
+    /// reloader retries this independently of daemon startup.
     pub async fn verify_kv(&self) -> Result<()> {
         let token = self.token();
         let account_id = self.account_id();
@@ -439,6 +417,88 @@ impl Client {
     /// Whether [`verify_kv`](Self::verify_kv) has found the namespace.
     pub fn kv_ready(&self) -> bool {
         !self.kv_namespace().is_empty()
+    }
+
+    /// Finds the pre-created configuration namespace. Unlike the provider
+    /// namespace this one is never created automatically: its tunnel token
+    /// must be provisioned explicitly by the operator.
+    pub async fn verify_config_kv(&self) -> Result<()> {
+        let token = self.token();
+        let account_id = self.account_id();
+        if token.is_empty() || account_id.is_empty() {
+            return Err(Error::NotVerified);
+        }
+        let path = format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100");
+        let namespaces: Vec<KvNamespaceResult> = self.get(&path, &token).await?;
+        let found = namespaces
+            .into_iter()
+            .find(|namespace| namespace.title == CONFIG_KV_NAMESPACE_TITLE)
+            .ok_or_else(|| Error::Api {
+                operation: "KV namespace lookup".into(),
+                message: format!("Workers KV namespace {CONFIG_KV_NAMESPACE_TITLE:?} not found; create it in Cloudflare first"),
+            })?;
+        self.inner.cred.write().unwrap().config_kv_namespace = found.id;
+        Ok(())
+    }
+
+    pub fn config_kv_ready(&self) -> bool {
+        !self.config_kv_namespace().is_empty()
+    }
+
+    fn config_kv_url(&self, key: &str) -> String {
+        format!(
+            "{API_BASE}/accounts/{}/storage/kv/namespaces/{}/values/{}",
+            self.account_id(),
+            self.config_kv_namespace(),
+            path_escape(key)
+        )
+    }
+
+    pub async fn config_kv_get(&self, key: &str) -> Result<Option<String>> {
+        if !self.config_kv_ready() {
+            return Err(Error::KvNotVerified);
+        }
+        let response = self.inner.http
+            .get(self.config_kv_url(key))
+            .headers(self.auth_headers(&self.token()))
+            .send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = response.status().as_u16();
+        let raw = read_limited(response, 1 << 20).await?;
+        if !(200..300).contains(&status) {
+            return Err(kv_error("config KV read", status as i32, &raw));
+        }
+        Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
+    }
+
+    pub async fn config_kv_put(&self, key: &str, value: &str) -> Result<()> {
+        if !self.config_kv_ready() {
+            return Err(Error::KvNotVerified);
+        }
+        let response = self.inner.http
+            .put(self.config_kv_url(key))
+            .headers(self.auth_headers(&self.token()))
+            .header(reqwest::header::CONTENT_TYPE, "text/plain")
+            .body(value.to_string())
+            .send().await?;
+        let status = response.status().as_u16();
+        let raw = read_limited(response, 1 << 20).await?;
+        if !(200..300).contains(&status) {
+            return Err(kv_error("config KV write", status as i32, &raw));
+        }
+        Ok(())
+    }
+
+    /// Writes only when the stored value differs. A missing key is written;
+    /// an API read failure is returned and never treated as an empty value.
+    pub async fn config_kv_put_if_changed(&self, key: &str, value: &str) -> Result<bool> {
+        if self.config_kv_get(key).await?.as_deref() == Some(value) {
+            return Ok(false);
+        }
+        self.config_kv_put(key, value).await?;
+        Ok(true)
     }
 
     async fn create_kv_namespace(&self, title: &str) -> Result<KvNamespaceResult> {

@@ -1,27 +1,16 @@
-//! The cloudflared quick tunnel, and the heartbeat that guards the daemon keys.
-//!
-//! Port of the engine's Go `tunnel.go`. The heartbeat at the bottom comes from
-//! `main.go`, but it only exists to read the tunnel's liveness, so it lives here
-//! beside the thing it asks.
-//!
-//! `cloudflared` announces a `https://*.trycloudflare.com` URL before the edge
-//! accepts it, so the URL is only published once the log line
-//! [`REGISTERED_LINE`] has been seen: publishing the earlier one is the bug that
-//! left D1 naming a URL no phone could dial.
+//! Cloudflare Named Tunnel lifecycle. The stable hostname is read from Workers KV;
+//! the tunnel token is never taken from process arguments or printed to logs.
 
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-/// What cloudflared prints once it has actually joined the edge. The URL is
-/// announced earlier and only starts resolving after this line, so this is the
-/// moment a URL is safe to publish.
+/// What cloudflared prints once it has actually joined the Named Tunnel edge.
 pub const REGISTERED_LINE: &str = "Registered tunnel connection";
 
 /// Release tag baked in at build time; the daemon writes it with the start
@@ -38,21 +27,15 @@ const RESTART_DELAY: Duration = Duration::from_secs(5);
 /// SIGTERM before it is killed outright.
 const STALE_REAP_WAIT: Duration = Duration::from_millis(1500);
 
-/// The start of every quick-tunnel URL.
-const URL_PREFIX: &str = "https://";
-
-/// The suffix every quick-tunnel hostname ends with.
-const URL_SUFFIX: &str = ".trycloudflare.com";
-
-/// One running cloudflared quick tunnel.
+/// One running Cloudflare Named Tunnel.
 #[derive(Clone)]
 pub struct Tunnel {
     url: String,
     /// The cloudflared process behind this tunnel. The keeper records it so the
     /// next process image can reap it: `execve` keeps the engine's pid but
     /// leaves the children of the image it replaced running, and a crash leaves
-    /// them to init — either way the old quick tunnel stays up and keeps
-    /// answering on a URL D1 no longer names.
+    /// them to init — either way the old Named Tunnel stays up and keeps
+    /// answering on an endpoint KV no longer names.
     pid: Option<u32>,
     done: watch::Receiver<bool>,
     kill: watch::Sender<bool>,
@@ -67,6 +50,7 @@ impl Tunnel {
     /// Whether cloudflared is still running. It is the daemon's real health:
     /// the HTTP server can keep serving while the tunnel that makes it
     /// reachable is already gone.
+    #[cfg(test)]
     pub fn alive(&self) -> bool {
         !*self.done.borrow()
     }
@@ -83,23 +67,22 @@ impl Tunnel {
     }
 }
 
-/// Starts the account-managed Named Tunnel and waits until cloudflared has
-/// registered at least one edge connection. The stable public URL is supplied
-/// by CF_TUNNEL_URL; Cloudflare owns hostname-to-origin routing in its dashboard.
-pub async fn start_cloudflared(cancel: CancellationToken, path: &Path) -> anyhow::Result<Tunnel> {
-    let token = std::env::var("CF_TUNNEL_TOKEN")
-        .or_else(|_| std::env::var("CLOUDFLARE_TUNNEL_TOKEN"))
-        .unwrap_or_default();
+/// Starts the configured Named Tunnel and waits until cloudflared registers an edge connection.
+pub async fn start_cloudflared(
+    cancel: CancellationToken,
+    path: &Path,
+    token: &str,
+    url: &str,
+) -> anyhow::Result<Tunnel> {
     let token = token.trim();
     if token.is_empty() {
-        anyhow::bail!("CF_TUNNEL_TOKEN is not set");
+        anyhow::bail!("Workers KV key tunnel_token is empty");
     }
-
-    let url = std::env::var("CF_TUNNEL_URL")
-        .unwrap_or_else(|_| "https://aixodia.dpdns.org".to_string());
     let url = url.trim().trim_end_matches('/').to_string();
-    if !url.starts_with("https://") || url.len() <= "https://".len() {
-        anyhow::bail!("CF_TUNNEL_URL must be an https:// URL");
+    let parsed = url::Url::parse(&url)
+        .map_err(|_| anyhow::anyhow!("Workers KV key tunnel_url is not a valid URL"))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        anyhow::bail!("Workers KV key tunnel_url must be an https:// URL");
     }
 
     let mut command = tokio::process::Command::new(path);
@@ -114,13 +97,14 @@ pub async fn start_cloudflared(cancel: CancellationToken, path: &Path) -> anyhow
     let stderr = child.stderr.take()
         .ok_or_else(|| anyhow::anyhow!("cloudflared: no stderr pipe"))?;
     let (ready_tx, ready_rx) = oneshot::channel::<String>();
+    let ready_url = url.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::with_capacity(64 * 1024, stderr).lines();
         let mut ready_tx = Some(ready_tx);
         while let Ok(Some(line)) = lines.next_line().await {
             if line.contains(REGISTERED_LINE) {
                 if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(url.clone());
+                    let _ = tx.send(ready_url.clone());
                 }
             }
         }
@@ -179,7 +163,7 @@ pub async fn start_cloudflared(cancel: CancellationToken, path: &Path) -> anyhow
 /// The name the keeper records its cloudflared child pid under in engine state.
 pub const PIDFILE: &str = "cloudflared.pid";
 
-/// Whether `pid` is a running cloudflared quick tunnel. A zombie has an empty
+/// Whether `pid` is a running cloudflared tunnel. A zombie has an empty
 /// command line and a recycled pid names whatever took its place, so both read
 /// false. Every argument is matched rather than only the first so that a
 /// `#!/bin/sh` stand-in in a test reads as the binary it is named for.
@@ -214,8 +198,8 @@ fn signal(pid: u32, sig: i32) {
 }
 
 /// Ends the cloudflared a previous process image left behind, so neither an
-/// `execve` handover nor a crash can pile a second live quick tunnel onto the
-/// one D1 names. Returns the pid it ended, or none when there was nothing of
+/// `execve` handover nor a crash can pile a second live Named Tunnel onto the
+/// one KV names. Returns the pid it ended, or none when there was nothing of
 /// ours to end.
 pub fn reap_stale_tunnel(pidfile: &Path) -> Option<u32> {
     let pid = recorded_pid(pidfile)?;
@@ -251,14 +235,15 @@ fn record_pid(pidfile: &Path, pid: Option<u32>) {
     }
 }
 
-/// Owns the cloudflared quick tunnel. It starts one, hands every (re)start's
+/// Owns the cloudflared Named Tunnel. It starts one, hands every (re)start's
 /// URL to publish, and starts a fresh one when it exits: the daemon row must
 /// never keep naming a URL whose tunnel has died.
 pub struct Keeper {
     path: PathBuf,
+    token: String,
+    url: String,
     publish: Option<Arc<dyn Fn(String) + Send + Sync>>,
     pidfile: PathBuf,
-    mu: Mutex<Option<Tunnel>>,
 }
 
 impl Keeper {
@@ -268,36 +253,18 @@ impl Keeper {
     /// tunnel that outlived the one that dialed it.
     pub fn new(
         path: impl Into<PathBuf>,
+        token: impl Into<String>,
+        url: impl Into<String>,
         publish: Option<Arc<dyn Fn(String) + Send + Sync>>,
         pidfile: impl Into<PathBuf>,
     ) -> Self {
         Self {
             path: path.into(),
+            token: token.into(),
+            url: url.into(),
             publish,
             pidfile: pidfile.into(),
-            mu: Mutex::new(None),
         }
-    }
-
-    /// Whether the tunnel is up right now. The heartbeat asks before refreshing
-    /// the daemon keys: a dead tunnel is not a live daemon.
-    pub fn alive(&self) -> bool {
-        self.current().map(|tunnel| tunnel.alive()).unwrap_or(false)
-    }
-
-    /// The tunnel this keeper currently has up, empty while it has none.
-    pub fn url(&self) -> String {
-        self.current()
-            .map(|tunnel| tunnel.url().to_string())
-            .unwrap_or_default()
-    }
-
-    fn current(&self) -> Option<Tunnel> {
-        self.mu.lock().unwrap().clone()
-    }
-
-    fn set(&self, tunnel: Option<Tunnel>) {
-        *self.mu.lock().unwrap() = tunnel;
     }
 
     /// Keeps a tunnel up for the life of `cancel`.
@@ -306,16 +273,14 @@ impl Keeper {
             tracing::info!("tunnel: reaped cloudflared {pid} left by the previous build");
         }
         while !cancel.is_cancelled() {
-            match start_cloudflared(cancel.clone(), &self.path).await {
+            match start_cloudflared(cancel.clone(), &self.path, &self.token, &self.url).await {
                 Ok(tunnel) => {
                     record_pid(&self.pidfile, tunnel.pid);
                     let url = tunnel.url().to_string();
-                    self.set(Some(tunnel));
                     tracing::info!("tunnel url: {url}");
                     if let Some(publish) = &self.publish {
                         publish(url);
                     }
-                    let tunnel = self.current().expect("tunnel was just set");
                     tokio::select! {
                         _ = cancel.cancelled() => {
                             tunnel.kill();
@@ -323,7 +288,6 @@ impl Keeper {
                         }
                         _ = tunnel.done() => {}
                     }
-                    self.set(None);
                     tracing::warn!("tunnel: cloudflared exited; restarting");
                 }
                 Err(err) => {
@@ -411,41 +375,10 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-// --- heartbeat -----------------------------------------------------------
-
-/// The boxed future the heartbeat's injected calls return.
-pub type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
-
-/// The service-key calls a heartbeat makes. They are a struct so a test can
-/// watch the write without D1.
-pub struct HeartbeatDeps {
-    /// Publishes the current tunnel URL, version and heartbeat.
-    pub publish: Box<dyn Fn(String, i64) -> BoxFuture<anyhow::Result<()>> + Send + Sync>,
-    /// The current unix second.
-    pub now: Box<dyn Fn() -> BoxFuture<i64> + Send + Sync>,
-    /// Pushes service state to phones after a heartbeat lands.
-    pub announce: Option<Box<dyn Fn(String, i64) + Send + Sync>>,
-}
-
-/// Performs one heartbeat. A tunnel outage pauses publication but never stops
-/// the foreground engine process.
-pub async fn heartbeat_once(alive: impl Fn() -> bool, deps: HeartbeatDeps) {
-    if !alive() {
-        tracing::info!("heartbeat: relay is down; not refreshing the service keys");
-        return;
-    }
-    if let Err(err) = (deps.publish)(version_string(), (deps.now)().await).await {
-        tracing::warn!("heartbeat: {err}");
-    } else if let Some(announce) = &deps.announce {
-        announce(version_string(), (deps.now)().await);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
-    use std::time::Instant;
+        use std::time::Instant;
 
     /// The clock the phone counts on is the machine's, not the process's: an
     /// engine update restarts the process and must not restart the answer.
@@ -510,68 +443,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_url_matcher_takes_the_leftmost_quick_tunnel_address() {
-        let line =
-            "INF Your quick Tunnel has been created! Visit it at https://live.trycloudflare.com";
-        assert_eq!(
-            find_tunnel_url(line),
-            Some("https://live.trycloudflare.com")
-        );
-    }
-
-    #[test]
-    fn the_url_matcher_ignores_anything_else() {
-        assert_eq!(
-            find_tunnel_url("INF Registered tunnel connection connIndex=0"),
-            None
-        );
-        assert_eq!(
-            find_tunnel_url("INF serving on http://127.0.0.1:8787"),
-            None
-        );
-        assert_eq!(find_tunnel_url("https://example.com"), None);
-        assert_eq!(find_tunnel_url("https://.trycloudflare.com"), None);
-    }
-
-    #[test]
-    fn the_url_matcher_stops_before_a_trailing_path() {
-        assert_eq!(
-            find_tunnel_url("INF see https://a.trycloudflare.com/path?x=1 now"),
-            Some("https://a.trycloudflare.com")
-        );
-    }
-
-    // A URL is announced before the tunnel is reachable; only the registration
-    // line means the hostname actually resolves. Publishing the earlier one is
-    // the bug that left D1 naming a URL no phone could dial.
+    // The Named Tunnel's configured hostname is published only after edge registration.
     #[tokio::test]
     async fn start_cloudflared_publishes_only_once_registered() {
         let (_dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://live.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              sleep 30\n",
         );
         let cancel = CancellationToken::new();
 
-        let tunnel = start_cloudflared(cancel, &path)
+        let tunnel = start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org")
             .await
             .expect("startCloudflared");
-        assert_eq!(tunnel.url(), "https://live.trycloudflare.com");
+        assert_eq!(tunnel.url(), "https://aixodia.dpdns.org");
         assert!(tunnel.alive(), "a running cloudflared must read as alive");
     }
 
     #[tokio::test]
     async fn start_cloudflared_fails_when_the_tunnel_never_registers() {
         let (_dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://dead.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'ERR no more connections active and exiting' >&2\n\
              exit 1\n",
         );
         let cancel = CancellationToken::new();
 
         assert!(
-            start_cloudflared(cancel, &path).await.is_err(),
+            start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org").await.is_err(),
             "a tunnel that never registered must not yield a URL"
         );
     }
@@ -579,14 +478,14 @@ mod tests {
     #[tokio::test]
     async fn tunnel_is_not_alive_after_cloudflared_exits() {
         let (_dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://gone.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              sleep 1\n\
              exit 1\n",
         );
         let cancel = CancellationToken::new();
 
-        let tunnel = start_cloudflared(cancel, &path)
+        let tunnel = start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org")
             .await
             .expect("startCloudflared");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -608,7 +507,7 @@ mod tests {
             "n=$(cat \"$0.n\" 2>/dev/null || echo 0)\n\
              n=$((n+1))\n\
              echo $n > \"$0.n\"\n\
-             echo \"INF Your quick Tunnel has been created! Visit it at https://t$n.trycloudflare.com\" >&2\n\
+             echo \"INF Starting configured Named Tunnel $n\" >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              if [ \"$n\" -ge 2 ]; then sleep 30; else sleep 1; fi\n",
         );
@@ -618,15 +517,15 @@ mod tests {
         });
         let cancel = CancellationToken::new();
 
-        let keeper = Arc::new(Keeper::new(path, Some(publish), dir.path().join(PIDFILE)));
+        let keeper = Arc::new(Keeper::new(path, "test-token", "https://aixodia.dpdns.org", Some(publish), dir.path().join(PIDFILE)));
         let task = {
             let keeper = Arc::clone(&keeper);
             let cancel = cancel.clone();
             tokio::spawn(async move { keeper.run(cancel).await })
         };
 
-        assert_eq!(wait_url(&mut urls).await, "https://t1.trycloudflare.com");
-        assert_eq!(wait_url(&mut urls).await, "https://t2.trycloudflare.com");
+        assert_eq!(wait_url(&mut urls).await, "https://aixodia.dpdns.org");
+        assert_eq!(wait_url(&mut urls).await, "https://aixodia.dpdns.org");
 
         // Every start records its pid, which is what the next image reaps.
         let recorded = std::fs::read_to_string(dir.path().join(PIDFILE))
@@ -645,19 +544,19 @@ mod tests {
 
     // The defect this closes: `execve` keeps the engine's pid but leaves the
     // children of the image it replaced running, and a crash leaves them to
-    // init. Either way every update used to pile one more live quick tunnel onto
-    // the address D1 names.
+    // init. Either way every update used to pile one more live Named Tunnel onto
+    // the address Workers KV names.
     #[tokio::test]
     async fn a_tunnel_left_by_the_previous_build_is_reaped() {
         let (dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://stale.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              sleep 30\n",
         );
         let pidfile = dir.path().join(PIDFILE);
         let cancel = CancellationToken::new();
 
-        let tunnel = start_cloudflared(cancel.clone(), &path)
+        let tunnel = start_cloudflared(cancel.clone(), &path, "test-token", "https://aixodia.dpdns.org")
             .await
             .expect("startCloudflared");
         let pid = tunnel.pid.expect("a spawned cloudflared has a pid");
@@ -707,65 +606,5 @@ mod tests {
         );
     }
 
-    // The app reads a fresh service heartbeat as "online". While the tunnel is
-    // down the heartbeat must not be refreshed, or the phone adopts a dead URL.
-    #[tokio::test]
-    async fn heartbeat_skips_the_write_while_the_tunnel_is_down() {
-        let touched = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&touched);
-        let deps = HeartbeatDeps {
-            publish: Box::new(move |_version: String, _at: i64| {
-                let count = Arc::clone(&count);
-                Box::pin(async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok::<(), anyhow::Error>(())
-                })
-            }),
-            now: Box::new(|| Box::pin(async { 1_i64 })),
-            announce: None,
-        };
 
-        heartbeat_once(|| false, deps).await;
-        assert_eq!(touched.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn heartbeat_refreshes_while_the_tunnel_is_up() {
-        let touched = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&touched);
-        let deps = HeartbeatDeps {
-            publish: Box::new(move |_version: String, _at: i64| {
-                let count = Arc::clone(&count);
-                Box::pin(async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok::<(), anyhow::Error>(())
-                })
-            }),
-            now: Box::new(|| Box::pin(async { 1_i64 })),
-            announce: None,
-        };
-
-        heartbeat_once(|| true, deps).await;
-        assert_eq!(touched.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn heartbeat_publishes_without_discovery_ownership_checks() {
-        let touched = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&touched);
-        let deps = HeartbeatDeps {
-            publish: Box::new(move |_version: String, _at: i64| {
-                let count = Arc::clone(&count);
-                Box::pin(async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok::<(), anyhow::Error>(())
-                })
-            }),
-            now: Box::new(|| Box::pin(async { 1_i64 })),
-            announce: None,
-        };
-
-        heartbeat_once(|| true, deps).await;
-        assert_eq!(touched.load(Ordering::SeqCst), 1);
-    }
 }

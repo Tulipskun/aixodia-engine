@@ -40,7 +40,7 @@ bin="$fakebin/aixodia-engine"
 make_engine "$bin"
 make_cloudflared "$fakebin"
 out_file="$home/out"
-env -u CF_TOKEN -u CF_TUNNEL_TOKEN -u CLOUDFLARE_TUNNEL_TOKEN AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
+env -u CF_TOKEN AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
   ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" ENGINE_HOME_FILE="$home/engine-home" \
   PATH="$fakebin:$PATH" bash "$LAUNCHER" start >"$out_file" 2>&1
 rc=$?
@@ -63,7 +63,7 @@ bin="$fakebin/aixodia-engine"
 make_engine "$bin"
 make_cloudflared "$fakebin"
 out_file="$home/out"
-CF_TOKEN=test-token CF_TUNNEL_TOKEN=test-tunnel-token CF_TUNNEL_URL=https://aixodia.dpdns.org AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
+CF_TOKEN=test-token AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
   ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" ENGINE_HOME_FILE="$home/engine-home" \
   PATH="$fakebin:$PATH" bash "$LAUNCHER" start >"$out_file" 2>&1 &
 launcher_pid=$!
@@ -110,7 +110,7 @@ bin="$fakebin/aixodia-engine"
 make_engine "$bin"
 make_cloudflared "$fakebin"
 out_file="$home/out"
-CF_TOKEN=test-token CF_TUNNEL_TOKEN=test-tunnel-token CF_TUNNEL_URL=https://aixodia.dpdns.org AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
+CF_TOKEN=test-token AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
   ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" ENGINE_HOME_FILE="$home/engine-home" \
   PATH="$fakebin:$PATH" bash "$LAUNCHER" >"$out_file" 2>&1
 rc=$?

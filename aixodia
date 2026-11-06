@@ -40,10 +40,6 @@ is_engine_pid() {
 
 cmd_start() {
   [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
-  [ -n "${CF_TUNNEL_TOKEN:-${CLOUDFLARE_TUNNEL_TOKEN:-}}" ] || die "CF_TUNNEL_TOKEN is not set (or set CLOUDFLARE_TUNNEL_TOKEN)"
-  CF_TUNNEL_URL="${CF_TUNNEL_URL:-https://aixodia.dpdns.org}"
-  case "$CF_TUNNEL_URL" in https://*) ;; *) die "CF_TUNNEL_URL must start with https://" ;; esac
-  export CF_TUNNEL_URL
   local resolved
   resolved="$(engine_path)"
   command -v cloudflared >/dev/null 2>&1 || die "cloudflared not found in PATH — reinstall with the install script"
@@ -116,7 +112,7 @@ usage: aixodia <command>
   stop        send SIGTERM to the running engine
   update      update the running engine in place, or install when stopped
 
-CF_TOKEN and CF_TUNNEL_TOKEN must be set before start. CF_TUNNEL_URL defaults to https://aixodia.dpdns.org.
+CF_TOKEN must be set before start. Named Tunnel credentials and URL are read from Cloudflare Workers KV.
 USAGE
 }
 
