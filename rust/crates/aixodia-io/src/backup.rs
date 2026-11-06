@@ -538,6 +538,7 @@ fn finish(
     });
     if operation == "restore"
         && finished["summary"]["ok"] == true
+        && finished["summary"]["report"].is_object()
         && finished["summary"]["report"]["failed"]
             .as_array()
             .map_or(true, |failed| failed.is_empty())
