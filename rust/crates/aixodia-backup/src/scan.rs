@@ -492,9 +492,6 @@ mod tests {
         }
     }
 
-    /// The scope this machine stored still carries the retired pattern, because
-    /// a stored scope wins over the defaults. Reading it back drops the rule, so
-    /// the next run captures what the last one hid.
     #[test]
     fn a_stored_scope_loses_the_retired_pattern() {
         let stored = vec!["target".to_string(), "core.*".to_string(), "*.pyc".into()];
