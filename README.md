@@ -1,7 +1,7 @@
 # AIxodia
 
 The AIxodia engine: serves the chat API on `127.0.0.1:8787`, puts a Cloudflare
-Named Tunnel in front of it, and tells the phone the tunnel URL via D1.
+Named Tunnel in front of it, and publishes its stable endpoint through Workers KV.
 
 ## Remote filesystem API
 
@@ -47,11 +47,8 @@ keeping the same pid, working directory, standard streams and active session.
 ## Run
 
 ```bash
-export CF_TOKEN=xxxxx              # Cloudflare Worker/D1 API token
-export CF_TUNNEL_TOKEN=xxxxx       # Named Tunnel connector token
-export CF_TUNNEL_URL=https://aixodia.dpdns.org
-aixodia                 # foreground start
-# or: aixodia start
+export CF_TOKEN=xxxxx              # Cloudflare API token with D1 + Workers KV access
+aixodia start                       # foreground start
 ```
 
 **The engine always runs in the foreground.** `aixodia start` replaces the
@@ -68,10 +65,9 @@ aixodia update      # update the running engine in place
 ```
 
 `status`, `logs`, `stop` and `update` are control commands; none starts a
-second engine. The engine does not use D1 timestamps or discovery ownership
-checks to suppress its tunnel publication or terminate its process. Start only
-one engine per account unless multiple active tunnels are intentionally
-required, because each active instance publishes its own current tunnel URL.
+second engine. Start only one engine per account unless multiple active tunnels
+are intentionally required, because each active instance shares the same KV
+endpoint keys.
 `stop` sends SIGTERM to the process reported by the local `/healthz` endpoint.
 `logs` reads the engine's local `/api/logs` endpoint. `update` sends SIGUSR1
 to the running process; the engine waits for active chats to finish, installs
@@ -93,14 +89,27 @@ API keys are in Workers KV.
 `AIXODIA_LOCAL_URL` can override the local control API address.
 
 
-Chat history, settings, run logs and the note a session leaves for the one that
-replaces it live in **D1** (`chat_sessions`, `chat_turns`, `system_state`,
-`runs`, `run_events`). Providers and their API keys live in
-**Workers KV**: namespace `aixodia-providers`, one key `providers` holding the
-whole list. D1's `system_state` also carries the daemon discovery keys
-(`daemon/url`, `daemon/version`, `daemon/heartbeat`), which is how the phone
-finds the current tunnel. `CF_TOKEN` therefore needs D1 and Workers KV
-read/write.
+Chat history, settings, run logs and handover state live in **D1**
+(`chat_sessions`, `chat_turns`, `system_state`, `runs`, `run_events`). Provider
+configuration remains in Workers KV namespace `aixodia-providers`, key
+`providers`. Named Tunnel configuration and discovery live in Workers KV
+namespace `AIXODIA_CONFIG`:
+
+| Key | Purpose | Writes |
+|---|---|---|
+| `tunnel_token` | Cloudflare Named Tunnel connector token | Operator-managed |
+| `tunnel_url` | Stable public HTTPS hostname | Operator-managed |
+| `daemon/url` | Engine endpoint discovered by the phone | Only when changed |
+| `daemon/version` | Engine start/boot metadata used for uptime | Only when changed |
+
+Create `AIXODIA_CONFIG` in Cloudflare Workers KV before starting the engine,
+then add `tunnel_token` and `tunnel_url`. The engine never creates this
+sensitive namespace or overwrites those operator-managed values. It reads both
+at startup, starts `cloudflared tunnel run`, waits for an edge registration,
+and only then publishes `daemon/url`. There is no `daemon/heartbeat` key or
+heartbeat task. `daemon/url` is compared with its stored value before a write,
+so ordinary restarts do not write it again. `CF_TOKEN` needs D1 Edit and Workers
+KV read/write access; the Android client needs Workers KV read access.
 
 ## File manager
 
