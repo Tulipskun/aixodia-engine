@@ -196,8 +196,8 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;
     tracing::info!("listening on 127.0.0.1:8787");
 
-    // The public address is a Cloudflare quick tunnel. D1 must never name a URL
-    // that is already dead, so the keeper publishes only after registration.
+    // Publish the stable Named Tunnel URL only after cloudflared has registered
+    // an edge connection. The hostname and origin route are configured in Cloudflare.
     let cloudflared =
         which("cloudflared").ok_or_else(|| anyhow::anyhow!("cloudflared is not installed"))?;
     let publisher_db = db.clone();
