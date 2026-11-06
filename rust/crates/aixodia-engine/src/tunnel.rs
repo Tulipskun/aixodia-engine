@@ -471,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn start_cloudflared_publishes_only_once_registered() {
         let (_dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://live.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              sleep 30\n",
         );
@@ -487,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn start_cloudflared_fails_when_the_tunnel_never_registers() {
         let (_dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://dead.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'ERR no more connections active and exiting' >&2\n\
              exit 1\n",
         );
@@ -502,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn tunnel_is_not_alive_after_cloudflared_exits() {
         let (_dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://gone.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              sleep 1\n\
              exit 1\n",
@@ -573,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn a_tunnel_left_by_the_previous_build_is_reaped() {
         let (dir, path) = fake_cloudflared(
-            "echo 'INF Your quick Tunnel has been created! Visit it at https://stale.trycloudflare.com' >&2\n\
+            "echo 'INF Starting configured Named Tunnel' >&2\n\
              echo 'INF Registered tunnel connection connIndex=0' >&2\n\
              sleep 30\n",
         );
