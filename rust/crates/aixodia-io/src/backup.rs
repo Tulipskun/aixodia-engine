@@ -269,6 +269,7 @@ pub async fn api_backup_config_put(State(g): State<Arc<Gateway>>, body: Bytes) -
     let previous_restore_identity = (
         previous.token.clone(),
         previous.bucket.clone(),
+        previous.endpoint.clone(),
         previous.prefix.clone(),
         previous.root.clone(),
         previous.excludes.clone(),
@@ -293,6 +294,7 @@ pub async fn api_backup_config_put(State(g): State<Arc<Gateway>>, body: Bytes) -
     let restore_identity_changed = previous_restore_identity != (
         merged.token.clone(),
         merged.bucket.clone(),
+        merged.endpoint.clone(),
         merged.prefix.clone(),
         merged.root.clone(),
         merged.excludes.clone(),
@@ -585,6 +587,8 @@ pub(crate) fn auto_status_with_config(stored_raw: Option<&str>) -> Value {
         "idle_streak_secs": live["idle_streak_secs"],
         "cpu_current": live["cpu_current"],
         "last_auto_backup_at": live["last_auto_backup_at"],
+        "restore_ready": live["restore_ready"],
+        "cpu_history": live["cpu_history"],
         "idle_secs": parsed.auto_idle_secs.unwrap_or(300),
         "cpu_threshold": parsed.auto_cpu_threshold.unwrap_or(10.0),
         "cooldown_secs": parsed.auto_cooldown_secs.unwrap_or(1800),
