@@ -267,8 +267,7 @@ impl Keeper {
         }
     }
 
-    /// Whether the tunnel is up right now. The heartbeat asks before refreshing
-    /// the daemon keys: a dead tunnel is not a live daemon.
+    /// Whether the tunnel is up right now. The engine checks this before retrying a dead tunnel.
     pub fn alive(&self) -> bool {
         self.current().map(|tunnel| tunnel.alive()).unwrap_or(false)
     }
@@ -467,31 +466,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_url_matcher_ignores_anything_else() {
-        assert_eq!(
-            find_tunnel_url("INF Registered tunnel connection connIndex=0"),
-            None
-        );
-        assert_eq!(
-            find_tunnel_url("INF serving on http://127.0.0.1:8787"),
-            None
-        );
-        assert_eq!(find_tunnel_url("https://example.com"), None);
-        assert_eq!(find_tunnel_url("https://.trycloudflare.com"), None);
-    }
-
-    #[test]
-    fn the_url_matcher_stops_before_a_trailing_path() {
-        assert_eq!(
-            find_tunnel_url("INF see https://a.trycloudflare.com/path?x=1 now"),
-            Some("https://a.trycloudflare.com")
-        );
-    }
-
-    // A URL is announced before the tunnel is reachable; only the registration
-    // line means the hostname actually resolves. Publishing the earlier one is
-    // the bug that left D1 naming a URL no phone could dial.
+    // The Named Tunnel's configured hostname is published only after edge registration.
     #[tokio::test]
     async fn start_cloudflared_publishes_only_once_registered() {
         let (_dir, path) = fake_cloudflared(
@@ -504,7 +479,7 @@ mod tests {
         let tunnel = start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org")
             .await
             .expect("startCloudflared");
-        assert_eq!(tunnel.url(), "https://live.trycloudflare.com");
+        assert_eq!(tunnel.url(), "https://aixodia.dpdns.org");
         assert!(tunnel.alive(), "a running cloudflared must read as alive");
     }
 
@@ -518,7 +493,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         assert!(
-            start_cloudflared(cancel, &path).await.is_err(),
+            start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org").await.is_err(),
             "a tunnel that never registered must not yield a URL"
         );
     }
@@ -533,7 +508,7 @@ mod tests {
         );
         let cancel = CancellationToken::new();
 
-        let tunnel = start_cloudflared(cancel, &path)
+        let tunnel = start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org")
             .await
             .expect("startCloudflared");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -593,7 +568,7 @@ mod tests {
     // The defect this closes: `execve` keeps the engine's pid but leaves the
     // children of the image it replaced running, and a crash leaves them to
     // init. Either way every update used to pile one more live Named Tunnel onto
-    // the address D1 names.
+    // the address Workers KV names.
     #[tokio::test]
     async fn a_tunnel_left_by_the_previous_build_is_reaped() {
         let (dir, path) = fake_cloudflared(
@@ -654,65 +629,5 @@ mod tests {
         );
     }
 
-    // The app reads a fresh service heartbeat as "online". While the tunnel is
-    // down the heartbeat must not be refreshed, or the phone adopts a dead URL.
-    #[tokio::test]
-    async fn heartbeat_skips_the_write_while_the_tunnel_is_down() {
-        let touched = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&touched);
-        let deps = HeartbeatDeps {
-            publish: Box::new(move |_version: String, _at: i64| {
-                let count = Arc::clone(&count);
-                Box::pin(async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok::<(), anyhow::Error>(())
-                })
-            }),
-            now: Box::new(|| Box::pin(async { 1_i64 })),
-            announce: None,
-        };
 
-        heartbeat_once(|| false, deps).await;
-        assert_eq!(touched.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn heartbeat_refreshes_while_the_tunnel_is_up() {
-        let touched = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&touched);
-        let deps = HeartbeatDeps {
-            publish: Box::new(move |_version: String, _at: i64| {
-                let count = Arc::clone(&count);
-                Box::pin(async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok::<(), anyhow::Error>(())
-                })
-            }),
-            now: Box::new(|| Box::pin(async { 1_i64 })),
-            announce: None,
-        };
-
-        heartbeat_once(|| true, deps).await;
-        assert_eq!(touched.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn heartbeat_publishes_without_discovery_ownership_checks() {
-        let touched = Arc::new(AtomicUsize::new(0));
-        let count = Arc::clone(&touched);
-        let deps = HeartbeatDeps {
-            publish: Box::new(move |_version: String, _at: i64| {
-                let count = Arc::clone(&count);
-                Box::pin(async move {
-                    count.fetch_add(1, Ordering::SeqCst);
-                    Ok::<(), anyhow::Error>(())
-                })
-            }),
-            now: Box::new(|| Box::pin(async { 1_i64 })),
-            announce: None,
-        };
-
-        heartbeat_once(|| true, deps).await;
-        assert_eq!(touched.load(Ordering::SeqCst), 1);
-    }
 }
