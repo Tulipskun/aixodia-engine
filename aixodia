@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# AIxodia foreground launcher.
-# "start" replaces this shell with aixodia-engine; output remains attached to
-# the caller (Kaggle, Colab, terminal, or a process supervisor).
+# AIxodia launcher.
+# "start" runs the engine detached in its own session and returns.
 set -euo pipefail
 
 AIXODIA_HOME="${AIXODIA_HOME:-$HOME/.aixodia}"
 ENGINE_BIN="${AIXODIA_ENGINE_BIN:-aixodia-engine}"
 LOCAL_URL="${AIXODIA_LOCAL_URL:-http://127.0.0.1:8787}"
+PID_FILE="${AIXODIA_PID_FILE:-aixodia.pid}"
+LOG_FILE="${AIXODIA_LOG_FILE:-engine.log}"
+LOG_MAX_KB="${AIXODIA_LOG_MAX_KB:-8192}"
+START_WAIT="${AIXODIA_START_WAIT:-30}"
 
 die() {
   echo "aixodia: $*" >&2
@@ -28,77 +31,217 @@ health_pid() {
 }
 
 is_engine_pid() {
-  local pid="$1" exe
+  local pid="$1" exe field
   [ "$pid" -gt 1 ] 2>/dev/null || return 1
-  [ -r "/proc/$pid/exe" ] || return 1
-  exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
-  case "${exe##*/}" in
-    aixodia-engine|aixodia-engine\ \(deleted\)) return 0 ;;
-    *) return 1 ;;
-  esac
+  if [ -r "/proc/$pid/exe" ]; then
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    case "${exe##*/}" in
+      aixodia-engine|aixodia-engine\ \(deleted\)) return 0 ;;
+    esac
+  fi
+  # An interpreter keeps the engine path in argv when it execs a script or
+  # wrapper, so a launcher or test stub is still recognisable.
+  if [ -r "/proc/$pid/cmdline" ]; then
+    while IFS= read -r -d '' field; do
+      [ "${field##*/}" = "aixodia-engine" ] && return 0
+    done < "/proc/$pid/cmdline"
+  fi
+  return 1
+}
+
+pid_path() { printf '%s/%s\n' "$AIXODIA_HOME" "$PID_FILE"; }
+log_path() { printf '%s/%s\n' "$AIXODIA_HOME" "$LOG_FILE"; }
+
+# The engine's live pid, or nothing when it is not answering healthz.
+live_pid() {
+  local body pid
+  body="$(healthz || true)" || body=""
+  pid="$(health_pid "${body:-}")"
+  [ -n "$pid" ] && is_engine_pid "$pid" && printf '%s\n' "$pid"
+  return 0
+}
+
+# The pid as written, before any check on what runs under it. Used only to ask
+# whether the process is still there; never signalled from here.
+raw_pid() {
+  local file value
+  file="$(pid_path)"
+  [ -r "$file" ] || return 0
+  value="$(sed -n 's/^[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$file" | head -1)"
+  printf '%s\n' "${value:-}"
+  return 0
+}
+
+# The pid recorded by the launcher, validated against the running executable so
+# a recycled pid can never be signalled.
+pidfile_pid() {
+  local value
+  value="$(raw_pid)"
+  [ -n "$value" ] && is_engine_pid "$value" && printf '%s\n' "$value"
+  return 0
+}
+
+# A reaped-but-unwaited child still answers kill -0, so a zombie has to count
+# as gone or a boot failure would be read as a slow start.
+pid_alive() {
+  local line state
+  [ -r "/proc/$1/stat" ] || return 1
+  line="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  state="${line##*) }"
+  [ "${state%% *}" != Z ]
+}
+
+# One generation of history is kept; the file only carries tracing and panic
+# output, since `aixodia logs` reads the structured log table.
+rotate_log() {
+  local file size limit
+  file="$(log_path)"
+  [ -f "$file" ] || return 0
+  size="$(wc -c < "$file" 2>/dev/null || echo 0)"
+  limit=$(( LOG_MAX_KB * 1024 ))
+  [ "$size" -gt "$limit" ] || return 0
+  mv -f "$file" "$file.1" || die "cannot rotate $file"
+  echo "aixodia: rotated $file ($size bytes) to $file.1"
+}
+
+require_prerequisites() {
+  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
+  ENGINE_RESOLVED="$(engine_path)"
+  command -v cloudflared >/dev/null 2>&1 || die "cloudflared not found in PATH — reinstall with the install script"
+  mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
+  export AIXODIA_HOME
 }
 
 cmd_start() {
-  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
-  local resolved
-  resolved="$(engine_path)"
-  command -v cloudflared >/dev/null 2>&1 || die "cloudflared not found in PATH — reinstall with the install script"
+  local file pid raw waited gone
+  require_prerequisites
+  file="$(pid_path)"
+  gone=0
 
-  mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
-  export AIXODIA_HOME
-  cd "$AIXODIA_HOME" || die "cannot enter $AIXODIA_HOME"
+  pid="$(live_pid)"
+  if [ -n "$pid" ]; then
+    printf '%s\n' "$pid" > "$file"
+    echo "aixodia: engine already running (pid $pid)"
+    echo "aixodia: log $(log_path)"
+    return 0
+  fi
 
-  echo "aixodia: starting in foreground; Ctrl-C stops the engine"
-  echo "aixodia: state $AIXODIA_HOME"
-  exec "$resolved"
+  pid="$(pidfile_pid)"
+  if [ -n "$pid" ]; then
+    echo "aixodia: pid $pid is an engine but does not answer healthz; stopping it first"
+    cmd_stop
+  else
+    rm -f "$file"
+  fi
+
+  rotate_log
+  echo "aixodia: starting in the background; state $AIXODIA_HOME"
+  AIXODIA_PID_FILE="$file" AIXODIA_LAUNCH_ENGINE="$ENGINE_RESOLVED" \
+    setsid bash -c 'printf "%s\n" "$$" > "$AIXODIA_PID_FILE"; cd "$AIXODIA_HOME" || exit 1; exec "$AIXODIA_LAUNCH_ENGINE"' \
+    >> "$(log_path)" 2>&1 < /dev/null &
+
+  # The child writes the pid file before it execs the engine, so a missing or
+  # unrecognised pid here means it is still coming up. Three beats of a pid that
+  # is not there at all is the engine leaving: the launcher is its parent, so an
+  # exited engine can wait on as a zombie, which still answers kill -0.
+  for (( waited = 0; waited < START_WAIT * 5; waited++ )); do
+    if [ -n "$(live_pid)" ]; then
+      pid="$(pidfile_pid)"
+      echo "aixodia: engine running (pid ${pid:-$(raw_pid)}), log $(log_path)"
+      return 0
+    fi
+    raw="$(raw_pid)"
+    if [ -n "$raw" ] && ! pid_alive "$raw"; then
+      gone=$(( gone + 1 ))
+      [ "$gone" -ge 3 ] && break
+    else
+      gone=0
+    fi
+    sleep 0.2
+  done
+
+  # A validated pid means /proc says it is the engine, which already means alive.
+  pid="$(pidfile_pid)"
+  if [ -n "$pid" ]; then
+    echo "aixodia: engine is still booting after ${START_WAIT}s (pid $pid); watch $(log_path)"
+    return 0
+  fi
+  echo "aixodia: engine exited during startup; last log lines:" >&2
+  tail -n 20 "$(log_path)" >&2 || true
+  rm -f "$file"
+  exit 1
 }
 
 cmd_status() {
-  local body
-  body="$(healthz)" || die "engine is not running"
-  printf '%s\n' "$body"
+  local body file pid
+  if body="$(healthz)"; then
+    printf '%s\n' "$body"
+    return 0
+  fi
+  file="$(pid_path)"
+  if [ -r "$file" ]; then
+    pid="$(raw_pid)"
+    echo "aixodia: engine is not running; $file names pid ${pid:-none}" >&2
+  else
+    echo "aixodia: engine is not running" >&2
+  fi
+  exit 1
 }
 
 cmd_stop() {
-  local body pid
-  body="$(healthz)" || die "engine is not running"
-  pid="$(health_pid "$body")"
-  [ -n "$pid" ] || die "healthz did not return an engine pid"
-  is_engine_pid "$pid" || die "pid $pid is not the aixodia-engine executable"
+  local pid source file
+  file="$(pid_path)"
+  pid="$(live_pid)"
+  source="healthz"
+  if [ -z "$pid" ]; then
+    pid="$(pidfile_pid)"
+    source="pidfile"
+  fi
+  [ -n "$pid" ] || die "engine is not running"
   kill -TERM "$pid" || die "cannot send SIGTERM to pid $pid"
-  echo "aixodia: SIGTERM sent to foreground engine (pid $pid)"
-  echo "aixodia: the attached terminal or notebook owns the process output"
+  for _ in $(seq 1 100); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "aixodia: pid $pid (found via $source) is still alive after SIGTERM" >&2
+    exit 1
+  fi
+  rm -f "$file"
+  echo "aixodia: engine stopped (pid $pid, found via $source)"
 }
 
 cmd_logs() {
-  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
-  local limit="${1:-40}"
+  local limit body
+  limit="${1:-40}"
   case "$limit" in
     ''|*[!0-9]*) die "log limit must be an integer from 1 to 2000" ;;
   esac
   [ "$limit" -ge 1 ] && [ "$limit" -le 2000 ] || die "log limit must be from 1 to 2000"
-  curl -fsS --max-time 10 \
-    -H "Authorization: Bearer $CF_TOKEN" \
-    "$LOCAL_URL/api/logs?limit=$limit"
+  if [ -n "${CF_TOKEN:-}" ] && body="$(curl -fsS --max-time 10 -H "Authorization: Bearer $CF_TOKEN" "$LOCAL_URL/api/logs?limit=$limit" 2>/dev/null)"; then
+    printf '%s\n' "$body"
+    return 0
+  fi
+  [ -r "$(log_path)" ] || die "engine is not running and $(log_path) is not readable"
+  echo "aixodia: reading $(log_path) (log table unavailable)"
+  tail -n "$limit" "$(log_path)"
 }
 
 cmd_update() {
-  local resolved body pid
-  resolved="$(engine_path)"
-  if body="$(healthz 2>/dev/null)"; then
-    pid="$(health_pid "$body")"
-    [ -n "$pid" ] || die "healthz did not return an engine pid"
-    is_engine_pid "$pid" || die "pid $pid is not the aixodia-engine executable"
-    case "$body" in
+  local pid resolved
+  if pid="$(live_pid)" && [ -n "$pid" ]; then
+    case "$(healthz)" in
       *'"update"'*'signal:USR1'*) ;;
-      *) die "the running engine does not support in-place updates; stop it with Ctrl-C and run aixodia update again" ;;
+      *) die "the running engine does not support in-place updates; run aixodia stop and then aixodia update" ;;
     esac
     kill -USR1 "$pid" || die "cannot request update from pid $pid"
-    echo "aixodia: update requested from foreground engine (pid $pid)"
-    echo "aixodia: update output remains in the engine's attached terminal"
+    echo "aixodia: update requested from engine (pid $pid)"
+    echo "aixodia: the update replaces the executable image, so the pid and $(pid_path) stay valid"
     return 0
   fi
 
+  # Installing while stopped needs the binary, not the tunnel credentials.
+  resolved="$(engine_path)"
   "$resolved" update
 }
 
@@ -106,17 +249,19 @@ usage() {
   cat <<'USAGE'
 usage: aixodia <command>
 
-  start       run the engine in the foreground; Ctrl-C stops it
-  status      print the running engine's health
-  logs [n]    print the latest n engine log entries (default 40)
-  stop        send SIGTERM to the running engine
-  update      update the running engine in place, or install when stopped
+  start          run the engine detached in its own session, then return
+  status         print the running engine's health
+  logs [n]       print the latest n log-table entries (default 40), or the
+                 engine log file when the engine is not answering
+  stop           send SIGTERM to the running engine and clear the pid file
+  update         update the running engine in place, or install when stopped
 
 CF_TOKEN must be set before start. Named Tunnel credentials and URL are read from Cloudflare Workers KV.
+State, pid file (aixodia.pid) and log (engine.log) live in AIXODIA_HOME, by default ~/.aixodia.
 USAGE
 }
 
-case "${1:-}" in
+case "${1:-start}" in
   ''|start|run|up) cmd_start ;;
   status) cmd_status ;;
   logs) cmd_logs "${2:-40}" ;;

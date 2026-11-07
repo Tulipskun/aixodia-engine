@@ -40,27 +40,28 @@ curl -fsSL https://raw.githubusercontent.com/Tulipskun/aixodia-engine/main/insta
 Installs to `/usr/local/bin`: `aixodia-engine`, `aixodia`, and `cloudflared` (if it
 is not already on your PATH). Linux x86_64 and arm64.
 
-Updating replaces the published binary without detaching or restarting
-the running foreground process. The engine swaps its executable image in place,
+Updating replaces the published binary without stopping or restarting the
+running engine. The engine swaps its executable image in place,
 keeping the same pid, working directory, standard streams and active session.
 
 ## Run
 
 ```bash
 export CF_TOKEN=xxxxx              # Cloudflare API token with D1 + Workers KV access
-aixodia start                       # foreground start
+aixodia start                       # start the engine detached, then return
 ```
 
-**The engine always runs in the foreground.** `aixodia start` replaces the
-launcher shell with `aixodia-engine`; it does not fork, use `nohup`, redirect
-output to a file, or return the prompt. Logs are written directly to stdout and
-stderr, so they appear in the same terminal or Kaggle/Colab cell. Ctrl-C sends
-SIGINT and stops the engine.
+**The engine always runs detached.** `aixodia start` launches `aixodia-engine`
+with `setsid` in its own session with no controlling terminal, records its pid
+in `~/.aixodia/aixodia.pid` and appends its output to `~/.aixodia/engine.log`
+(rotated to `engine.log.1` once it passes 8 MB), then returns the prompt.
+The terminal is never the engine's controlling tty, so closing the shell or
+Ctrl-C in it does not stop the engine; use `aixodia stop`.
 
 ```bash
 aixodia status      # read the running engine's health
 aixodia logs        # fetch recent engine logs from its local API
-aixodia stop        # send SIGTERM to the foreground engine
+aixodia stop        # send SIGTERM to the running engine
 aixodia update      # update the running engine in place
 ```
 
@@ -68,19 +69,23 @@ aixodia update      # update the running engine in place
 second engine. Start only one engine per account unless multiple active tunnels
 are intentionally required, because each active instance shares the same KV
 endpoint keys.
-`stop` sends SIGTERM to the process reported by the local `/healthz` endpoint.
-`logs` reads the engine's local `/api/logs` endpoint. `update` sends SIGUSR1
+`stop` sends SIGTERM to the process reported by the local `/healthz` endpoint,
+falling back to `~/.aixodia/aixodia.pid` when the engine is not answering; the
+pid is checked against `/proc` first, so a recycled pid is never signalled.
+`logs` reads the engine's local `/api/logs` endpoint, or `engine.log` when the
+engine is not answering. `update` sends SIGUSR1
 to the running process; the engine waits for active chats to finish, installs
 the published build and execs the new image in the same process. Its output
-remains attached to the original terminal or notebook.
+keeps going to the log file it opened at start.
 
 The engine also checks for a published build every ten minutes and applies it
 only while no chat is in flight. The update is an in-place exec, not a
 background restart.
 
-Only local state lives in `~/.aixodia/` (`aixodia-logs.db`, `uploads/` and
-the cloudflared child-process pid file). There is no engine pid file or
-background log file. Chat history and settings are in D1; providers and their
+Local state lives in `~/.aixodia/`: `aixodia-logs.db`, `uploads/`, the
+cloudflared child-process pid file, the engine pid file `aixodia.pid` and the
+engine log `engine.log` (plus one rotated generation, `engine.log.1`).
+Chat history and settings are in D1; providers and their
 API keys are in Workers KV.
 
 ## Configuration

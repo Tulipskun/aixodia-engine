@@ -8,7 +8,7 @@
 #
 # Installs:
 #   aixodia-engine  the engine binary (it serves 127.0.0.1:8787)
-#   aixodia         the foreground launcher (start / stop / status / logs / update)
+#   aixodia         the detached launcher (start / stop / status / logs / update)
 #   cloudflared     the tunnel helper, if it is not already installed
 #
 # Updating is the same command again: it replaces the files and stops there.
