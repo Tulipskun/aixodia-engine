@@ -6,6 +6,7 @@
 //! stable endpoint through Workers KV.
 
 #[allow(dead_code)]
+mod client_auth;
 mod d1log;
 mod handover;
 mod tunnel;
@@ -93,6 +94,9 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     if token.is_empty() {
         anyhow::bail!("CF_TOKEN is not set");
     }
+    // Browser clients no longer go through the dashboard Worker: the engine
+    // issues its own short-lived token and answers CORS preflights itself.
+    let client_auth = client_auth::ClientAuth::from_env(token.clone());
 
     let db = DbClient::new();
     if !db.verify(&token).await {
@@ -195,6 +199,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .merge(aixodia_run::router(runs.clone()))
         .merge(terminal.router())
         .merge(aixodia_relay::router(relay_cfg))
+        .merge(client_auth.router())
         .route(
             "/ws",
             get(move |request: axum::extract::Request| {
@@ -205,8 +210,8 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
             }),
         );
     mux = mux.layer(middleware::from_fn_with_state(
-        token.clone(),
-        aixodia_io::require_token,
+        client_auth.clone(),
+        client_auth::client_guard,
     ));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;

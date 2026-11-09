@@ -3,7 +3,7 @@ GOAL:
 
 PLAN:
 [COMPLETED] Operator: both clients direct; engine issues short-lived token instead of exposing CF_TOKEN (see task.md).
-[IN_PROCESS] Confirm exact worker scope, then implement direct path; commit + push after EVERY change.
+[IN_PROCESS] Engine CORS + POST /v1/auth/token shipped; dashboard/Android wiring is next; commit + push after EVERY change.
 
 ARCHIVE:
 v1.175 Engine runs detached: `aixodia start` daemonizes with setsid, aixodia.pid and a rotated engine.log; no attached mode.

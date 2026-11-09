@@ -66,8 +66,24 @@
 | --- | --- | --- | --- |
 | 1 | ✅ | clone 3 repo, สำรวจสถาปัตยกรรม, สร้าง `task.md` (+ `MAIN.md`), push ทั้ง 3 repo | `engine afd4f94` / `AIxodia ad939f9` / `dashboard e9ffba7` |
 | 2 | ✅ | บันทึกคำตอบ operator (client = ทั้งคู่, auth = engine short-lived token) ลง `task.md` + `MAIN.md` | (this commit) |
-| 3 | ⏳ | ยืนยันขอบเขต worker กับ operator | — |
-| 4 | ⏳ | implement ทีละขั้น + commit/push ทุกขั้น | — |
+| 3 | ✅ | operator ปฏิเสธการตอบเพิ่ม → ถือ working assumption (dashboard worker + stale relay, เก็บ KV/D1/Tunnel) | (this commit) |
+| 4 | ✅ | engine: CORS + `POST /v1/auth/token` (outstanding: cargo check) + `client_guard` แทน `require_token` ที่ outer mux | (this commit) |
+| 5 | ⏳ | รัน `cargo check -p aixodia-engine` / `cargo test --workspace` ยืนยันโค้ด compile | — |
+| 6 | ⏳ | dashboard: เปลี่ยน SPA เป็น GitHub OAuth PKCE + ยิง engine ตรง แล้วลบ `worker/` | — |
+| 7 | ⏳ | AIxodia: อัปเดต docs ให้สอดคล้อง short-lived token (โค้ดยังใช้ CF_TOKEN ตรงอยู่) | — |
+| 8 | ⏳ | ลบ stale `engine/relay/` + refs | — |
+
+## Implementation status — engine (checkpoint 4)
+
+- ไฟล์ใหม่ `rust/crates/aixodia-engine/src/client_auth.rs`: `ClientAuth` เก็บ session token แบบ opaque ใน memory (`HashMap` + `RwLock`), ออกผ่าน `POST /v1/auth/token` โดยแลกจาก GitHub OAuth access token (`GET https://api.github.com/user`) แล้วตรวจ allowlist
+- `client_guard` แทน `aixodia_io::require_token` เฉพาะ **outer mux**: ยังรับ `CF_TOKEN` เดิม (Android/CLI/in-process), รับ short-lived token เพิ่ม, ตอบ OPTIONS preflight, เติม CORS headers ทุก response; open paths คงเดิม (`/healthz`, `/terminal`, `/room`) + `/v1/auth/token`
+- `aixodia_relay::router(relay_cfg)` ภายในยังใช้ `require_token` เดิมกับ CF_TOKEN → ไม่กระทบ `/room`
+- **env ใหม่ที่ต้องตั้งบน engine** (fail-closed ถ้าไม่ตั้ง = ไม่มีใครล็อกอินผ่าน browser ได้):
+  - `ALLOWED_GITHUB_USERS=Tulipskun` (comma-separated)
+  - `ALLOWED_ORIGINS=https://dashboard.aixodia.dpdns.org,http://localhost:5173`
+  - `AIXODIA_CLIENT_TOKEN_TTL=900` (optional, 60–86400 วินาที)
+- **ข้อจำกัดที่ตั้งใจ**: token อยู่ใน memory → restart engine ทำให้ session หลุด (ยอมรับได้สำหรับ short-lived); engine ยัง bind `127.0.0.1:8787` และเข้าได้ผ่าน Named Tunnel เท่านั้น; `CF_TOKEN` **ไม่เคยถูกส่งให้ browser**
+- **ยังไม่ได้รัน build/test** — ขั้นที่ 5 คือ `cargo check -p aixodia-engine` (cargo 1.93.0 มีอยู่; อาจต้อง `LIBCLANG_PATH` ตาม MAIN.md NOTE)
 
 ## Next steps สำหรับ AI ที่รับช่วง
 
