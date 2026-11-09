@@ -6,7 +6,8 @@
 
 ## Handoff (EN — read this first)
 
-**Status:** `SURVEY COMPLETE / AWAITING OPERATOR DECISION / NO CODE CHANGED`
+**Status:** `PARTIAL DECISION RECEIVED / WORKING ASSUMPTION PENDING CONFIRMATION / NO CODE CHANGED`
+**Decisions:** both clients direct; engine issues a short-lived token instead of exposing `CF_TOKEN`. Exact worker scope still unconfirmed — see *Operator decisions*.
 **Goal:** Remove the worker middleman so engine and client talk directly.
 **Hard constraint:** commit + push after EVERY change; no unpushed local work, ever.
 **Repos (all `main`, all public, owner `Tulipskun`):**
@@ -51,13 +52,22 @@
 
 ยังต้องระบุด้วยว่า **client** หมายถึง Android อย่างเดียว / dashboard อย่างเดียว / ทั้งคู่
 
+## Operator decisions (received)
+
+- **Client เป้าหมาย:** ทั้งคู่ — Android + Dashboard ต้องชี้ไป engine โดยตรง
+- **Auth เมื่อตัด dashboard Worker:** ให้ **engine ออก short-lived token** แทนการเปิดเผย `CF_TOKEN` ต่อ browser (ต้องเพิ่ม endpoint ออก session token ที่จำกัดอายุ/scope ฝั่ง engine)
+- **ยังไม่มีคำตอบชัดเจน:** ขอบเขตว่า "worker" คือ `dashboard/worker/` / `engine/relay/` / ทั้งสอง / ตัด Cloudflare ทั้งระบบ
+  - **Working assumption (รอยืนยัน):** เริ่มที่ `aixodia-dashboard/worker/` (ตัวกลางจริง) + ลบ stale `aixodia-engine/relay/` เป็น cleanup; **ไม่แตะ** Workers KV / D1 / Named Tunnel
+  - ถ้า operator เลือกต่างจากนี้ ให้แก้ assumption นี้ใน 3 repo ก่อน implement ต่อ
+
 ## Checkpoint log
 
 | # | สถานะ | สิ่งที่ทำ | Commit |
 | --- | --- | --- | --- |
-| 1 | ✅ | clone 3 repo, สำรวจสถาปัตยกรรม, สร้าง `task.md` + update `MAIN.md`, push ทั้ง 3 repo | (this commit) |
-| 2 | ⏳ | รอคำตอบ operator เรื่องขอบเขต worker/client | — |
-| 3 | ⏳ | implement ทีละขั้น + commit/push ทุกขั้น | — |
+| 1 | ✅ | clone 3 repo, สำรวจสถาปัตยกรรม, สร้าง `task.md` (+ `MAIN.md`), push ทั้ง 3 repo | `engine afd4f94` / `AIxodia ad939f9` / `dashboard e9ffba7` |
+| 2 | ✅ | บันทึกคำตอบ operator (client = ทั้งคู่, auth = engine short-lived token) ลง `task.md` + `MAIN.md` | (this commit) |
+| 3 | ⏳ | ยืนยันขอบเขต worker กับ operator | — |
+| 4 | ⏳ | implement ทีละขั้น + commit/push ทุกขั้น | — |
 
 ## Next steps สำหรับ AI ที่รับช่วง
 

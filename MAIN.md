@@ -2,8 +2,8 @@ GOAL:
 [IN_PROCESS] Remove the worker middleman so engine and client talk directly; track every step in task.md (v1.176)
 
 PLAN:
-[IN_PROCESS] Decide which "worker" the operator means (relay/ vs dashboard worker/ vs all Cloudflare) — see task.md.
-[IN_PROCESS] Implement direct engine↔client path; commit + push after EVERY change.
+[COMPLETED] Operator: both clients direct; engine issues short-lived token instead of exposing CF_TOKEN (see task.md).
+[IN_PROCESS] Confirm exact worker scope, then implement direct path; commit + push after EVERY change.
 
 ARCHIVE:
 v1.175 Engine runs detached: `aixodia start` daemonizes with setsid, aixodia.pid and a rotated engine.log; no attached mode.
