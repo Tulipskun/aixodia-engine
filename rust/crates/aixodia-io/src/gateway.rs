@@ -44,7 +44,7 @@ pub const REQUEST_MAX_BODY: usize = 8 << 20;
 
 /// The release tag, baked in at build time. Bump on every release so a live
 /// service can be identified via `GET /healthz`.
-pub const VERSION: &str = "v1.175";
+pub const VERSION: &str = "v1.176";
 
 /// The rule a client-supplied draft id has to follow, as a readable pattern.
 pub const SESSION_ID_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
@@ -492,10 +492,10 @@ impl Gateway {
 }
 
 async fn healthz(State(g): State<Arc<Gateway>>) -> Response {
-    // The launcher reads `pid` before signalling and `update` before deciding
-    // that SIGUSR1 is safe: on a build that predates the handshake the signal
-    // would kill the process. `idle` is the same check `/v1/runs` uses to avoid
-    // a swap mid-turn.
+    // Sample CPU over a short interval instead of reporting a made-up or stale
+    // value. The endpoint is intentionally open for tunnel health checks; the
+    // extra fields contain host resource counters only, never secrets.
+    let metrics = system_metrics().await;
     let idle = g.turns.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     write_json(
         StatusCode::OK,
@@ -506,8 +506,93 @@ async fn healthz(State(g): State<Arc<Gateway>>) -> Response {
             "pid": std::process::id(),
             "update": "signal:USR1",
             "idle": idle,
+            "cpu_percent": metrics.cpu_percent,
+            "memory_used_bytes": metrics.memory_used_bytes,
+            "memory_total_bytes": metrics.memory_total_bytes,
+            "memory_percent": metrics.memory_percent,
+            "uptime_seconds": metrics.uptime_seconds,
         }),
     )
+}
+
+#[derive(Debug, Default)]
+struct SystemMetrics {
+    cpu_percent: Option<f64>,
+    memory_used_bytes: Option<u64>,
+    memory_total_bytes: Option<u64>,
+    memory_percent: Option<f64>,
+    uptime_seconds: Option<f64>,
+}
+
+fn cpu_ticks(contents: &str) -> Option<(u64, u64)> {
+    let line = contents.lines().next()?;
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let values: Vec<u64> = fields.map(str::parse).collect::<Result<_, _>>().ok()?;
+    if values.len() < 4 {
+        return None;
+    }
+    let total = values.iter().copied().sum();
+    let idle = values.get(3).copied().unwrap_or(0)
+        .saturating_add(values.get(4).copied().unwrap_or(0));
+    Some((total, idle))
+}
+
+fn memory_bytes(contents: &str) -> Option<(u64, u64)> {
+    let mut total_kib = None;
+    let mut available_kib = None;
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        match fields.next()? {
+            "MemTotal:" => total_kib = fields.next()?.parse::<u64>().ok(),
+            "MemAvailable:" => available_kib = fields.next()?.parse::<u64>().ok(),
+            _ => continue,
+        }
+    }
+    let total = total_kib?.checked_mul(1024)?;
+    let available = available_kib?.checked_mul(1024)?.min(total);
+    Some((total.saturating_sub(available), total))
+}
+
+async fn system_metrics() -> SystemMetrics {
+    let mut metrics = SystemMetrics::default();
+
+    if let Ok(first) = tokio::fs::read_to_string("/proc/stat").await {
+        if let Some(before) = cpu_ticks(&first) {
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            if let Ok(second) = tokio::fs::read_to_string("/proc/stat").await {
+                if let Some(after) = cpu_ticks(&second) {
+                    let total = after.0.saturating_sub(before.0);
+                    let idle = after.1.saturating_sub(before.1).min(total);
+                    if total > 0 {
+                        metrics.cpu_percent =
+                            Some(((total - idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(memory) = tokio::fs::read_to_string("/proc/meminfo").await {
+        if let Some((used, total)) = memory_bytes(&memory) {
+            metrics.memory_used_bytes = Some(used);
+            metrics.memory_total_bytes = Some(total);
+            if total > 0 {
+                metrics.memory_percent = Some(used as f64 / total as f64 * 100.0);
+            }
+        }
+    }
+
+    if let Ok(uptime) = tokio::fs::read_to_string("/proc/uptime").await {
+        metrics.uptime_seconds = uptime
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<f64>().ok());
+    }
+
+    metrics
 }
 
 async fn list_providers() -> Response {
@@ -863,4 +948,34 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+
+#[cfg(test)]
+mod system_metrics_tests {
+    use super::{cpu_ticks, memory_bytes};
+
+    #[test]
+    fn parses_aggregate_cpu_ticks_and_counts_iowait_as_idle() {
+        let (total, idle) = cpu_ticks("cpu  10 2 3 40 5 1 1 0 0 0\ncpu0 1 0 0 4 0 0 0 0 0 0")
+            .expect("aggregate CPU line");
+        assert_eq!(total, 62);
+        assert_eq!(idle, 45);
+    }
+
+    #[test]
+    fn calculates_used_memory_from_mem_available() {
+        let (used, total) = memory_bytes(
+            "MemTotal:         100 kB\nMemFree:           10 kB\nMemAvailable:      25 kB\n",
+        )
+        .expect("memory values");
+        assert_eq!(total, 102_400);
+        assert_eq!(used, 76_800);
+    }
+
+    #[test]
+    fn missing_proc_fields_do_not_create_metrics() {
+        assert_eq!(cpu_ticks("btime 123"), None);
+        assert_eq!(memory_bytes("MemFree: 100 kB"), None);
+    }
 }
