@@ -949,3 +949,33 @@ pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     }
     diff == 0
 }
+
+
+#[cfg(test)]
+mod system_metrics_tests {
+    use super::{cpu_ticks, memory_bytes};
+
+    #[test]
+    fn parses_aggregate_cpu_ticks_and_counts_iowait_as_idle() {
+        let (total, idle) = cpu_ticks("cpu  10 2 3 40 5 1 1 0 0 0\ncpu0 1 0 0 4 0 0 0 0 0 0")
+            .expect("aggregate CPU line");
+        assert_eq!(total, 62);
+        assert_eq!(idle, 45);
+    }
+
+    #[test]
+    fn calculates_used_memory_from_mem_available() {
+        let (used, total) = memory_bytes(
+            "MemTotal:         100 kB\nMemFree:           10 kB\nMemAvailable:      25 kB\n",
+        )
+        .expect("memory values");
+        assert_eq!(total, 102_400);
+        assert_eq!(used, 76_800);
+    }
+
+    #[test]
+    fn missing_proc_fields_do_not_create_metrics() {
+        assert_eq!(cpu_ticks("btime 123"), None);
+        assert_eq!(memory_bytes("MemFree: 100 kB"), None);
+    }
+}
