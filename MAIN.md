@@ -1,10 +1,12 @@
 GOAL:
-[COMPLETED] Run the engine detached: `aixodia start` daemonizes it with setsid, an `aixodia.pid` and a rotated `engine.log`, and the launcher has no attached mode at all.
+[IN_PROCESS] Remove the worker middleman so engine and client talk directly; track every step in task.md (v1.176)
 
 PLAN:
-(no active plan)
+[IN_PROCESS] Decide which "worker" the operator means (relay/ vs dashboard worker/ vs all Cloudflare) — see task.md.
+[IN_PROCESS] Implement direct engine↔client path; commit + push after EVERY change.
 
 ARCHIVE:
+v1.175 Engine runs detached: `aixodia start` daemonizes with setsid, aixodia.pid and a rotated engine.log; no attached mode.
 Launcher daemonizes, shipped at v1.175 with no engine bump: `cmd_start` setsids the engine, the child writes `aixodia.pid` before it execs, output appends to `engine.log` (rotated past `AIXODIA_LOG_MAX_KB`, default 8 MB), then `start` waits on healthz; `stop`/`status`/`logs`/`update` read healthz and fall back to the `/proc`-validated pidfile, `run`/`up` alias `start`, and no code path execs the engine in the caller's shell.
 v1.175 root-capable file manager API (`/api/files` list/delete/download/upload/mkdir/rename) behind the existing API token.
 v1.173 `aixodia start` execs the engine in the caller's foreground; no nohup, forked launcher, engine pidfile or redirected log. A newer D1 discovery owner gates only URL/version/heartbeat writes; it never shuts down the older foreground process. When the newer heartbeat expires, the still-running process can republish its current tunnel URL.
@@ -35,10 +37,8 @@ v1.148+ provider registry, tool rounds, keyless attempts, idle check, restart en
 earlier: gateway port from Go, session store, chat SSE, D1 history, mobile hub, terminal ws
 
 NOTE:
-- A multiplexer's copy-mode answers a wheel in *state* instantly and in *paint* on its own clock: measured here at 1253 ms median for one notch per 250 ms, 701 ms at /100 ms, 442 ms at /40 ms, 108 ms median (205 ms worst) for a 30-notch burst. Paging through the wire can never feel like a local drag, so the history is handed to the client instead.
-- `"target"` in `DEFAULT_EXCLUDES` is the same class of rule as `core.*` was: a plain name prunes any component named `target`, including a crate's own `src/target/`. The registry survives it only because the `.crate` tarballs are kept — repair is a per-crate diff of `registry/src/<name>` against the members of `registry/cache/<name>.crate`, writing the missing ones with the tarball's mode and mtime so cargo's fingerprints stay valid. No `rm -rf`, no rebuild.
-- An exclusion is a data-loss rule in disguise. A restore only ever adds and overwrites, so a file the scope hides does not come back as an error at restore time — it comes back later as a build that cannot compile.
-- A backup's minutes are spent reading the tree, not on the wire: 53.4 s idle for 4.6 GB was 37.9 s packing, 5.5 s uploading 517 MB (~94 MB/s), 6.8 s walking, 3.4 s publishing.
+- task.md is the cross-repo handoff tracker: update it and push in the SAME commit as any edit; operator requires zero unpushed work (another AI may take over mid-task).
+- Pending operator decision (see task.md): which "worker" to remove. Android already bypasses Workers via Named Tunnel (D-011); the live middleman is aixodia-dashboard/worker/.
 - Backup slot is single: auto-backup cannot start during a manual run.
 - Cooldown (default 30 min) prevents rapid-fire on CPU threshold bouncing.
 - rustc 1.99.1 requires cc >= 1.11; a truncated registry src dir (e.g. tokio missing `runtime/task/core.rs`) is repaired by extracting the members the dir lacks from the intact `.crate` in `registry/cache`, keeping the tarball mtimes so cargo's fingerprints stay valid — no `rm -rf`, no rebuild.
