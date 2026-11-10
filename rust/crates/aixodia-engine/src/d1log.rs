@@ -136,35 +136,6 @@ impl LogStore {
     }
 }
 
-/// Writes to stdout and queues every non-empty line for the log store, which is
-/// how the Go engine tees its `log` output into the database.
-pub struct TeeWriter {
-    store: LogStore,
-}
-
-impl TeeWriter {
-    /// Wraps a store so that everything written to the returned writer also
-    /// lands in it.
-    pub fn new(store: LogStore) -> Self {
-        Self { store }
-    }
-}
-
-impl std::io::Write for TeeWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = std::io::stdout().write(buf)?;
-        let msg = String::from_utf8_lossy(buf).trim().to_string();
-        if !msg.is_empty() {
-            self.store.push("info", msg);
-        }
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::stdout().flush()
-    }
-}
-
 /// Drains the write buffer, rotating the table when it is full.
 fn log_writer(conn: Arc<Mutex<Connection>>, mut rx: mpsc::Receiver<LogEntry>) {
     while let Some(entry) = rx.blocking_recv() {
@@ -279,11 +250,6 @@ pub fn log(level: &str, msg: String) {
 /// Queues an informational line on the process-wide store.
 pub fn info(msg: impl Into<String>) {
     log("info", msg.into());
-}
-
-/// Queues a warning line on the process-wide store.
-pub fn warn(msg: impl Into<String>) {
-    log("warn", msg.into());
 }
 
 /// Queues an error line on the process-wide store.
