@@ -71,7 +71,7 @@
 | 5 | 🔄 | `cargo check` ครั้งแรก fail เพราะ **MSRV ของ sandbox** (rustc 1.93 < sysinfo 0.39.6 ที่ต้อง 1.95 / wreq 0.16.3 ที่ต้อง 1.98) ไม่ใช่ error ในโค้ด → กำลังรันใหม่ด้วย `--ignore-rust-version`; `Cargo.lock` +3 บรรทัดจาก reqwest/uuid ถูก commit แล้ว | (this commit) |
 | 6 | ⏳ | dashboard: เปลี่ยน SPA เป็น GitHub OAuth PKCE + ยิง engine ตรง แล้วลบ `worker/` | — |
 | 7 | ⏳ | AIxodia: อัปเดต docs ให้สอดคล้อง short-lived token (โค้ดยังใช้ CF_TOKEN ตรงอยู่) | — |
-| 8 | ⏳ | ลบ stale `engine/relay/` + refs | — |
+| 8 | ✅ | ลบ stale `engine/relay/` (Cloudflare Worker + Durable Object) + แก้ comment stale ใน `aixodia-wsock/src/client.rs`; ไม่มี CI/workspace อ้างถึง | (this commit) |
 
 ## Implementation status — engine (checkpoint 4)
 

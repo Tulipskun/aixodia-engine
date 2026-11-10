@@ -1,4 +1,4 @@
-//! The outbound half of RFC 6455: the engine dials the relay with it.
+//! The outbound half of RFC 6455: legacy: the engine now serves /room directly behind the tunnel.
 //!
 //! Port of the Go `io/wsock/client.go`. A client masks every frame it sends and
 //! may not receive masked frames, which is the mirror of the server half.
