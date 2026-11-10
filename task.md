@@ -68,7 +68,7 @@
 | 2 | ✅ | บันทึกคำตอบ operator (client = ทั้งคู่, auth = engine short-lived token) ลง `task.md` + `MAIN.md` | (this commit) |
 | 3 | ✅ | operator ปฏิเสธการตอบเพิ่ม → ถือ working assumption (dashboard worker + stale relay, เก็บ KV/D1/Tunnel) | (this commit) |
 | 4 | ✅ | engine: CORS + `POST /v1/auth/token` (outstanding: cargo check) + `client_guard` แทน `require_token` ที่ outer mux | (this commit) |
-| 5 | 🔄 | `cargo check` ครั้งแรก fail เพราะ **MSRV ของ sandbox** (rustc 1.93 < sysinfo 0.39.6 ที่ต้อง 1.95 / wreq 0.16.3 ที่ต้อง 1.98) ไม่ใช่ error ในโค้ด → กำลังรันใหม่ด้วย `--ignore-rust-version`; `Cargo.lock` +3 บรรทัดจาก reqwest/uuid ถูก commit แล้ว | (this commit) |
+| 5 | ✅ | build: `cargo check -p aixodia-engine` ใน sandbox **ยังไม่ผ่าน** เพราะ deps ของ workspace (`sysinfo 0.39.6` ใช้ unstable `cfg_select` ต้อง rustc ≥1.95; `wreq 0.16.3` ต้อง 1.98; `btls-sys v0.5.6` build script fail) แต่ **โค้ดใหม่ผ่านการตรวจจริง**: copy `client_auth.rs` ไป mini crate ที่มีแค่ axum/reqwest/uuid/tokio/serde → `cargo check` = `Finished` ไม่มี error/warning | `dff576e` |
 | 6 | ⏳ | dashboard: เปลี่ยน SPA เป็น GitHub OAuth PKCE + ยิง engine ตรง แล้วลบ `worker/` | — |
 | 7 | ⏳ | AIxodia: อัปเดต docs ให้สอดคล้อง short-lived token (โค้ดยังใช้ CF_TOKEN ตรงอยู่) | — |
 | 8 | ✅ | ลบ stale `engine/relay/` (Cloudflare Worker + Durable Object) + แก้ comment stale ใน `aixodia-wsock/src/client.rs`; ไม่มี CI/workspace อ้างถึง | (this commit) |
