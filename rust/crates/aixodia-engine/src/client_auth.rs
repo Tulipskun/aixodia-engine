@@ -30,7 +30,7 @@ use sha2::Sha256;
 
 /// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
 const DEFAULT_ALLOWED_ORIGINS: &str = "https://dashboard.aixodia.dpdns.org,http://localhost:5173";
-const DEFAULT_GITHUB_REDIRECT_URI: &str = "https://dashboard.aixodia.dpdns.org/";
+const DEFAULT_GITHUB_REDIRECT_URI: &str = "https://dashboard.aixodia.dpdns.org";
 
 /// Refresh credentials are deliberately stateless: they survive Engine restarts
 /// without creating realtime KV/D1 session rows. The refresh token is stored by
