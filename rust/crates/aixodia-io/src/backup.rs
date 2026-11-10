@@ -137,11 +137,17 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
     };
     let config = resolve(stored.as_deref());
     let Some(store) = g.state_store() else {
-        return write_error(StatusCode::BAD_GATEWAY, "database_error", "the engine state store is not open");
+        return write_error(
+            StatusCode::BAD_GATEWAY,
+            "database_error",
+            "the engine state store is not open",
+        );
     };
     let persisted_raw = match store.get_state(LAST_BACKUP_KEY).await {
         Ok(raw) => raw,
-        Err(err) => return write_error(StatusCode::BAD_GATEWAY, "database_error", &err.to_string()),
+        Err(err) => {
+            return write_error(StatusCode::BAD_GATEWAY, "database_error", &err.to_string())
+        }
     };
     let mut persisted_last = persisted_raw
         .as_deref()
@@ -158,7 +164,9 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
         let lookup_config = config.clone();
         let legacy = tokio::task::spawn_blocking(move || -> Result<Option<Value>, String> {
             let hub = aixodia_backup::Hub::new(&lookup_config).map_err(|err| err.to_string())?;
-            let Some(manifest) = aixodia_backup::latest_manifest(&hub).map_err(|err| err.to_string())? else {
+            let Some(manifest) =
+                aixodia_backup::latest_manifest(&hub).map_err(|err| err.to_string())?
+            else {
                 return Ok(None);
             };
             Ok(Some(json!({
@@ -181,7 +189,8 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
                     }
                 }
             })))
-        }).await;
+        })
+        .await;
         match legacy {
             Ok(Ok(Some(record))) => {
                 if let Err(err) = store.put_state(LAST_BACKUP_KEY, &record.to_string()).await {
@@ -206,12 +215,15 @@ pub async fn api_backup_status(State(g): State<Arc<Gateway>>) -> Response {
             "progress": active.reporter.snapshot(),
         })
     });
-    let current_last = if slots.finished["operation"] == "backup" && slots.finished["summary"]["ok"] == true {
-        slots.finished.clone()
-    } else {
-        Value::Null
-    };
-    let last_backup = if current_last["finished_at"].as_i64().unwrap_or(0) > persisted_last["finished_at"].as_i64().unwrap_or(0) {
+    let current_last =
+        if slots.finished["operation"] == "backup" && slots.finished["summary"]["ok"] == true {
+            slots.finished.clone()
+        } else {
+            Value::Null
+        };
+    let last_backup = if current_last["finished_at"].as_i64().unwrap_or(0)
+        > persisted_last["finished_at"].as_i64().unwrap_or(0)
+    {
         current_last
     } else {
         persisted_last
@@ -291,15 +303,16 @@ pub async fn api_backup_config_put(State(g): State<Arc<Gateway>>, body: Bytes) -
         auto_cpu_threshold: incoming.auto_cpu_threshold.or(previous.auto_cpu_threshold),
         auto_cooldown_secs: incoming.auto_cooldown_secs.or(previous.auto_cooldown_secs),
     };
-    let restore_identity_changed = previous_restore_identity != (
-        merged.token.clone(),
-        merged.bucket.clone(),
-        merged.endpoint.clone(),
-        merged.prefix.clone(),
-        merged.root.clone(),
-        merged.excludes.clone(),
-        merged.includes.clone(),
-    );
+    let restore_identity_changed = previous_restore_identity
+        != (
+            merged.token.clone(),
+            merged.bucket.clone(),
+            merged.endpoint.clone(),
+            merged.prefix.clone(),
+            merged.root.clone(),
+            merged.excludes.clone(),
+            merged.includes.clone(),
+        );
     let raw = match serde_json::to_string(&merged) {
         Ok(raw) => raw,
         Err(err) => {
@@ -550,13 +563,20 @@ fn finish(
     if operation == "backup" && finished["summary"]["ok"] == true {
         if let Some(store) = store {
             let raw = finished.to_string();
-            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(runtime) => {
                     if let Err(err) = runtime.block_on(store.put_state(LAST_BACKUP_KEY, &raw)) {
-                        tracing::warn!("backup succeeded but last-backup persistence failed: {err}");
+                        tracing::warn!(
+                            "backup succeeded but last-backup persistence failed: {err}"
+                        );
                     }
                 }
-                Err(err) => tracing::warn!("backup succeeded but persistence runtime could not start: {err}"),
+                Err(err) => tracing::warn!(
+                    "backup succeeded but persistence runtime could not start: {err}"
+                ),
             }
         }
     }
@@ -682,7 +702,10 @@ pub(crate) fn list_directory(path: &str) -> Result<Value, String> {
         let file_type = meta.file_type();
         let is_link = file_type.is_symlink();
         let is_dir = file_type.is_dir()
-            || (is_link && std::fs::metadata(&child).map(|target| target.is_dir()).unwrap_or(false));
+            || (is_link
+                && std::fs::metadata(&child)
+                    .map(|target| target.is_dir())
+                    .unwrap_or(false));
         let entry = json!({
             "name": name,
             "path": joined(&text, &name),
@@ -1006,7 +1029,10 @@ mod tests {
             "and an empty selection resolves to no included paths"
         );
         assert!(
-            !aixodia_backup::scan::is_included("anything", &resolve(Some(&serde_json::to_string(&stored).unwrap())).includes),
+            !aixodia_backup::scan::is_included(
+                "anything",
+                &resolve(Some(&serde_json::to_string(&stored).unwrap())).includes
+            ),
             "an empty selection must not include any path"
         );
     }

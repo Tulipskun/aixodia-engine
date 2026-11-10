@@ -87,14 +87,22 @@ pub async fn start_cloudflared(
 
     let mut command = tokio::process::Command::new(path);
     command
-        .args(["tunnel", "--no-autoupdate", "--metrics", "127.0.0.1:0", "run"])
+        .args([
+            "tunnel",
+            "--no-autoupdate",
+            "--metrics",
+            "127.0.0.1:0",
+            "run",
+        ])
         .env("TUNNEL_TOKEN", token)
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = command.spawn()?;
     let pid = child.id();
 
-    let stderr = child.stderr.take()
+    let stderr = child
+        .stderr
+        .take()
         .ok_or_else(|| anyhow::anyhow!("cloudflared: no stderr pipe"))?;
     let (ready_tx, ready_rx) = oneshot::channel::<String>();
     let ready_url = url.clone();
@@ -118,7 +126,9 @@ pub async fn start_cloudflared(
         let mut kill_rx = kill_rx;
         let killed = {
             let wait = child.wait();
-            let stop = async { let _ = kill_rx.changed().await; };
+            let stop = async {
+                let _ = kill_rx.changed().await;
+            };
             tokio::pin!(wait, stop);
             tokio::select! {
                 _ = &mut wait => false,
@@ -148,7 +158,9 @@ pub async fn start_cloudflared(
         }
     };
     let Some(url) = url else {
-        if let Some(tx) = kill.take() { let _ = tx.send(true); }
+        if let Some(tx) = kill.take() {
+            let _ = tx.send(true);
+        }
         anyhow::bail!("cloudflared exited before the Named Tunnel registered");
     };
 
@@ -378,7 +390,7 @@ pub fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-        use std::time::Instant;
+    use std::time::Instant;
 
     /// The clock the phone counts on is the machine's, not the process's: an
     /// engine update restarts the process and must not restart the answer.
@@ -470,7 +482,9 @@ mod tests {
         let cancel = CancellationToken::new();
 
         assert!(
-            start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org").await.is_err(),
+            start_cloudflared(cancel, &path, "test-token", "https://aixodia.dpdns.org")
+                .await
+                .is_err(),
             "a tunnel that never registered must not yield a URL"
         );
     }
@@ -517,7 +531,13 @@ mod tests {
         });
         let cancel = CancellationToken::new();
 
-        let keeper = Arc::new(Keeper::new(path, "test-token", "https://aixodia.dpdns.org", Some(publish), dir.path().join(PIDFILE)));
+        let keeper = Arc::new(Keeper::new(
+            path,
+            "test-token",
+            "https://aixodia.dpdns.org",
+            Some(publish),
+            dir.path().join(PIDFILE),
+        ));
         let task = {
             let keeper = Arc::clone(&keeper);
             let cancel = cancel.clone();
@@ -556,9 +576,14 @@ mod tests {
         let pidfile = dir.path().join(PIDFILE);
         let cancel = CancellationToken::new();
 
-        let tunnel = start_cloudflared(cancel.clone(), &path, "test-token", "https://aixodia.dpdns.org")
-            .await
-            .expect("startCloudflared");
+        let tunnel = start_cloudflared(
+            cancel.clone(),
+            &path,
+            "test-token",
+            "https://aixodia.dpdns.org",
+        )
+        .await
+        .expect("startCloudflared");
         let pid = tunnel.pid.expect("a spawned cloudflared has a pid");
         assert!(is_stale_tunnel(pid));
         std::fs::write(&pidfile, format!("{pid}\n")).expect("record the pid");
@@ -605,6 +630,4 @@ mod tests {
             "a first boot has nothing to reap"
         );
     }
-
-
 }

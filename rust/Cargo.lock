@@ -178,7 +178,6 @@ dependencies = [
 name = "aixodia-mobile"
 version = "0.1.0"
 dependencies = [
- "aixodia-auth",
  "aixodia-session",
  "aixodia-wsock",
  "async-trait",
@@ -294,7 +293,6 @@ dependencies = [
 name = "aixodia-terminal"
 version = "0.1.0"
 dependencies = [
- "aixodia-auth",
  "aixodia-wsock",
  "axum",
  "libc",

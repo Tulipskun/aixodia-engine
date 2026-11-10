@@ -89,10 +89,12 @@ fn rule_matches_or_reaches(pattern: &str, rel: &str) -> bool {
 }
 
 fn selected_by_rules(rel: &str, includes: &[String]) -> bool {
-    includes.iter()
+    includes
+        .iter()
         .filter_map(|raw| {
             let raw = raw.trim();
-            let (excluded, path) = raw.strip_prefix('!')
+            let (excluded, path) = raw
+                .strip_prefix('!')
                 .map(|path| (true, path))
                 .unwrap_or((false, raw));
             if path.is_empty() || !rule_matches_or_reaches(path, rel) {
@@ -120,8 +122,7 @@ pub fn is_included(rel: &str, includes: &[String]) -> bool {
         if pattern.starts_with(&format!("{rel}/")) {
             return selected_by_rules(pattern, includes);
         }
-        (pattern.contains('*') || pattern.contains('?'))
-            && leads_to_match(rel, pattern)
+        (pattern.contains('*') || pattern.contains('?')) && leads_to_match(rel, pattern)
     })
 }
 
@@ -477,7 +478,9 @@ mod tests {
     #[test]
     fn explicit_exclusion_patterns_prune_any_depth() {
         let excludes: Vec<String> = ["target", "__pycache__", ".cache", "*.pyc", "*.aixodia-part"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(is_excluded("aixodia-engine/rust/target/debug/x", &excludes));
         assert!(is_excluded(".cache/pip/wheel.whl", &excludes));
         assert!(is_excluded("a/b/__pycache__/c.pyc", &excludes));

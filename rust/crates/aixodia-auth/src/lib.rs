@@ -208,8 +208,14 @@ mod tests {
     #[tokio::test]
     async fn empty_token_is_unauthorized() {
         let auth = GitHubAuth::new("Tulipskun");
-        assert!(matches!(auth.verify("").await, Err(AuthError::Unauthorized)));
-        assert!(matches!(auth.verify("   ").await, Err(AuthError::Unauthorized)));
+        assert!(matches!(
+            auth.verify("").await,
+            Err(AuthError::Unauthorized)
+        ));
+        assert!(matches!(
+            auth.verify("   ").await,
+            Err(AuthError::Unauthorized)
+        ));
     }
 
     #[tokio::test]

@@ -5,8 +5,8 @@
 //! duration claims the backup slot and starts a backup on an OS thread (same
 //! path as a manual trigger). Disabled until explicitly turned on via config.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 

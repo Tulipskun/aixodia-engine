@@ -535,7 +535,10 @@ fn cpu_ticks(contents: &str) -> Option<(u64, u64)> {
         return None;
     }
     let total = values.iter().copied().sum();
-    let idle = values.get(3).copied().unwrap_or(0)
+    let idle = values
+        .get(3)
+        .copied()
+        .unwrap_or(0)
         .saturating_add(values.get(4).copied().unwrap_or(0));
     Some((total, idle))
 }
@@ -948,7 +951,6 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         Some(token)
     }
 }
-
 
 #[cfg(test)]
 mod system_metrics_tests {

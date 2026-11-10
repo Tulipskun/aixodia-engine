@@ -324,7 +324,6 @@ impl Client {
         .map(|_| ())
     }
 
-
     // --- D1 --------------------------------------------------------------
 
     /// Runs one statement against D1 and returns its rows.
@@ -458,10 +457,13 @@ impl Client {
         if !self.config_kv_ready() {
             return Err(Error::KvNotVerified);
         }
-        let response = self.inner.http
+        let response = self
+            .inner
+            .http
             .get(self.config_kv_url(key))
             .headers(self.auth_headers(&self.token()))
-            .send().await?;
+            .send()
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -477,12 +479,15 @@ impl Client {
         if !self.config_kv_ready() {
             return Err(Error::KvNotVerified);
         }
-        let response = self.inner.http
+        let response = self
+            .inner
+            .http
             .put(self.config_kv_url(key))
             .headers(self.auth_headers(&self.token()))
             .header(reqwest::header::CONTENT_TYPE, "text/plain")
             .body(value.to_string())
-            .send().await?;
+            .send()
+            .await?;
         let status = response.status().as_u16();
         let raw = read_limited(response, 1 << 20).await?;
         if !(200..300).contains(&status) {
@@ -872,13 +877,16 @@ impl Client {
             if !(200..300).contains(&status) {
                 return Err(kv_error("device KV list", status as i32, &raw));
             }
-            let page: DeviceKeyList =
-                serde_json::from_slice(&raw).map_err(|e| Error::Decode {
-                    what: "device KV list".into(),
-                    source: e.into(),
-                })?;
+            let page: DeviceKeyList = serde_json::from_slice(&raw).map_err(|e| Error::Decode {
+                what: "device KV list".into(),
+                source: e.into(),
+            })?;
             if !page.success {
-                return Err(api_error_message("device KV list", status as i32, &page.errors));
+                return Err(api_error_message(
+                    "device KV list",
+                    status as i32,
+                    &page.errors,
+                ));
             }
             for row in page.result {
                 if valid_device_name(&row.name) {

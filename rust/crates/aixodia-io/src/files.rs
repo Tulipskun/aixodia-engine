@@ -76,7 +76,11 @@ struct DeleteQuery {
 }
 
 fn bad_path(message: impl std::fmt::Display) -> Response {
-    write_error(StatusCode::BAD_REQUEST, "invalid_path", &message.to_string())
+    write_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_path",
+        &message.to_string(),
+    )
 }
 
 fn absolute_path(raw: &str) -> Result<PathBuf, String> {
@@ -93,8 +97,7 @@ fn absolute_path(raw: &str) -> Result<PathBuf, String> {
 
 fn canonical_directory(raw: &str) -> Result<PathBuf, String> {
     let path = absolute_path(raw)?;
-    let real = std::fs::canonicalize(&path)
-        .map_err(|err| format!("{}: {err}", path.display()))?;
+    let real = std::fs::canonicalize(&path).map_err(|err| format!("{}: {err}", path.display()))?;
     if !real.is_dir() {
         return Err(format!("{} is not a directory", real.display()));
     }
@@ -119,21 +122,33 @@ fn parent_and_name(raw: &str) -> Result<(PathBuf, std::ffi::OsString), String> {
 }
 
 async fn list(Query(query): Query<PathQuery>) -> Response {
-    let requested = if query.path.trim().is_empty() { "/" } else { &query.path };
+    let requested = if query.path.trim().is_empty() {
+        "/"
+    } else {
+        &query.path
+    };
     let dir = match canonical_directory(requested) {
         Ok(dir) => dir,
         Err(err) => return bad_path(err),
     };
     let mut read = match tokio::fs::read_dir(&dir).await {
         Ok(read) => read,
-        Err(err) => return write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
+        Err(err) => {
+            return write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string())
+        }
     };
     let mut entries = Vec::new();
     loop {
         let item = match read.next_entry().await {
             Ok(Some(item)) => item,
             Ok(None) => break,
-            Err(err) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, "filesystem_error", &err.to_string()),
+            Err(err) => {
+                return write_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "filesystem_error",
+                    &err.to_string(),
+                )
+            }
         };
         let name = item.file_name().to_string_lossy().into_owned();
         let path = item.path();
@@ -142,13 +157,19 @@ async fn list(Query(query): Query<PathQuery>) -> Response {
             Err(_) => continue,
         };
         let kind = metadata.file_type();
-        let modified = metadata.modified().ok()
+        let modified = metadata
+            .modified()
+            .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs());
         #[cfg(unix)]
         let (mode, uid, gid) = {
             use std::os::unix::fs::MetadataExt;
-            (Some(format!("{:04o}", metadata.mode() & 0o7777)), Some(metadata.uid()), Some(metadata.gid()))
+            (
+                Some(format!("{:04o}", metadata.mode() & 0o7777)),
+                Some(metadata.uid()),
+                Some(metadata.gid()),
+            )
         };
         #[cfg(not(unix))]
         let (mode, uid, gid): (Option<String>, Option<u32>, Option<u32>) = (None, None, None);
@@ -170,17 +191,23 @@ async fn list(Query(query): Query<PathQuery>) -> Response {
         let ad = a["is_dir"].as_bool().unwrap_or(false);
         let bd = b["is_dir"].as_bool().unwrap_or(false);
         bd.cmp(&ad).then_with(|| {
-            a["name"].as_str().unwrap_or("").to_lowercase()
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
                 .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
         })
     });
     let count = entries.len();
-    write_json(StatusCode::OK, json!({
-        "path": dir.to_string_lossy(),
-        "parent": dir.parent().map(|p| p.to_string_lossy().into_owned()),
-        "entries": entries,
-        "count": count
-    }))
+    write_json(
+        StatusCode::OK,
+        json!({
+            "path": dir.to_string_lossy(),
+            "parent": dir.parent().map(|p| p.to_string_lossy().into_owned()),
+            "entries": entries,
+            "count": count
+        }),
+    )
 }
 
 async fn download(Query(query): Query<PathQuery>) -> Response {
@@ -197,36 +224,60 @@ async fn download(Query(query): Query<PathQuery>) -> Response {
         Ok(_) => return bad_path("download target is not a regular file"),
         Err(err) => return write_error(StatusCode::NOT_FOUND, "not_found", &err.to_string()),
     };
-    let name = real.file_name().unwrap_or_default().to_string_lossy().replace(['"', '\r', '\n'], "_");
+    let name = real
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .replace(['"', '\r', '\n'], "_");
     let file = match tokio::fs::File::open(&real).await {
         Ok(file) => file,
-        Err(err) => return write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
+        Err(err) => {
+            return write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string())
+        }
     };
     let stream = ReaderStream::new(file);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
-    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-    response.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from_str(&metadata.len().to_string()).unwrap());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.len().to_string()).unwrap(),
+    );
     response.headers_mut().insert(
         header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("attachment; filename=\"{}\"; filename*=UTF-8''{}", name, percent_encode(&name))).unwrap(),
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+            name,
+            percent_encode(&name)
+        ))
+        .unwrap(),
     );
     response
 }
 
 fn percent_encode(value: &str) -> String {
-    value.bytes().map(|byte| {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
-            (byte as char).to_string()
-        } else {
-            format!("%{byte:02X}")
-        }
-    }).collect()
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
 }
 
 async fn upload(Query(query): Query<UploadQuery>, headers: HeaderMap, body: Body) -> Response {
-    if query.name.is_empty() || query.name == "." || query.name == ".."
-        || query.name.contains('/') || query.name.contains('\\') || query.name.contains('\0')
+    if query.name.is_empty()
+        || query.name == "."
+        || query.name == ".."
+        || query.name.contains('/')
+        || query.name.contains('\\')
+        || query.name.contains('\0')
     {
         return bad_path("name must be one filename, without path separators");
     }
@@ -236,13 +287,28 @@ async fn upload(Query(query): Query<UploadQuery>, headers: HeaderMap, body: Body
     };
     let destination = parent.join(&query.name);
     if !query.overwrite && tokio::fs::symlink_metadata(&destination).await.is_ok() {
-        return write_error(StatusCode::CONFLICT, "already_exists", "destination already exists");
+        return write_error(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "destination already exists",
+        );
     }
     let seq = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(".aixodia-upload-{}-{seq}.part", std::process::id()));
-    let mut file = match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .await
+    {
         Ok(file) => file,
-        Err(err) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, "filesystem_error", &err.to_string()),
+        Err(err) => {
+            return write_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "filesystem_error",
+                &err.to_string(),
+            )
+        }
     };
     let mut written = 0u64;
     let mut stream = body.into_data_stream();
@@ -260,24 +326,40 @@ async fn upload(Query(query): Query<UploadQuery>, headers: HeaderMap, body: Body
             None => {
                 drop(file);
                 let _ = tokio::fs::remove_file(&temp).await;
-                return write_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "file size overflow");
+                return write_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "too_large",
+                    "file size overflow",
+                );
             }
         };
         if let Err(err) = file.write_all(&chunk).await {
             drop(file);
             let _ = tokio::fs::remove_file(&temp).await;
-            return write_error(StatusCode::INSUFFICIENT_STORAGE, "filesystem_error", &err.to_string());
+            return write_error(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "filesystem_error",
+                &err.to_string(),
+            );
         }
     }
     if let Err(err) = file.flush().await {
         drop(file);
         let _ = tokio::fs::remove_file(&temp).await;
-        return write_error(StatusCode::INSUFFICIENT_STORAGE, "filesystem_error", &err.to_string());
+        return write_error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "filesystem_error",
+            &err.to_string(),
+        );
     }
     drop(file);
     if !query.overwrite && tokio::fs::symlink_metadata(&destination).await.is_ok() {
         let _ = tokio::fs::remove_file(&temp).await;
-        return write_error(StatusCode::CONFLICT, "already_exists", "destination appeared during upload");
+        return write_error(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "destination appeared during upload",
+        );
     }
     let publish = if query.overwrite {
         tokio::fs::rename(&temp, &destination).await
@@ -294,13 +376,19 @@ async fn upload(Query(query): Query<UploadQuery>, headers: HeaderMap, body: Body
         return write_error(status, "filesystem_error", &err.to_string());
     }
     let _ = tokio::fs::remove_file(&temp).await;
-    let mime = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream");
-    write_json(StatusCode::CREATED, json!({
-        "path": destination.to_string_lossy(),
-        "name": query.name,
-        "size": written,
-        "content_type": mime
-    }))
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    write_json(
+        StatusCode::CREATED,
+        json!({
+            "path": destination.to_string_lossy(),
+            "name": query.name,
+            "size": written,
+            "content_type": mime
+        }),
+    )
 }
 
 async fn mkdir(Json(request): Json<CreateDirectory>) -> Response {
@@ -310,8 +398,13 @@ async fn mkdir(Json(request): Json<CreateDirectory>) -> Response {
     };
     let target = parent.join(name);
     match tokio::fs::create_dir(&target).await {
-        Ok(()) => write_json(StatusCode::CREATED, json!({"ok": true, "path": target.to_string_lossy()})),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => write_error(StatusCode::CONFLICT, "already_exists", &err.to_string()),
+        Ok(()) => write_json(
+            StatusCode::CREATED,
+            json!({"ok": true, "path": target.to_string_lossy()}),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            write_error(StatusCode::CONFLICT, "already_exists", &err.to_string())
+        }
         Err(err) => write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
     }
 }
@@ -331,10 +424,17 @@ async fn rename(Json(request): Json<RenameRequest>) -> Response {
         return write_error(StatusCode::NOT_FOUND, "not_found", "source does not exist");
     }
     if tokio::fs::symlink_metadata(&target).await.is_ok() {
-        return write_error(StatusCode::CONFLICT, "already_exists", "destination already exists");
+        return write_error(
+            StatusCode::CONFLICT,
+            "already_exists",
+            "destination already exists",
+        );
     }
     match tokio::fs::rename(&source, &target).await {
-        Ok(()) => write_json(StatusCode::OK, json!({"ok": true, "from": source.to_string_lossy(), "to": target.to_string_lossy()})),
+        Ok(()) => write_json(
+            StatusCode::OK,
+            json!({"ok": true, "from": source.to_string_lossy(), "to": target.to_string_lossy()}),
+        ),
         Err(err) => write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
     }
 }
@@ -363,18 +463,25 @@ async fn chmod(Json(request): Json<PermissionsRequest>) -> Response {
         use std::os::unix::fs::PermissionsExt;
         let permissions = std::fs::Permissions::from_mode(request.mode);
         match tokio::fs::set_permissions(&real, permissions).await {
-            Ok(()) => write_json(StatusCode::OK, json!({
-                "ok": true,
-                "path": real.to_string_lossy(),
-                "mode": format!("{:04o}", request.mode)
-            })),
+            Ok(()) => write_json(
+                StatusCode::OK,
+                json!({
+                    "ok": true,
+                    "path": real.to_string_lossy(),
+                    "mode": format!("{:04o}", request.mode)
+                }),
+            ),
             Err(err) => write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
         }
     }
     #[cfg(not(unix))]
     {
         let _ = real;
-        write_error(StatusCode::NOT_IMPLEMENTED, "unsupported", "permission changes require a Unix host")
+        write_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "unsupported",
+            "permission changes require a Unix host",
+        )
     }
 }
 
@@ -386,8 +493,12 @@ async fn remove(Query(query): Query<DeleteQuery>) -> Response {
     let target = parent.join(name);
     let metadata = match tokio::fs::symlink_metadata(&target).await {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return write_error(StatusCode::NOT_FOUND, "not_found", &err.to_string()),
-        Err(err) => return write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return write_error(StatusCode::NOT_FOUND, "not_found", &err.to_string())
+        }
+        Err(err) => {
+            return write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string())
+        }
     };
     let result = if metadata.file_type().is_dir() {
         if !query.recursive {
@@ -399,7 +510,10 @@ async fn remove(Query(query): Query<DeleteQuery>) -> Response {
         tokio::fs::remove_file(&target).await
     };
     match result {
-        Ok(()) => write_json(StatusCode::OK, json!({"ok": true, "path": target.to_string_lossy()})),
+        Ok(()) => write_json(
+            StatusCode::OK,
+            json!({"ok": true, "path": target.to_string_lossy()}),
+        ),
         Err(err) => write_error(StatusCode::FORBIDDEN, "filesystem_error", &err.to_string()),
     }
 }
@@ -429,10 +543,17 @@ mod tests {
     #[tokio::test]
     async fn directory_listing_returns_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(dir.path().join("hello.txt"), b"hello").await.unwrap();
-        let response = list(Query(PathQuery { path: dir.path().display().to_string() })).await;
+        tokio::fs::write(dir.path().join("hello.txt"), b"hello")
+            .await
+            .unwrap();
+        let response = list(Query(PathQuery {
+            path: dir.path().display().to_string(),
+        }))
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["count"], 1);
         assert_eq!(value["entries"][0]["name"], "hello.txt");
@@ -442,10 +563,22 @@ mod tests {
     #[tokio::test]
     async fn upload_is_streamed_and_does_not_overwrite_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let query = UploadQuery { path: dir.path().display().to_string(), name: "data.bin".into(), overwrite: false };
-        let response = upload(Query(query.clone()), HeaderMap::new(), Body::from("payload")).await;
+        let query = UploadQuery {
+            path: dir.path().display().to_string(),
+            name: "data.bin".into(),
+            overwrite: false,
+        };
+        let response = upload(
+            Query(query.clone()),
+            HeaderMap::new(),
+            Body::from("payload"),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(tokio::fs::read(dir.path().join("data.bin")).await.unwrap(), b"payload");
+        assert_eq!(
+            tokio::fs::read(dir.path().join("data.bin")).await.unwrap(),
+            b"payload"
+        );
         let response = upload(Query(query), HeaderMap::new(), Body::from("other")).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }

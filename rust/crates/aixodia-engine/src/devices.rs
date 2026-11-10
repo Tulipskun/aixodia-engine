@@ -42,8 +42,12 @@ const DEVICE_TOOLS: &[&str] = &[
 
 /// Tools sent straight through as the MCP call; the rest are wrapped in the
 /// `act_and_observe` action envelope (matching the old Worker).
-const PASSTHROUGH_TOOLS: &[&str] =
-    &["screenshot", "screen_size", "ui_hierarchy", "act_and_observe"];
+const PASSTHROUGH_TOOLS: &[&str] = &[
+    "screenshot",
+    "screen_size",
+    "ui_hierarchy",
+    "act_and_observe",
+];
 
 pub struct Devices {
     db: DbClient,
@@ -156,9 +160,7 @@ impl Devices {
                             .pointer("/error/message")
                             .and_then(Value::as_str)
                             .map(str::to_string)
-                            .unwrap_or_else(|| {
-                                format!("Device returned HTTP {}", status.as_u16())
-                            });
+                            .unwrap_or_else(|| format!("Device returned HTTP {}", status.as_u16()));
                         let retryable = status.is_server_error() || status.as_u16() == 429;
                         if retryable && attempt == 0 {
                             last = message;
@@ -203,10 +205,8 @@ impl Devices {
         let checked_at = now_iso();
         match self.mcp(name, payload, Duration::from_secs(4)).await {
             Ok(result) => {
-                let online = result
-                    .pointer("/serverInfo/name")
-                    .and_then(Value::as_str)
-                    == Some("Droid-MCP");
+                let online =
+                    result.pointer("/serverInfo/name").and_then(Value::as_str) == Some("Droid-MCP");
                 json!({
                     "online": online,
                     "checkedAt": checked_at,
@@ -273,10 +273,7 @@ async fn list_devices(State(devices): State<Arc<Devices>>) -> Response {
         .into_response()
 }
 
-async fn device_tools(
-    State(devices): State<Arc<Devices>>,
-    Path(id): Path<String>,
-) -> Response {
+async fn device_tools(State(devices): State<Arc<Devices>>, Path(id): Path<String>) -> Response {
     if !valid_device_name(&id) {
         return device_error(
             StatusCode::BAD_REQUEST,
@@ -333,7 +330,10 @@ async fn device_action(
             "Tool is not allowed",
         );
     }
-    let arguments = parsed.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = parsed
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let arguments_obj = match &arguments {
         Value::Object(map) => map.clone(),
         Value::Null => serde_json::Map::new(),
@@ -385,7 +385,10 @@ async fn device_action(
                 .filter_map(|item| item.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+            let is_error = result
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let status = if is_error {
                 StatusCode::BAD_GATEWAY
             } else {

@@ -646,34 +646,36 @@ fn pack_shards(
             .min(8);
         reporter.set(
             Phase::Uploading,
-            format!("packing {whole} file(s) into {} container(s) using {workers} workers", tasks.len()),
+            format!(
+                "packing {whole} file(s) into {} container(s) using {workers} workers",
+                tasks.len()
+            ),
         );
 
         type BuiltShard = (usize, Vec<usize>, String, PathBuf, Result<pack::Built>);
-        let built: Vec<BuiltShard> =
-            std::thread::scope(|scope| -> Result<Vec<_>> {
-                let mut handles = Vec::new();
-                for chunk in tasks.chunks(tasks.len().div_ceil(workers)) {
-                    handles.push(scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|(position, group, members, fingerprint)| {
-                                let temp = scratch.join(format!("{fingerprint}.shard"));
-                                let result = pack::build(members, &cfg.root, &temp);
-                                (*position, group.clone(), fingerprint.clone(), temp, result)
-                            })
-                            .collect::<Vec<_>>()
-                    }));
-                }
-                let mut out = Vec::with_capacity(tasks.len());
-                for handle in handles {
-                    out.extend(handle.join().map_err(|_| Error::Api {
-                        operation: "pack".into(),
-                        message: "a shard worker panicked".into(),
-                    })?);
-                }
-                Ok(out)
-            })?;
+        let built: Vec<BuiltShard> = std::thread::scope(|scope| -> Result<Vec<_>> {
+            let mut handles = Vec::new();
+            for chunk in tasks.chunks(tasks.len().div_ceil(workers)) {
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(position, group, members, fingerprint)| {
+                            let temp = scratch.join(format!("{fingerprint}.shard"));
+                            let result = pack::build(members, &cfg.root, &temp);
+                            (*position, group.clone(), fingerprint.clone(), temp, result)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut out = Vec::with_capacity(tasks.len());
+            for handle in handles {
+                out.extend(handle.join().map_err(|_| Error::Api {
+                    operation: "pack".into(),
+                    message: "a shard worker panicked".into(),
+                })?);
+            }
+            Ok(out)
+        })?;
 
         for (position, group, _fingerprint, temp, built) in built {
             let built = built?;
@@ -866,7 +868,11 @@ pub fn fetch_manifest(hub: &Hub, name: &str) -> Result<Manifest> {
 /// they are, so a restore onto a live tree only ever adds and overwrites. The
 /// run always goes through the whole manifest and reports what it could not
 /// write, so a partial tree is never the surprise ending of a failed call.
-fn restore_target_root(configured_root: &Path, requested_root: &Path, manifest_root: &str) -> PathBuf {
+fn restore_target_root(
+    configured_root: &Path,
+    requested_root: &Path,
+    manifest_root: &str,
+) -> PathBuf {
     if requested_root == configured_root && Path::new(manifest_root).is_absolute() {
         PathBuf::from(manifest_root)
     } else {
@@ -3237,4 +3243,3 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
-

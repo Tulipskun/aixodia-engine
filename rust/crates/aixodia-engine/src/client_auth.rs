@@ -27,8 +27,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 /// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
-const DEFAULT_ALLOWED_ORIGINS: &str =
-    "https://dashboard.aixodia.dpdns.org,http://localhost:5173";
+const DEFAULT_ALLOWED_ORIGINS: &str = "https://dashboard.aixodia.dpdns.org,http://localhost:5173";
 
 /// One issued client token. Opaque, random, in memory: an engine restart simply
 /// invalidates every outstanding session, which is fine for a short-lived one.
@@ -144,7 +143,8 @@ impl ClientAuth {
     fn cors(&self, origin: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::VARY, HeaderValue::from_static("Origin"));
-        if let Some(origin) = origin.filter(|value| self.allowed_origins.iter().any(|o| o == value)) {
+        if let Some(origin) = origin.filter(|value| self.allowed_origins.iter().any(|o| o == value))
+        {
             if let Ok(value) = HeaderValue::from_str(origin) {
                 headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
             }
@@ -221,7 +221,10 @@ pub async fn client_guard(
     let cors = auth.cors(origin.as_deref());
 
     if request.method() == Method::OPTIONS {
-        return with_cors((StatusCode::NO_CONTENT, cors.clone()).into_response(), &cors);
+        return with_cors(
+            (StatusCode::NO_CONTENT, cors.clone()).into_response(),
+            &cors,
+        );
     }
 
     let path = request.uri().path().to_string();

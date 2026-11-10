@@ -605,10 +605,19 @@ mod tests {
             ..Default::default()
         };
         assert!(scoped(&[]).validate_scope().is_ok());
-        assert!(scoped(&[".codex", "projects/aixodia/app", "*.log", "!root/.cache"])
-            .validate_scope()
-            .is_ok());
-        for bad in ["/abs/from/root", "a//b", "./relative", "up/../out", "!/abs/from/root", "!up/../out"] {
+        assert!(
+            scoped(&[".codex", "projects/aixodia/app", "*.log", "!root/.cache"])
+                .validate_scope()
+                .is_ok()
+        );
+        for bad in [
+            "/abs/from/root",
+            "a//b",
+            "./relative",
+            "up/../out",
+            "!/abs/from/root",
+            "!up/../out",
+        ] {
             assert!(
                 scoped(&[bad]).validate_scope().is_err(),
                 "{bad} must be refused"
