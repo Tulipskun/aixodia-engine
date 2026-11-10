@@ -25,6 +25,7 @@ aixodia-terminal = { path = "../aixodia-terminal" }
 aixodia-tools = { path = "../aixodia-tools" }
 anyhow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 libc.workspace = true

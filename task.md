@@ -4,18 +4,22 @@
 > **ขอบเขต:** ทำงานเฉพาะ repo นี้ (`Tulipskun/aixodia-engine`, branch `main`); ห้ามแตะ repo อื่น; ห้าม deploy
 > **จบใน session เดียว:** งานทั้ง 5 ข้อทำเสร็จทีละขั้น (≥4 commits) ไม่มี handoff ไป AI อื่น ไม่มีงานรอ operator
 
-## Status (EN)
-`IN PROGRESS (all work stays in this session) — step 1/4 shipped; steps 2–4 follow, each committed + pushed. No operator input needed.`
-Every push succeeds; at the end `git status --short --branch` is clean and ahead 0.
+## Status & checkpoints
+Status: `IN PROGRESS (all work stays in this session) — steps 1–2/4 shipped; steps 3–4 follow, each committed + pushed. No operator input needed. Every push succeeds; final tree clean & ahead 0.`
 
-## งาน (5 ข้อ, จาก operator)
+| # | สถานะ | สิ่งที่ทำ | Commit |
+| --- | --- | --- | --- |
+| 1 | ✅ | toolchain fix: `rust-toolchain.toml`, `cargo check --workspace` + `cargo test -p aixodia-engine` ผ่านบน 1.99.1; sync MAIN.md/task.md | df71f1e |
+| 2 | ✅ | devices endpoints: `devices.rs` + `DbClient::device_names()` (KV `DEVICE_TUNNELS`), 3 routes รวมเข้า mux ผ่าน `client_guard`; sync MAIN.md/task.md | (this commit) |
+
+## งาน (5 ข้อ จาก operator)
 1. ทำให้ build ผ่านจริง (toolchain 1.99.1, btls-sys, check/test)
 2. ย้าย device/MCP gateway มา engine (`/v1/devices` ฯลฯ)
 3. `POST /v1/auth/token` รับ `master_token` (Android ไม่ต้องมี GitHub PAT)
 4. env fallback จาก Workers KV `AIXODIA_CONFIG` + default ที่ใช้งานได้
 5. Sync `MAIN.md` (<60 บรรทัด ตาม AGENTS.md) + `task.md` ทุก checkpoint → completed
 
-## Endpoints ใหม่ (contract)
+## Endpoints ใหม่ (implemented)
 | Method | Path | หน้าที่ |
 | --- | --- | --- |
 | POST | `/v1/auth/token` | body `{"github_token":...}` หรือ `{"master_token":"<CF_TOKEN>"}` → short-lived opaque token (ไม่ส่ง CF_TOKEN กลับ) |
@@ -23,7 +27,7 @@ Every push succeeds; at the end `git status --short --branch` is clean and ahead
 | GET | `/v1/devices/{id}/tools` | MCP `tools/list` → `{tools:[...]}` |
 | POST | `/v1/devices/{id}/action` | body `{tool, arguments}` → MCP `tools/call` (map เป็น `act_and_observe` เมื่อเหมาะ) → `{ok, device, tool, text, screenshot, at}` |
 
-ทุก route รวมเข้า outer mux ผ่าน `client_guard` (รับ short-lived token หรือ CF_TOKEN). Upstream `https://mcp.aixodia.dpdns.org/{device}` ด้วย reqwest jsonrpc 2.0, timeout ต่อ request + retry 1 ครั้ง, error มี `error`/`code` อ่านรู้เรื่อง (`DEVICE_UNAVAILABLE`, `DEVICE_ACTION_FAILED`, `DEVICE_REGISTRY_UNAVAILABLE`, `INVALID_TOOL`, `INVALID_ARGUMENTS`, `INVALID_REQUEST`).
+ทุก route รวมเข้า outer mux ผ่าน `client_guard` (รับ short-lived token หรือ CF_TOKEN). Upstream `https://mcp.aixodia.dpdns.org/{device}` ด้วย reqwest jsonrpc 2.0, timeout ต่อ request + retry 1 ครั้ง (transport error / 5xx / 429), error มี `error`/`code` อ่านรู้เรื่อง (`DEVICE_UNAVAILABLE`, `DEVICE_ERROR`, `DEVICE_ACTION_FAILED`, `INVALID_TOOL`, `INVALID_ARGUMENTS`, `INVALID_DEVICE`, `INVALID_REQUEST`). ไฟล์ใหม่ `src/devices.rs`; รายชื่อ device ผ่าน `aixodia_db::Client::device_names()` (list keys ของ KV namespace `DEVICE_TUNNELS`) + fallback env `AIXODIA_DEVICE_TUNNELS`.
 
 ## env (engine)
 - `CF_TOKEN` — master token (จำเป็น; ไม่เคยส่งให้ browser)
@@ -31,6 +35,7 @@ Every push succeeds; at the end `git status --short --branch` is clean and ahead
 - `ALLOWED_ORIGINS` — ไม่ตั้ง → KV `client/allowed_origins` → default `https://dashboard.aixodia.dpdns.org,http://localhost:5173`
 - `AIXODIA_CLIENT_TOKEN_TTL` — optional 60–86400 วิ (default 900)
 - `AIXODIA_DEVICE_TUNNELS` — optional comma-separated device names (fallback เมื่อ KV ว่าง)
+- `AIXODIA_MCP_UPSTREAM` — optional base URL (default `https://mcp.aixodia.dpdns.org`)
 
 ## Build verification (ผ่านจริง)
 ```
@@ -42,11 +47,6 @@ LIBCLANG_PATH=/usr/lib/llvm-18/lib BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/g
   cargo +1.99.1 test -p aixodia-engine     # ok: 16 passed; 0 failed
 ```
 `cargo check --workspace` ธรรมดาก็ผ่าน (rust-toolchain.toml + rustup default 1.99.1; clang-sys หา libclang ผ่าน `llvm-config` ได้เอง). MSRV เดิม `wreq 0.16.3`(1.98) / `sysinfo 0.39.6`(1.95) / `btls-sys 0.5.6` build script — แก้ด้วย toolchain 1.99.1 + LLVM-18 libclang/cmake/perl/clang ที่มีอยู่; ไม่ต้อง `cargo update` หรือ `--ignore-rust-version`.
-
-## Checkpoint log
-| # | สถานะ | สิ่งที่ทำ | Commit |
-| --- | --- | --- | --- |
-| 1 | ✅ | toolchain fix: `rust-toolchain.toml`, `cargo check --workspace` + `cargo test -p aixodia-engine` ผ่านบน 1.99.1; sync MAIN.md/task.md | (this commit) |
 
 ## กฎ
 - `git -C /workspace/aixodia-work/aixodia-engine add -A && git -C ... commit -m "engine: ..." && git -C ... push origin main` ทุกขั้น (≥4 commits)

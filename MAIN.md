@@ -2,8 +2,9 @@ GOAL:
 [IN_PROCESS] Migrate the device/MCP gateway, master_token exchange and KV env fallback into the engine; workspace build green on rustc 1.99.1 (v1.177)
 
 PLAN:
-[COMPLETED] toolchain: `rustup toolchain install 1.99.1` + `rustup update stable`; `rust-toolchain.toml` pins 1.99.1; `cargo check --workspace` and `cargo test -p aixodia-engine` pass (clang-sys resolves libclang via llvm-config).
-[IN_PROCESS] 2) /v1/devices, /v1/devices/{id}/tools, /v1/devices/{id}/action via reqwest upstream. 3) master_token + ALLOWED_* KV fallback. 4) MAIN.md/task.md sync to completed. commit+push after EVERY change.
+[COMPLETED] toolchain: `rustup toolchain install 1.99.1` + `rustup update stable`; `rust-toolchain.toml` pins 1.99.1; `cargo check --workspace` and `cargo test -p aixodia-engine` pass.
+[COMPLETED] /v1/devices, /v1/devices/{id}/tools, /v1/devices/{id}/action (reqwest -> mcp.aixodia.dpdns.org/{device}, timeout+retry); device names via `DbClient::device_names()` over KV DEVICE_TUNNELS.
+[IN_PROCESS] 3) master_token + ALLOWED_* KV fallback. 4) MAIN.md/task.md sync to completed. commit+push after EVERY change.
 
 ARCHIVE:
 v1.176 CORS + `POST /v1/auth/token` short-lived client token + `client_guard`; removed stale relay/; both clients talk to the engine directly.

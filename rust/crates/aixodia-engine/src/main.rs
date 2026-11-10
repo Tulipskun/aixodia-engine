@@ -8,6 +8,7 @@
 #[allow(dead_code)]
 mod client_auth;
 mod d1log;
+mod devices;
 mod handover;
 mod tunnel;
 
@@ -200,6 +201,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .merge(terminal.router())
         .merge(aixodia_relay::router(relay_cfg))
         .merge(client_auth.router())
+        .merge(devices::Devices::new(db.clone()).router())
         .route(
             "/ws",
             get(move |request: axum::extract::Request| {

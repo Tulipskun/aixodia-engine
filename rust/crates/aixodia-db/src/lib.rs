@@ -792,6 +792,110 @@ impl KeyValue for MemoryKv {
     }
 }
 
+/// Device-name grammar shared with the dashboard Worker: lowercase alnum with
+/// dashes inside, 1–32 chars, no leading/trailing dash. Keeping the id strict
+/// also stops path/SSRF games before it is interpolated into an upstream URL.
+pub fn valid_device_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+    if len == 0 || len > 32 {
+        return false;
+    }
+    let is_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !is_alnum(bytes[0]) || !is_alnum(bytes[len - 1]) {
+        return false;
+    }
+    bytes.iter().all(|&b| is_alnum(b) || b == b'-')
+}
+
+/// Title of the KV namespace whose keys are the registered device names.
+const DEVICE_KV_NAMESPACE_TITLE: &str = "DEVICE_TUNNELS";
+
+#[derive(Deserialize, Default)]
+struct DeviceKeyRow {
+    #[serde(default)]
+    name: String,
+}
+#[derive(Deserialize, Default)]
+struct DeviceKeyCursor {
+    #[serde(default)]
+    cursor: String,
+}
+#[derive(Deserialize, Default)]
+struct DeviceKeyList {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    errors: Vec<ApiError>,
+    #[serde(default)]
+    result: Vec<DeviceKeyRow>,
+    #[serde(default)]
+    result_info: DeviceKeyCursor,
+}
+
+impl Client {
+    /// Lists the device names registered in the Workers KV `DEVICE_TUNNELS`
+    /// namespace (each key is a device, exactly as the dashboard Worker's
+    /// `env.DEVICE_TUNNELS.list` read it). An absent namespace or an empty
+    /// registry is `Ok(vec![])`, never an error: the caller answers
+    /// `{devices: []}` with a note instead of a 500. Network/API failures are
+    /// returned so the caller can fall back to static config.
+    pub async fn device_names(&self) -> Result<Vec<String>> {
+        let token = self.token();
+        let account_id = self.account_id();
+        if token.is_empty() || account_id.is_empty() {
+            return Err(Error::NotVerified);
+        }
+        let ns_path = format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100");
+        let namespaces: Vec<KvNamespaceResult> = self.get(&ns_path, &token).await?;
+        let Some(namespace) = namespaces
+            .into_iter()
+            .find(|ns| ns.title == DEVICE_KV_NAMESPACE_TITLE)
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut names = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let base = format!(
+                "{API_BASE}/accounts/{account_id}/storage/kv/namespaces/{}/keys",
+                namespace.id
+            );
+            let mut request = self.inner.http.get(&base).query(&[("limit", "1000")]);
+            if let Some(value) = cursor.as_deref() {
+                request = request.query(&[("cursor", value)]);
+            }
+            let response = request.headers(self.auth_headers(&token)).send().await?;
+            let status = response.status().as_u16();
+            let raw = read_limited(response, 8 << 20).await?;
+            if !(200..300).contains(&status) {
+                return Err(kv_error("device KV list", status as i32, &raw));
+            }
+            let page: DeviceKeyList =
+                serde_json::from_slice(&raw).map_err(|e| Error::Decode {
+                    what: "device KV list".into(),
+                    source: e.into(),
+                })?;
+            if !page.success {
+                return Err(api_error_message("device KV list", status as i32, &page.errors));
+            }
+            for row in page.result {
+                if valid_device_name(&row.name) {
+                    names.push(row.name);
+                }
+            }
+            cursor = (!page.result_info.cursor.is_empty()).then_some(page.result_info.cursor);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
