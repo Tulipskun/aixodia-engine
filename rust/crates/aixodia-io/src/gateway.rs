@@ -44,7 +44,7 @@ pub const REQUEST_MAX_BODY: usize = 8 << 20;
 
 /// The release tag, baked in at build time. Bump on every release so a live
 /// service can be identified via `GET /healthz`.
-pub const VERSION: &str = "v1.176";
+pub const VERSION: &str = "v1.177";
 
 /// The rule a client-supplied draft id has to follow, as a readable pattern.
 pub const SESSION_ID_PATTERN: &str = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
@@ -905,9 +905,12 @@ pub(crate) fn first_non_zero_ptr(value: Option<f64>, fallback: Option<f64>) -> O
     value.or(fallback)
 }
 
-/// The bearer-token guard. `/healthz` stays open so the tunnel can be checked.
+/// The GitHub bearer-token guard. `/healthz` stays open so the tunnel can be
+/// checked. A request is authorised when its bearer resolves, through the
+/// GitHub API, to a login on the engine's allowlist; verdicts are cached inside
+/// [`GitHubAuth`](aixodia_auth::GitHubAuth).
 pub async fn require_token(
-    State(token): State<String>,
+    State(auth): State<std::sync::Arc<aixodia_auth::GitHubAuth>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -917,37 +920,33 @@ pub async fn require_token(
     if matches!(request.uri().path(), "/healthz" | "/terminal" | "/room") {
         return next.run(request).await;
     }
-    if !bearer_ok(request.headers(), &token) {
-        return write_error(StatusCode::UNAUTHORIZED, "unauthorized", "token rejected");
+    match bearer(request.headers()) {
+        Some(token) => match auth.verify(token).await {
+            Ok(_) => next.run(request).await,
+            Err(err) => write_error(
+                StatusCode::from_u16(err.status()).unwrap_or(StatusCode::UNAUTHORIZED),
+                "unauthorized",
+                &err.message(),
+            ),
+        },
+        None => write_error(StatusCode::UNAUTHORIZED, "unauthorized", "token rejected"),
     }
-    next.run(request).await
 }
 
-/// The bearer token on a handshake, as `RequireToken` reads it. The scheme is
-/// optional here because `/ws` never required it: the header is compared after
-/// trimming `Bearer `, so a bare token matched before and must keep matching.
-pub fn bearer_ok(headers: &HeaderMap, token: &str) -> bool {
+/// The bearer token on a request, without the optional `Bearer ` scheme. The
+/// scheme stays optional because `/ws` never required it.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
     let auth = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .trim()
-        .trim_start_matches("Bearer ")
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
         .trim();
-    !token.is_empty() && constant_time_eq(auth.as_bytes(), token.as_bytes())
-}
-
-/// A comparison whose running time does not depend on where the first difference
-/// is, like Go's `subtle.ConstantTimeCompare`.
-pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
+    let token = auth.trim_start_matches("Bearer ").trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
     }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
 }
 
 
