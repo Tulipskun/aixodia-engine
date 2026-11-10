@@ -1,13 +1,11 @@
 GOAL:
-[IN_PROCESS] Migrate the device/MCP gateway, master_token exchange and KV env fallback into the engine; workspace build green on rustc 1.99.1 (v1.177)
+[COMPLETED] All 5 engine tasks done; tree clean, ahead 0 (v1.177)
 
 PLAN:
-[COMPLETED] toolchain 1.99.1; `cargo check --workspace` + `cargo test -p aixodia-engine` pass.
-[COMPLETED] /v1/devices, /v1/devices/{id}/tools, /v1/devices/{id}/action (reqwest -> mcp.aixodia.dpdns.org/{device}, timeout+retry); names via `DbClient::device_names()`.
-[COMPLETED] `master_token` exchange in /v1/auth/token + ALLOWED_* env->KV(AIXODIA_CONFIG)->default fallback; GitHub path fail-closed, master path always works.
-[IN_PROCESS] 4) MAIN.md/task.md sync to completed; final verify (check --workspace + test -p aixodia-engine); commit+push.
+(no active plan)
 
 ARCHIVE:
+v1.177 Device/MCP gateway migrated to engine (GET /v1/devices, GET /v1/devices/{id}/tools, POST /v1/devices/{id}/action; reqwest -> mcp.aixodia.dpdns.org/{device}, timeout+retry, names via DbClient::device_names over KV DEVICE_TUNNELS); master_token exchange + ALLOWED_* env->KV(AIXODIA_CONFIG)->default fallback; rust-toolchain.toml pins 1.99.1; cargo check --workspace + test --workspace pass.
 v1.176 CORS + `POST /v1/auth/token` short-lived client token + `client_guard`; removed stale relay/; both clients talk to the engine directly.
 v1.175 Engine runs detached: `aixodia start` daemonizes with setsid, aixodia.pid and a rotated engine.log; no attached mode.
 Launcher daemonizes, shipped at v1.175 with no engine bump: `cmd_start` setsids the engine, the child writes `aixodia.pid` before it execs, output appends to `engine.log` (rotated past `AIXODIA_LOG_MAX_KB`, default 8 MB), then `start` waits on healthz; `stop`/`status`/`logs`/`update` read healthz and fall back to the `/proc`-validated pidfile, `run`/`up` alias `start`, and no code path execs the engine in the caller's shell.
@@ -41,12 +39,14 @@ earlier: gateway port from Go, session store, chat SSE, D1 history, mobile hub, 
 
 NOTE:
 - task.md is the handoff tracker: update + push in the SAME commit as any edit; operator requires zero unpushed work.
-- Build (this sandbox): `cargo check --workspace` / `cargo test -p aixodia-engine` pass on 1.99.1. btls-sys builds against LLVM-18 libclang found via `llvm-config`; optional belt-and-suspenders env: `LIBCLANG_PATH=/usr/lib/llvm-18/lib BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"`.
-- `--ignore-rust-version` no longer needed: wreq 0.16.3 (MSRV 1.98) and sysinfo 0.39.6 (1.95) compile on 1.99.1; deploy box runs 1.99.1 too.
+- Build (final, this sandbox): `rustup toolchain install 1.99.1` + `rustup update stable`; `rust-toolchain.toml` pins 1.99.1. With `LIBCLANG_PATH=/usr/lib/llvm-18/lib BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"`: `cargo +1.99.1 check --workspace` exit 0, `cargo +1.99.1 test -p aixodia-engine` 20 passed, `cargo +1.99.1 test --workspace` exit 0. clang-sys also finds libclang via llvm-config without the env.
+- wreq 0.16.3 (MSRV 1.98) / sysinfo 0.39.6 (1.95) / btls-sys 0.5.6 compile on 1.99.1; no cargo update / --ignore-rust-version needed.
+- New /v1/* routes sit inside client_guard (short-lived token or CF_TOKEN); CF_TOKEN is never sent to browsers. master_token path works even with an empty GitHub allowlist (GitHub path fails closed).
+- ALLOWED_GITHUB_USERS / ALLOWED_ORIGINS: env -> KV AIXODIA_CONFIG client/allowed_users|client/allowed_origins -> default (origins: dashboard + localhost:5173).
+- Device registry: KV namespace DEVICE_TUNNELS (keys = names) via DbClient::device_names; empty -> {devices:[], note}; env AIXODIA_DEVICE_TUNNELS fallback; upstream base AIXODIA_MCP_UPSTREAM.
 - engine binds 127.0.0.1:8787 behind Named Tunnel aixodia.dpdns.org; CF_TOKEN must be exported, never passed as argv.
-- `client_guard` accepts CF_TOKEN or a short-lived token from `POST /v1/auth/token`; CF_TOKEN is never sent to browsers.
 - Cooldown (default 30 min) prevents rapid-fire on CPU threshold bouncing.
 - `latest` tag points to main; phone builds from main branch.
-- Self-update looks a release up by published tag; a draft 404s with no hint, so `engine-latest` must stay published.
-- Deployment: `aixodia start` detaches the engine itself; `start` on a live engine adopts it. instabox box installs to ~/.local/bin (must be on PATH); a second engine republishes `daemon/url` and moves every phone's discovery.
+- Self-update: a draft 404s with no hint, so `engine-latest` must stay published.
+- Deployment: `aixodia start` detaches the engine itself; `start` on a live engine adopts it. instabox box installs to ~/.local/bin (on PATH); a second engine republishes daemon/url and moves phones.
 - Do not deploy (`wrangler deploy`, `aixodia start`) without an explicit order.
