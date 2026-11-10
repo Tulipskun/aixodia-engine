@@ -39,7 +39,7 @@ earlier: gateway port from Go, session store, chat SSE, D1 history, mobile hub, 
 NOTE:
 - task.md is the cross-repo handoff tracker: update it and push in the SAME commit as any edit; operator requires zero unpushed work (another AI may take over mid-task).
 - Pending operator decision (see task.md): which "worker" to remove. Android already bypasses Workers via Named Tunnel (D-011); the live middleman is aixodia-dashboard/worker/.
-- Backup slot is single: auto-backup cannot start during a manual run.
+- cargo check here needs --ignore-rust-version: rustc 1.93 < sysinfo 0.39.6 (1.95) / wreq 0.16.3 (1.98); the deploy box runs 1.99.1.
 - Cooldown (default 30 min) prevents rapid-fire on CPU threshold bouncing.
 - rustc 1.99.1 requires cc >= 1.11; a truncated registry src dir (e.g. tokio missing `runtime/task/core.rs`) is repaired by extracting the members the dir lacks from the intact `.crate` in `registry/cache`, keeping the tarball mtimes so cargo's fingerprints stay valid — no `rm -rf`, no rebuild.
 - `latest` tag points to main; phone builds from main branch.

@@ -98,6 +98,7 @@ dependencies = [
  "axum",
  "futures-util",
  "libc",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
@@ -106,6 +107,8 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]

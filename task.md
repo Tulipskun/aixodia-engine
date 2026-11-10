@@ -68,7 +68,7 @@
 | 2 | ✅ | บันทึกคำตอบ operator (client = ทั้งคู่, auth = engine short-lived token) ลง `task.md` + `MAIN.md` | (this commit) |
 | 3 | ✅ | operator ปฏิเสธการตอบเพิ่ม → ถือ working assumption (dashboard worker + stale relay, เก็บ KV/D1/Tunnel) | (this commit) |
 | 4 | ✅ | engine: CORS + `POST /v1/auth/token` (outstanding: cargo check) + `client_guard` แทน `require_token` ที่ outer mux | (this commit) |
-| 5 | ⏳ | รัน `cargo check -p aixodia-engine` / `cargo test --workspace` ยืนยันโค้ด compile | — |
+| 5 | 🔄 | `cargo check` ครั้งแรก fail เพราะ **MSRV ของ sandbox** (rustc 1.93 < sysinfo 0.39.6 ที่ต้อง 1.95 / wreq 0.16.3 ที่ต้อง 1.98) ไม่ใช่ error ในโค้ด → กำลังรันใหม่ด้วย `--ignore-rust-version`; `Cargo.lock` +3 บรรทัดจาก reqwest/uuid ถูก commit แล้ว | (this commit) |
 | 6 | ⏳ | dashboard: เปลี่ยน SPA เป็น GitHub OAuth PKCE + ยิง engine ตรง แล้วลบ `worker/` | — |
 | 7 | ⏳ | AIxodia: อัปเดต docs ให้สอดคล้อง short-lived token (โค้ดยังใช้ CF_TOKEN ตรงอยู่) | — |
 | 8 | ⏳ | ลบ stale `engine/relay/` + refs | — |
@@ -83,7 +83,7 @@
   - `ALLOWED_ORIGINS=https://dashboard.aixodia.dpdns.org,http://localhost:5173`
   - `AIXODIA_CLIENT_TOKEN_TTL=900` (optional, 60–86400 วินาที)
 - **ข้อจำกัดที่ตั้งใจ**: token อยู่ใน memory → restart engine ทำให้ session หลุด (ยอมรับได้สำหรับ short-lived); engine ยัง bind `127.0.0.1:8787` และเข้าได้ผ่าน Named Tunnel เท่านั้น; `CF_TOKEN` **ไม่เคยถูกส่งให้ browser**
-- **ยังไม่ได้รัน build/test** — ขั้นที่ 5 คือ `cargo check -p aixodia-engine` (cargo 1.93.0 มีอยู่; อาจต้อง `LIBCLANG_PATH` ตาม MAIN.md NOTE)
+- **build status:** ครั้งแรก `cargo check -p aixodia-engine` หยุดที่ MSRV (`rustc 1.93.0 is not supported … sysinfo@0.39.6 requires rustc 1.95, wreq@0.16.3 requires rustc 1.98`) ก่อน compile โค้ดจริง → รันใหม่ด้วย `cargo check --ignore-rust-version` + `LIBCLANG_PATH=/usr/local/lib/python3.13/dist-packages/clang/native` + `BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"`; เครื่อง deploy จริงใช้ rustc 1.99.1 ตาม MAIN.md
 
 ## Next steps สำหรับ AI ที่รับช่วง
 
