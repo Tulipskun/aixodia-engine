@@ -101,3 +101,17 @@ git status --short --branch
 git add -A && git commit -m "task: <step>" && git push origin main
 gh repo view Tulipskun/<repo>
 ```
+
+## Final cross-repo status (synced)
+
+| Repo | ทำไปแล้ว | ค้าง |
+| --- | --- | --- |
+| `aixodia-engine` | CORS + `POST /v1/auth/token` + `client_guard`; ลบ stale `relay/`; `client_auth.rs` ผ่าน standalone cargo check | workspace `cargo test` บนเครื่อง deploy (sandbox rustc 1.93 ต่ำกว่า MSRV) |
+| `AIxodia` | docs note (operator-approved short-lived token), stale migration path แก้แล้ว | Kotlin ยังใช้ `CF_TOKEN` ตรงๆ ยังไม่ migrate |
+| `aixodia-dashboard` | ลบ `worker/`/wrangler/tests; SPA ยิง engine ตรงด้วย short-lived token; `npm test` 6/6 + `npm run build` ผ่าน | device/MCP gateway (`MCP_GATEWAY_NOT_MIGRATED`), OAuth-PKCE vs PAT-paste |
+
+**Blocker ที่ต้องแจ้ง operator:** OAuth token (`gho_…`) ไม่มี scope `workflow` → GitHub ปฏิเสธการสร้าง/แก้ `.github/workflows/*` จึงลบ `deploy.yml` (หยุด CI wrangler deploy) ได้อย่างเดียว; workflow แบบ build-only ถูกเก็บไว้ที่ `docs/deploy-build-only.yml.example` ต้องใช้ token ที่มี `workflow` scope (`gh auth refresh -h github.com -s workflow`) จึงใส่กลับได้
+
+**env ที่ต้องตั้งบนของจริง:** engine `ALLOWED_GITHUB_USERS`, `ALLOWED_ORIGINS`, `AIXODIA_CLIENT_TOKEN_TTL`; dashboard `VITE_ENGINE_URL`
+
+**ทุก change ถูก commit + push แล้ว ไม่มี unpushed work** — AI ตัวถัดไปให้เริ่มจาก `task.md` นี้

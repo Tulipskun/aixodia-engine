@@ -3,7 +3,7 @@ GOAL:
 
 PLAN:
 [COMPLETED] Operator: both clients direct; engine issues short-lived token instead of exposing CF_TOKEN (see task.md).
-[IN_PROCESS] Engine + dashboard direct path shipped; Android docs/optional token wiring next; commit + push after EVERY change.
+[IN_PROCESS] Remaining: Android code migration, device/MCP gateway, deploy env, OAuth-PKCE decision; commit + push after EVERY change.
 
 ARCHIVE:
 v1.175 Engine runs detached: `aixodia start` daemonizes with setsid, aixodia.pid and a rotated engine.log; no attached mode.
