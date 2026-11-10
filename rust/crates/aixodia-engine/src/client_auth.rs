@@ -49,6 +49,8 @@ pub struct ClientAuth {
     allowed_users: Vec<String>,
     allowed_origins: Vec<String>,
     ttl_secs: u64,
+    github_client_id: String,
+    github_client_secret: String,
 }
 
 fn now_unix() -> u64 {
@@ -113,16 +115,30 @@ impl ClientAuth {
             Some(DEFAULT_ALLOWED_ORIGINS),
         )
         .await;
+        let github_client_id = env::var("GITHUB_CLIENT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Ov23lieKSrKCRs5YKwdO".to_string());
+        let github_client_secret = match env::var("GITHUB_CLIENT_SECRET")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(value) => value,
+            None => db.config_kv_get("client/github_client_secret").await.ok().flatten().unwrap_or_default(),
+        };
         if allowed_users.is_empty() {
-            tracing::warn!(
-                "ALLOWED_GITHUB_USERS/KV unset: GitHub-token exchange is disabled; master_token still works"
-            );
+            tracing::warn!("ALLOWED_GITHUB_USERS/KV unset: GitHub authorization-code sign-in is disabled; master_token still works");
+        }
+        if github_client_secret.is_empty() {
+            tracing::warn!("GITHUB_CLIENT_SECRET or AIXODIA_CONFIG/client/github_client_secret is not configured");
         }
         Arc::new(Self {
             cf_token,
             allowed_users,
             allowed_origins,
             ttl_secs,
+            github_client_id,
+            github_client_secret,
         })
     }
 
@@ -130,6 +146,7 @@ impl ClientAuth {
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/v1/auth/token", post(issue_token))
+            .route("/v1/auth/github/exchange", post(exchange_github_code))
             .route("/v1/auth/refresh", post(refresh_token))
             .with_state(self.clone())
     }
@@ -304,7 +321,7 @@ pub async fn client_guard(
     let path = request.uri().path().to_string();
     let open = matches!(
         path.as_str(),
-        "/healthz" | "/terminal" | "/room" | "/v1/auth/token" | "/v1/auth/refresh"
+        "/healthz" | "/terminal" | "/room" | "/v1/auth/token" | "/v1/auth/github/exchange" | "/v1/auth/refresh"
     );
     if !open {
         let presented = bearer(request.headers());
@@ -424,6 +441,75 @@ async fn issue_token(
 }
 
 #[derive(Deserialize)]
+struct GitHubCodeRequest {
+    code: String,
+    code_verifier: String,
+    redirect_uri: String,
+    client_id: String,
+}
+
+/// Exchange a GitHub authorization code on the Engine. The client secret is
+/// read only by the server from env/KV; clients send a PKCE verifier, never a secret.
+async fn exchange_github_code(
+    State(auth): State<Arc<ClientAuth>>,
+    Json(body): Json<GitHubCodeRequest>,
+) -> Response {
+    if body.code.trim().is_empty() || body.code_verifier.trim().is_empty()
+        || body.redirect_uri.trim().is_empty() || body.client_id != auth.github_client_id {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid authorization-code request","code":"INVALID_OAUTH_REQUEST"}))).into_response();
+    }
+    if auth.github_client_secret.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"GitHub OAuth client secret is not configured","code":"OAUTH_NOT_CONFIGURED"}))).into_response();
+    }
+    if auth.allowed_users.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"ALLOWED_GITHUB_USERS is not configured","code":"GITHUB_ALLOWLIST_NOT_CONFIGURED"}))).into_response();
+    }
+    let client = reqwest::Client::new();
+    let token_response = match client.post("https://github.com/login/oauth/access_token")
+        .header(header::ACCEPT, "application/json")
+        .header(header::USER_AGENT, "aixodia-engine")
+        .form(&[
+            ("client_id", auth.github_client_id.as_str()),
+            ("client_secret", auth.github_client_secret.as_str()),
+            ("code", body.code.trim()),
+            ("redirect_uri", body.redirect_uri.trim()),
+            ("code_verifier", body.code_verifier.trim()),
+        ]).send().await {
+        Ok(response) => match response.json::<Value>().await {
+            Ok(value) => value,
+            Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub returned an unreadable token response","code":"GITHUB_BAD_RESPONSE"}))).into_response(),
+        },
+        Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub is unreachable","code":"GITHUB_UNREACHABLE"}))).into_response(),
+    };
+    let github_token = token_response.get("access_token").and_then(Value::as_str).unwrap_or("");
+    if github_token.is_empty() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({
+            "error": token_response.get("error_description").and_then(Value::as_str).unwrap_or("GitHub authorization code was rejected"),
+            "code": "GITHUB_CODE_REJECTED"
+        }))).into_response();
+    }
+    let user_response = match client.get("https://api.github.com/user")
+        .header(header::AUTHORIZATION, format!("Bearer {github_token}"))
+        .header(header::ACCEPT, "application/vnd.github+json")
+        .header(header::USER_AGENT, "aixodia-engine").send().await {
+        Ok(response) => response,
+        Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub is unreachable","code":"GITHUB_UNREACHABLE"}))).into_response(),
+    };
+    if !user_response.status().is_success() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"GitHub token rejected","code":"GITHUB_TOKEN_REJECTED"}))).into_response();
+    }
+    let user = match user_response.json::<Value>().await {
+        Ok(value) => value,
+        Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub returned an unreadable user","code":"GITHUB_BAD_RESPONSE"}))).into_response(),
+    };
+    let login = user.get("login").and_then(Value::as_str).unwrap_or("");
+    if !auth.allowed_users.iter().any(|allowed| allowed == login) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error":"GitHub user is not allowed","code":"GITHUB_USER_NOT_ALLOWED"}))).into_response();
+    }
+    auth.issue_session(login.to_string())
+}
+
+#[derive(Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
 }
@@ -452,6 +538,8 @@ mod tests {
             allowed_users: Vec::new(),
             allowed_origins: parse_csv(DEFAULT_ALLOWED_ORIGINS),
             ttl_secs: 900,
+            github_client_id: "test-client".to_string(),
+            github_client_secret: "test-secret".to_string(),
         }
     }
 
