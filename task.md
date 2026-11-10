@@ -65,3 +65,10 @@ cargo +1.99.1 test --workspace           # exit 0 ทุก crate
 - สรุป: ไม่มี uncommitted work, ไม่มี unpushed commit; ทุก change ถูก push ครบแล้ว
 - **ไม่มีส่วนใด push ไม่ได้** — repo นี้ sync กับ origin/main เรียบร้อย
 
+
+## Deploy fix session (operator: pull all repos, verify, fix deploys, GitHub client login)
+- วันที่: 2026-11-10
+- ตรวจพบ: Release/CI failed 5 ครั้งติดกัน — `cargo-fmt is not installed for toolchain 1.99.1` (dtolnay action ติดตั้ง stable แต่ rust-toolchain.toml pin 1.99.1, rustup auto-install ไม่มี components)
+- แก้: workflows ติดตั้ง toolchain 1.99.1 + components rustfmt; ลบ dead code (TeeWriter, warn) ที่ clippy -D warnings ติด; bump VERSION v1.176→v1.177 (const ลืม bump ทำให้ release ใหม่รายงานเวอร์ชันเก่า)
+- เสร็จสมบูรณ์บน production: release สำเร็จ → selfupdate แทน binary (digest ตรง) → engine restart → KV `client/allowed_users=Tulipskun` มีผล → `POST /v1/auth/token` แลก GitHub token เป็น short-lived token สำเร็จ (ทดสอบด้วย gh auth token จริง; token ไม่ถูกต้องได้ 401 ไม่ใช่ 503)
+- ต่อ: operator ต้องการให้ client ล็อกอินผ่าน GitHub โดยไม่เก็บ CF_TOKEN — Android เพิ่ม GitHubDeviceFlow + ClientToken ส่ง github_token แล้ว (2 commits); เหลือ wiring settings/UI ฝั่ง Android

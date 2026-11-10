@@ -1,10 +1,12 @@
 GOAL:
 [COMPLETED] All 5 engine tasks done; tree clean, ahead 0 (v1.177)
+[COMPLETED] CI/release fixed (pinned 1.99.1 + rustfmt), v1.177 deployed live, GitHub bearer auth verified end-to-end
 
 PLAN:
 (no active plan)
 
 ARCHIVE:
+v1.177 CI green again: dtolnay step installs the pinned 1.99.1 toolchain WITH rustfmt (rustup's silent auto-install ships no components — every release failed on `cargo-fmt is not installed`); unused TeeWriter/warn removed for clippy -D warnings; VERSION const bumped to v1.177; aixodia-auth crate (GitHub bearer verification with cache + outage grace) wired into main.rs relay api; workspace fmt'd. Live: release published, selfupdate replaced the binary (digest match), KV `AIXODIA_CONFIG/client/allowed_users=Tulipskun` read at boot, `POST /v1/auth/token` with a GitHub token returns a short-lived session token (401 for rejected tokens, no more 503).
 v1.177 Device/MCP gateway migrated to engine (GET /v1/devices, GET /v1/devices/{id}/tools, POST /v1/devices/{id}/action; reqwest -> mcp.aixodia.dpdns.org/{device}, timeout+retry, names via DbClient::device_names over KV DEVICE_TUNNELS); master_token exchange + ALLOWED_* env->KV(AIXODIA_CONFIG)->default fallback; rust-toolchain.toml pins 1.99.1; cargo check --workspace + test --workspace pass.
 v1.176 CORS + `POST /v1/auth/token` short-lived client token + `client_guard`; removed stale relay/; both clients talk to the engine directly.
 v1.175 Engine runs detached: `aixodia start` daemonizes with setsid, aixodia.pid and a rotated engine.log; no attached mode.
