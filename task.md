@@ -1,117 +1,53 @@
 # task.md — Handoff tracker
 
-> **กฎเหล็กจาก operator:** ทุกครั้งที่มีการเปลี่ยนแปลงไฟล์ใดๆ (รวมไฟล์นี้) ต้อง `git add` → `commit` → `push` **ทันที**
-> เหตุผล: อาจมี AI ตัวอื่นมารับช่วงต่อหาก session นี้ติดลิมิต — ห้ามมี work ที่ยังไม่ถูก push ค้างอยู่
-> **MAINTAIN:** อัปเดตไฟล์นี้ทุก checkpoint ให้บอกสถานะล่าสุด / สิ่งที่ทำไปแล้ว / ขั้นต่อไป
+> **กฎเหล็กจาก operator:** ทุกครั้งที่แก้ไฟล์ใดๆ (รวมไฟล์นี้) ต้อง `git add` → `commit` → `push` **ทันที** — ไม่มี unpushed work ค้างอยู่
+> **ขอบเขต:** ทำงานเฉพาะ repo นี้ (`Tulipskun/aixodia-engine`, branch `main`); ห้ามแตะ repo อื่น; ห้าม deploy
+> **จบใน session เดียว:** งานทั้ง 5 ข้อทำเสร็จทีละขั้น (≥4 commits) ไม่มี handoff ไป AI อื่น ไม่มีงานรอ operator
 
-## Handoff (EN — read this first)
+## Status (EN)
+`IN PROGRESS (all work stays in this session) — step 1/4 shipped; steps 2–4 follow, each committed + pushed. No operator input needed.`
+Every push succeeds; at the end `git status --short --branch` is clean and ahead 0.
 
-**Status:** `PARTIAL DECISION RECEIVED / WORKING ASSUMPTION PENDING CONFIRMATION / NO CODE CHANGED`
-**Decisions:** both clients direct; engine issues a short-lived token instead of exposing `CF_TOKEN`. Exact worker scope still unconfirmed — see *Operator decisions*.
-**Goal:** Remove the worker middleman so engine and client talk directly.
-**Hard constraint:** commit + push after EVERY change; no unpushed local work, ever.
-**Repos (all `main`, all public, owner `Tulipskun`):**
-`Tulipskun/aixodia-engine`, `Tulipskun/AIxodia`, `Tulipskun/aixodia-dashboard`
-**Local clones:** `/workspace/aixodia-work/<repo-name>`
-**Auth:** `gh auth status` OK as `Tulipskun` (OAuth `gho_…`, scopes repo/read:org/gist); per-repo git identity set to `Tulipskun <Tulipskun@users.noreply.github.com>`.
-**Blocker:** "worker" is ambiguous — see *Decision needed*. Do NOT guess; ask the operator.
-**Repo conventions:** `AGENTS.md` requires updating `MAIN.md` in the SAME turn as any non-read/search tool call. `MAIN.md` must stay under 60 lines.
+## งาน (5 ข้อ, จาก operator)
+1. ทำให้ build ผ่านจริง (toolchain 1.99.1, btls-sys, check/test)
+2. ย้าย device/MCP gateway มา engine (`/v1/devices` ฯลฯ)
+3. `POST /v1/auth/token` รับ `master_token` (Android ไม่ต้องมี GitHub PAT)
+4. env fallback จาก Workers KV `AIXODIA_CONFIG` + default ที่ใช้งานได้
+5. Sync `MAIN.md` (<60 บรรทัด ตาม AGENTS.md) + `task.md` ทุก checkpoint → completed
 
-## เป้าหมาย (จาก operator)
-
-ใน `aixodia-engine`, `AIxodia`, `aixodia-dashboard`: เอา **worker** ออก ให้ **engine กับ client คุยกันโดยตรง** และสร้าง `task.md` ลง repo พร้อม **commit + push ทุกครั้ง** เพื่อให้ AI ตัวอื่นสานต่อได้หากติดลิมิต
-
-## ผลสำรวจ (ภาพรวม 3 repo)
-
-| ความหมายของ "worker" | ที่อยู่ | สถานะในเส้นทางจริง |
+## Endpoints ใหม่ (contract)
+| Method | Path | หน้าที่ |
 | --- | --- | --- |
-| A. Cloudflare Worker + Durable Object (stale) | `aixodia-engine/relay/` | ไม่ได้ deploy แล้ว (`rust/MILESTONES.md:34-36`) |
-| B. Cloudflare Worker ที่เป็นตัวกลางจริง | `aixodia-dashboard/worker/` | **อยู่ในเส้นทาง**: browser → `/api/*` → Worker → engine |
-| C. ผลิตภัณฑ์ Cloudflare ที่ไม่ใช่ Worker script | Workers KV `AIXODIA_CONFIG`, D1 `aixodia`, Named Tunnel | พึ่งพาอยู่ทุกเส้นทาง |
-| D. OS thread / agent label | backup crates, `agent == "worker"` ใน UI | ไม่ใช่ network ไม่ต้องแตะ |
+| POST | `/v1/auth/token` | body `{"github_token":...}` หรือ `{"master_token":"<CF_TOKEN>"}` → short-lived opaque token (ไม่ส่ง CF_TOKEN กลับ) |
+| GET | `/v1/devices` | รายชื่อ device จาก KV `DEVICE_TUNNELS` / config + probe status ผ่าน MCP `initialize`; ว่าง → `{devices: [], note}` ไม่ใช่ 500 |
+| GET | `/v1/devices/{id}/tools` | MCP `tools/list` → `{tools:[...]}` |
+| POST | `/v1/devices/{id}/action` | body `{tool, arguments}` → MCP `tools/call` (map เป็น `act_and_observe` เมื่อเหมาะ) → `{ok, device, tool, text, screenshot, at}` |
 
-**ข้อค้นพบที่ขัดสมมติฐาน:** ฝั่ง Android **ไม่ได้ผ่าน Worker อยู่แล้ว** — `AIxodia/README.md:9` (D-011), `PRODUCT.md:25,46` ยืนยันว่า client ค้น URL จาก Workers KV แล้วยิง `https://aixodia.dpdns.org` (Named Tunnel) ไป engine `127.0.0.1:8787` ตรงๆ
+ทุก route รวมเข้า outer mux ผ่าน `client_guard` (รับ short-lived token หรือ CF_TOKEN). Upstream `https://mcp.aixodia.dpdns.org/{device}` ด้วย reqwest jsonrpc 2.0, timeout ต่อ request + retry 1 ครั้ง, error มี `error`/`code` อ่านรู้เรื่อง (`DEVICE_UNAVAILABLE`, `DEVICE_ACTION_FAILED`, `DEVICE_REGISTRY_UNAVAILABLE`, `INVALID_TOOL`, `INVALID_ARGUMENTS`, `INVALID_REQUEST`).
 
-## Repo-specific findings — aixodia-engine
+## env (engine)
+- `CF_TOKEN` — master token (จำเป็น; ไม่เคยส่งให้ browser)
+- `ALLOWED_GITHUB_USERS` — comma-separated; ไม่ตั้ง → KV `AIXODIA_CONFIG` key `client/allowed_users`; ไม่มีจริง → fail-closed เฉพาะ github path (master_token ยังทำงาน)
+- `ALLOWED_ORIGINS` — ไม่ตั้ง → KV `client/allowed_origins` → default `https://dashboard.aixodia.dpdns.org,http://localhost:5173`
+- `AIXODIA_CLIENT_TOKEN_TTL` — optional 60–86400 วิ (default 900)
+- `AIXODIA_DEVICE_TUNNELS` — optional comma-separated device names (fallback เมื่อ KV ว่าง)
 
-- stack: Rust workspace, `axum 0.7` + `tokio`, WebSocket เขียนเอง (`aixodia-wsock`), `cloudflared` Named Tunnel, เรียก Cloudflare REST (D1 / Workers KV)
-- entry: `rust/crates/aixodia-engine/src/main.rs:43-49`; launcher `aixodia:8` (`LOCAL_URL=http://127.0.0.1:8787`)
-- **server พร้อมอยู่แล้ว**: bind `127.0.0.1:8787` (`main.rs:212-213`), router `gateway.rs:375-453` (`/v1/*`, `/api/*`), WS `/ws`, `/room`, `/terminal`, bearer auth `require_token` (`gateway.rs:908-923`, ข้าม `/healthz`, `/terminal`, `/room`)
-- **สิ่งที่ขาดสำหรับ "คุยตรงกับ browser"**: ไม่มี CORS layer เลย (grep `cors|Access-Control|tower_http|allow_origin` ไม่พบ), bind loopback เท่านั้น, และไม่มีกลไก auth ที่ไม่เปิดเผย `CF_TOKEN` ต่อ browser
-- `relay/` = Worker ทางเลือก stale: `relay/wrangler.toml:1-4`, `relay/src/index.ts`, `relay/src/room.ts`, `relay/README.md`, `relay/test/helpers.mjs:3`; engine ยังมี `rust/crates/aixodia-relay/` ที่เป็น **engine-side `/room`** (คนละอย่างกับ Cloudflare Worker)
-- เอกสาร/CI ที่อ้าง: `README.md:37,50-52,97-108`, `MAIN.md`, `.github/workflows/ci.yml:25-48`
-
-## Decision needed (ห้ามเดา)
-
-| ทางเลือก | ขอบเขต | ผลกระทบ |
-| --- | --- | --- |
-| 1 | ลบเฉพาะ `aixodia-engine/relay/` | ต่ำมาก — เป็น stale code/docs |
-| 2 | ลบ `aixodia-dashboard/worker/` แล้วให้ browser ยิง engine ตรง | สูง — ต้องออกแบบใหม่: SPA hosting, GitHub OAuth/session, CSRF, `CF_TOKEN` ไม่ให้หลุดไป browser, route allowlist, CORS ที่ engine, MCP gateway |
-| 3 | ลบทั้งสอง Worker script | รวม 1+2 |
-| 4 | ตัด Cloudflare ทั้งระบบ (KV + D1 + Tunnel) | รุนแรงสุด — engine start ไม่ติด, discovery/history/providers หาย, ต้อง rewrite |
-
-ยังต้องระบุด้วยว่า **client** หมายถึง Android อย่างเดียว / dashboard อย่างเดียว / ทั้งคู่
-
-## Operator decisions (received)
-
-- **Client เป้าหมาย:** ทั้งคู่ — Android + Dashboard ต้องชี้ไป engine โดยตรง
-- **Auth เมื่อตัด dashboard Worker:** ให้ **engine ออก short-lived token** แทนการเปิดเผย `CF_TOKEN` ต่อ browser (ต้องเพิ่ม endpoint ออก session token ที่จำกัดอายุ/scope ฝั่ง engine)
-- **ยังไม่มีคำตอบชัดเจน:** ขอบเขตว่า "worker" คือ `dashboard/worker/` / `engine/relay/` / ทั้งสอง / ตัด Cloudflare ทั้งระบบ
-  - **Working assumption (รอยืนยัน):** เริ่มที่ `aixodia-dashboard/worker/` (ตัวกลางจริง) + ลบ stale `aixodia-engine/relay/` เป็น cleanup; **ไม่แตะ** Workers KV / D1 / Named Tunnel
-  - ถ้า operator เลือกต่างจากนี้ ให้แก้ assumption นี้ใน 3 repo ก่อน implement ต่อ
+## Build verification (ผ่านจริง)
+```
+rustup toolchain install 1.99.1 && rustup update stable   # stable = 1.99.1 (>=1.98); rust-toolchain.toml pins it
+cd rust
+LIBCLANG_PATH=/usr/lib/llvm-18/lib BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" \
+  cargo +1.99.1 check --workspace        # Finished dev profile, exit 0 (เฉพาะ dead_code warnings เดิมใน d1log.rs)
+LIBCLANG_PATH=/usr/lib/llvm-18/lib BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include" \
+  cargo +1.99.1 test -p aixodia-engine     # ok: 16 passed; 0 failed
+```
+`cargo check --workspace` ธรรมดาก็ผ่าน (rust-toolchain.toml + rustup default 1.99.1; clang-sys หา libclang ผ่าน `llvm-config` ได้เอง). MSRV เดิม `wreq 0.16.3`(1.98) / `sysinfo 0.39.6`(1.95) / `btls-sys 0.5.6` build script — แก้ด้วย toolchain 1.99.1 + LLVM-18 libclang/cmake/perl/clang ที่มีอยู่; ไม่ต้อง `cargo update` หรือ `--ignore-rust-version`.
 
 ## Checkpoint log
-
 | # | สถานะ | สิ่งที่ทำ | Commit |
 | --- | --- | --- | --- |
-| 1 | ✅ | clone 3 repo, สำรวจสถาปัตยกรรม, สร้าง `task.md` (+ `MAIN.md`), push ทั้ง 3 repo | `engine afd4f94` / `AIxodia ad939f9` / `dashboard e9ffba7` |
-| 2 | ✅ | บันทึกคำตอบ operator (client = ทั้งคู่, auth = engine short-lived token) ลง `task.md` + `MAIN.md` | (this commit) |
-| 3 | ✅ | operator ปฏิเสธการตอบเพิ่ม → ถือ working assumption (dashboard worker + stale relay, เก็บ KV/D1/Tunnel) | (this commit) |
-| 4 | ✅ | engine: CORS + `POST /v1/auth/token` (outstanding: cargo check) + `client_guard` แทน `require_token` ที่ outer mux | (this commit) |
-| 5 | ✅ | build: `cargo check -p aixodia-engine` ใน sandbox **ยังไม่ผ่าน** เพราะ deps ของ workspace (`sysinfo 0.39.6` ใช้ unstable `cfg_select` ต้อง rustc ≥1.95; `wreq 0.16.3` ต้อง 1.98; `btls-sys v0.5.6` build script fail) แต่ **โค้ดใหม่ผ่านการตรวจจริง**: copy `client_auth.rs` ไป mini crate ที่มีแค่ axum/reqwest/uuid/tokio/serde → `cargo check` = `Finished` ไม่มี error/warning | `dff576e` |
-| 6 | ⏳ | dashboard: เปลี่ยน SPA เป็น GitHub OAuth PKCE + ยิง engine ตรง แล้วลบ `worker/` | — |
-| 7 | ⏳ | AIxodia: อัปเดต docs ให้สอดคล้อง short-lived token (โค้ดยังใช้ CF_TOKEN ตรงอยู่) | — |
-| 8 | ✅ | ลบ stale `engine/relay/` (Cloudflare Worker + Durable Object) + แก้ comment stale ใน `aixodia-wsock/src/client.rs`; ไม่มี CI/workspace อ้างถึง | (this commit) |
+| 1 | ✅ | toolchain fix: `rust-toolchain.toml`, `cargo check --workspace` + `cargo test -p aixodia-engine` ผ่านบน 1.99.1; sync MAIN.md/task.md | (this commit) |
 
-## Implementation status — engine (checkpoint 4)
-
-- ไฟล์ใหม่ `rust/crates/aixodia-engine/src/client_auth.rs`: `ClientAuth` เก็บ session token แบบ opaque ใน memory (`HashMap` + `RwLock`), ออกผ่าน `POST /v1/auth/token` โดยแลกจาก GitHub OAuth access token (`GET https://api.github.com/user`) แล้วตรวจ allowlist
-- `client_guard` แทน `aixodia_io::require_token` เฉพาะ **outer mux**: ยังรับ `CF_TOKEN` เดิม (Android/CLI/in-process), รับ short-lived token เพิ่ม, ตอบ OPTIONS preflight, เติม CORS headers ทุก response; open paths คงเดิม (`/healthz`, `/terminal`, `/room`) + `/v1/auth/token`
-- `aixodia_relay::router(relay_cfg)` ภายในยังใช้ `require_token` เดิมกับ CF_TOKEN → ไม่กระทบ `/room`
-- **env ใหม่ที่ต้องตั้งบน engine** (fail-closed ถ้าไม่ตั้ง = ไม่มีใครล็อกอินผ่าน browser ได้):
-  - `ALLOWED_GITHUB_USERS=Tulipskun` (comma-separated)
-  - `ALLOWED_ORIGINS=https://dashboard.aixodia.dpdns.org,http://localhost:5173`
-  - `AIXODIA_CLIENT_TOKEN_TTL=900` (optional, 60–86400 วินาที)
-- **ข้อจำกัดที่ตั้งใจ**: token อยู่ใน memory → restart engine ทำให้ session หลุด (ยอมรับได้สำหรับ short-lived); engine ยัง bind `127.0.0.1:8787` และเข้าได้ผ่าน Named Tunnel เท่านั้น; `CF_TOKEN` **ไม่เคยถูกส่งให้ browser**
-- **build status:** ครั้งแรก `cargo check -p aixodia-engine` หยุดที่ MSRV (`rustc 1.93.0 is not supported … sysinfo@0.39.6 requires rustc 1.95, wreq@0.16.3 requires rustc 1.98`) ก่อน compile โค้ดจริง → รันใหม่ด้วย `cargo check --ignore-rust-version` + `LIBCLANG_PATH=/usr/local/lib/python3.13/dist-packages/clang/native` + `BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"`; เครื่อง deploy จริงใช้ rustc 1.99.1 ตาม MAIN.md
-
-## Next steps สำหรับ AI ที่รับช่วง
-
-1. อ่าน `task.md` ใน **ทั้ง 3 repo** (เนื้อหาเหมือนกันต่างกันเฉพาะ findings)
-2. ถาม operator ให้ชัดเรื่อง *Decision needed* ด้านบน ถ้ายังไม่มีคำตอบ
-3. ทำทีละขั้นเล็กๆ: แก้ → update `task.md` (checkpoint) → `git add -A` → `commit` → `git push origin main` **ทุกขั้น**; ใน engine/AIxodia ต้อง update `MAIN.md` พร้อมกันตาม `AGENTS.md`
-4. ตรวจทดสอบตาม repo: `cargo test --workspace` / `./gradlew :app:testDebugUnitTest` (under `unshare -Cm` ถ้าเจอ jmod cgroup warning) / `npm test && npm run build`
-5. อย่า deploy (`wrangler deploy`, `aixodia start`) โดยไม่มีคำสั่งชัดเจน
-
-## Useful commands
-
-```bash
-cd /workspace/aixodia-work/<repo>
-git status --short --branch
-git add -A && git commit -m "task: <step>" && git push origin main
-gh repo view Tulipskun/<repo>
-```
-
-## Final cross-repo status (synced)
-
-| Repo | ทำไปแล้ว | ค้าง |
-| --- | --- | --- |
-| `aixodia-engine` | CORS + `POST /v1/auth/token` + `client_guard`; ลบ stale `relay/`; `client_auth.rs` ผ่าน standalone cargo check | workspace `cargo test` บนเครื่อง deploy (sandbox rustc 1.93 ต่ำกว่า MSRV) |
-| `AIxodia` | docs note (operator-approved short-lived token), stale migration path แก้แล้ว | Kotlin ยังใช้ `CF_TOKEN` ตรงๆ ยังไม่ migrate |
-| `aixodia-dashboard` | ลบ `worker/`/wrangler/tests; SPA ยิง engine ตรงด้วย short-lived token; `npm test` 6/6 + `npm run build` ผ่าน | device/MCP gateway (`MCP_GATEWAY_NOT_MIGRATED`), OAuth-PKCE vs PAT-paste |
-
-**Blocker ที่ต้องแจ้ง operator:** OAuth token (`gho_…`) ไม่มี scope `workflow` → GitHub ปฏิเสธการสร้าง/แก้ `.github/workflows/*` จึงลบ `deploy.yml` (หยุด CI wrangler deploy) ได้อย่างเดียว; workflow แบบ build-only ถูกเก็บไว้ที่ `docs/deploy-build-only.yml.example` ต้องใช้ token ที่มี `workflow` scope (`gh auth refresh -h github.com -s workflow`) จึงใส่กลับได้
-
-**env ที่ต้องตั้งบนของจริง:** engine `ALLOWED_GITHUB_USERS`, `ALLOWED_ORIGINS`, `AIXODIA_CLIENT_TOKEN_TTL`; dashboard `VITE_ENGINE_URL`
-
-**ทุก change ถูก commit + push แล้ว ไม่มี unpushed work** — AI ตัวถัดไปให้เริ่มจาก `task.md` นี้
+## กฎ
+- `git -C /workspace/aixodia-work/aixodia-engine add -A && git -C ... commit -m "engine: ..." && git -C ... push origin main` ทุกขั้น (≥4 commits)
+- ท้ายสุด: tree สะอาด, ahead 0, ไม่มีงานค้าง, ไม่มี deploy

@@ -1,11 +1,12 @@
 GOAL:
-[IN_PROCESS] Remove the worker middleman so engine and client talk directly; track every step in task.md (v1.176)
+[IN_PROCESS] Migrate the device/MCP gateway, master_token exchange and KV env fallback into the engine; workspace build green on rustc 1.99.1 (v1.177)
 
 PLAN:
-[COMPLETED] Operator: both clients direct; engine issues short-lived token instead of exposing CF_TOKEN (see task.md).
-[IN_PROCESS] Remaining: Android code migration, device/MCP gateway, deploy env, OAuth-PKCE decision; commit + push after EVERY change.
+[COMPLETED] toolchain: `rustup toolchain install 1.99.1` + `rustup update stable`; `rust-toolchain.toml` pins 1.99.1; `cargo check --workspace` and `cargo test -p aixodia-engine` pass (clang-sys resolves libclang via llvm-config).
+[IN_PROCESS] 2) /v1/devices, /v1/devices/{id}/tools, /v1/devices/{id}/action via reqwest upstream. 3) master_token + ALLOWED_* KV fallback. 4) MAIN.md/task.md sync to completed. commit+push after EVERY change.
 
 ARCHIVE:
+v1.176 CORS + `POST /v1/auth/token` short-lived client token + `client_guard`; removed stale relay/; both clients talk to the engine directly.
 v1.175 Engine runs detached: `aixodia start` daemonizes with setsid, aixodia.pid and a rotated engine.log; no attached mode.
 Launcher daemonizes, shipped at v1.175 with no engine bump: `cmd_start` setsids the engine, the child writes `aixodia.pid` before it execs, output appends to `engine.log` (rotated past `AIXODIA_LOG_MAX_KB`, default 8 MB), then `start` waits on healthz; `stop`/`status`/`logs`/`update` read healthz and fall back to the `/proc`-validated pidfile, `run`/`up` alias `start`, and no code path execs the engine in the caller's shell.
 v1.175 root-capable file manager API (`/api/files` list/delete/download/upload/mkdir/rename) behind the existing API token.
@@ -37,23 +38,13 @@ v1.148+ provider registry, tool rounds, keyless attempts, idle check, restart en
 earlier: gateway port from Go, session store, chat SSE, D1 history, mobile hub, terminal ws
 
 NOTE:
-- task.md is the cross-repo handoff tracker: update it and push in the SAME commit as any edit; operator requires zero unpushed work (another AI may take over mid-task).
-- Pending operator decision (see task.md): which "worker" to remove. Android already bypasses Workers via Named Tunnel (D-011); the live middleman is aixodia-dashboard/worker/.
-- cargo check here needs --ignore-rust-version: rustc 1.93 < sysinfo 0.39.6 (1.95) / wreq 0.16.3 (1.98); the deploy box runs 1.99.1.
+- task.md is the handoff tracker: update + push in the SAME commit as any edit; operator requires zero unpushed work.
+- Build (this sandbox): `cargo check --workspace` / `cargo test -p aixodia-engine` pass on 1.99.1. btls-sys builds against LLVM-18 libclang found via `llvm-config`; optional belt-and-suspenders env: `LIBCLANG_PATH=/usr/lib/llvm-18/lib BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"`.
+- `--ignore-rust-version` no longer needed: wreq 0.16.3 (MSRV 1.98) and sysinfo 0.39.6 (1.95) compile on 1.99.1; deploy box runs 1.99.1 too.
+- engine binds 127.0.0.1:8787 behind Named Tunnel aixodia.dpdns.org; CF_TOKEN must be exported, never passed as argv.
+- `client_guard` accepts CF_TOKEN or a short-lived token from `POST /v1/auth/token`; CF_TOKEN is never sent to browsers.
 - Cooldown (default 30 min) prevents rapid-fire on CPU threshold bouncing.
-- rustc 1.99.1 requires cc >= 1.11; a truncated registry src dir (e.g. tokio missing `runtime/task/core.rs`) is repaired by extracting the members the dir lacks from the intact `.crate` in `registry/cache`, keeping the tarball mtimes so cargo's fingerprints stay valid — no `rm -rf`, no rebuild.
 - `latest` tag points to main; phone builds from main branch.
-- Building the Android client here: this container makes every HotSpot process print a cgroup warning to stderr, and AGP feeds that blob to `jmod --module-version`, which fails with "Version string does not start with a number". Run gradle under `unshare -Cm` (cgroup namespace) — /proc/self/cgroup then reads `/` and the warning is gone. The SDK lives at /opt/android-sdk (platform 35, build-tools 35, platform-tools); `/data` is not mounted here.
-- Rust builds here with `LIBCLANG_PATH=/usr/local/lib/python3.13/dist-packages/clang/native` and `BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include"` — there is no llvm-18 or clang on this box, and btls-sys' bindgen needs gcc's `stddef.h` to go with the wheel's libclang.
-- Deployment: `aixodia start` detaches the engine itself, so no `setsid`/`nohup` wrapper belongs anywhere. `aixodia update` execs a new engine image in place and never touches the launcher script — a launcher change only lands through `install.sh`. `start` on a live engine adopts it (records the pidfile, no restart), so reinstalling while it runs is safe. `CF_TOKEN` must be exported in the shell, never passed as `env CF_TOKEN=…` argv, because argv is readable in `ps`.
-- The instabox engine box (`ssh -p 2222 ibssh_…@ssh.instabox.sh`, x86_64, 4 cores / 7 GB): `install.sh` lands `aixodia-engine`, `aixodia` and `cloudflared` in `~/.local/bin`, **not** `/usr/local/bin`, so that dir must be on PATH. Both the launcher and the binary refuse to start without `CF_TOKEN`. Starting a second engine for the same account republishes `daemon/url` in `AIXODIA_CONFIG`, which moves every phone's discovery to this box.
-- `aixodia.dpdns.org` is meant to be authoritative at **Cloudflare** with no hardcoded records: `PATCH /domains/{d}/nameservers` sets the registry delegation to `keenan/elsa.ns.cloudflare.com` (GET on that path returns 403, PATCH succeeds) and `POST /dns/switch-external` sets `mode=external` and archives the Hosted DNS zone. The archived zone is still *served* by `dns1/dns2.digitalplat.org` until their nodes purge it, which is why every switch so far left the phone online.
-- The DigitalPlat parent cluster (`ns1..ns4.digitalplat.org`) is anycast with inconsistent nodes — repeated queries to one IP return different data, so a single reading is not state; sample a dozen. Cloudflare's own side is solid: `elsa` 8/8 and `keenan` 8/8 return the flattened A of the proxied `CNAME → <tunnel-uuid>.cfargotunnel.com`.
-- Apex `CNAME` is rejected by DigitalPlat DNS (`apex_cname_not_allowed`), `<tunnel-uuid>.cfargotunnel.com` has no public A, and records cannot be deleted while `mode=external` (`DELETE /dns/records/{id}` → `409 hosted_dns_zone_read_only`). There is **no rollback left**: the archived Hosted DNS zone was destroyed when the Cloudflare zone was deleted and recreated, so if delegation flips back or the zone is lost again the records must be rebuilt by hand from the tunnel uuid.
-- DigitalPlat API base is `https://domain-api.digitalplat.org/api/v1` (`Authorization: Bearer dp_live_…`, writes require `Idempotency-Key`); `dashboard.digitalplat.org` is a different product and sits behind a Cloudflare challenge.
-- Self-update looks a release up by tag, and `GET /repos/{repo}/releases/tags/{tag}` does **not** answer for a draft: a bare 404 with no hint of why. The rolling `engine-latest` must stay published. The workflow creates it published, so only a hand-made draft row breaks it — and one that was orphaned by a squashed history stays unlinked even after the tag is pushed again.
-- `daemon/version` is the phone's only transport for the daemon's clocks: `D1Api` regexes `started=` and `boot=` out of that one column, so a new clock costs no endpoint, no schema change and no protocol version. Anything added must therefore keep parsing for an older client — which is why `started=` stays the first number in the string.
-- `handover.rs` writes `kernel_started: started_at()`, which is not a kernel start. Nothing reads the field, and `tunnel::boot_time()` is the real one; left alone rather than widened into this change.
-- MAIN.md policy: current goal + one active plan, archive past as one-liners, operational notes only if relevant to next session. No prose paragraphs for completed work.
-- Bucket batch API: `POST /api/buckets/{bucket}/batch` with NDJSON `{"type":"deleteFile","path":…}`; 500 ops per request is fine, and deleting a key that is already gone reports success. List with `GET /api/buckets/{bucket}/tree/{prefix}?recursive=true` — leave `/` unencoded, send a User-Agent, follow the `Link: rel="next"` header (it caps at 1000 entries).
-- Restore's remaining cost is container skew, not round trips: one 32 MiB container was 16.1s of a 32s transfer. Grouping by encoded bytes instead of raw is the next win.
+- Self-update looks a release up by published tag; a draft 404s with no hint, so `engine-latest` must stay published.
+- Deployment: `aixodia start` detaches the engine itself; `start` on a live engine adopts it. instabox box installs to ~/.local/bin (must be on PATH); a second engine republishes `daemon/url` and moves every phone's discovery.
+- Do not deploy (`wrangler deploy`, `aixodia start`) without an explicit order.
