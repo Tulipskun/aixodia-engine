@@ -1,18 +1,21 @@
 //! Direct client access: CORS and short-lived session tokens.
 //!
-//! The dashboard used to sit behind a Cloudflare Worker that injected `CF_TOKEN`
-//! server-side, kept the GitHub OAuth session and proxied `/api/engine/*`.
-//! With the Worker removed the browser talks to the engine itself, so the engine
-//! issues its own short-lived opaque token instead of ever handing `CF_TOKEN`
-//! to a browser. A GitHub OAuth access token is exchanged for it once, checked
-//! against `ALLOWED_GITHUB_USERS`, and the resulting token expires in
-//! `AIXODIA_CLIENT_TOKEN_TTL` seconds (default 900).
+//! The dashboard used to sit behind a Cloudflare Worker that injected
+//! `CF_TOKEN` server-side, kept the GitHub OAuth session and proxied
+//! `/api/engine/*`. With the Worker removed the browser talks to the engine
+//! itself, so the engine issues its own short-lived opaque token instead of
+//! ever handing `CF_TOKEN` to a browser. A GitHub OAuth access token OR the
+//! `CF_TOKEN` itself (`master_token`, for clients with no GitHub PAT) is
+//! exchanged for it once; the result expires in `AIXODIA_CLIENT_TOKEN_TTL`
+//! seconds (default 900). `ALLOWED_GITHUB_USERS` / `ALLOWED_ORIGINS` come from
+//! env, else Workers KV `AIXODIA_CONFIG` (`client/*`), else a usable default.
 
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aixodia_db::Client as DbClient;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -22,6 +25,10 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
+
+/// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
+const DEFAULT_ALLOWED_ORIGINS: &str =
+    "https://dashboard.aixodia.dpdns.org,http://localhost:5173";
 
 /// One issued client token. Opaque, random, in memory: an engine restart simply
 /// invalidates every outstanding session, which is fine for a short-lived one.
@@ -45,29 +52,70 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-fn csv(name: &str) -> Vec<String> {
-    env::var(name)
-        .unwrap_or_default()
+fn parse_csv(value: &str) -> Vec<String> {
+    value
         .split(',')
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect()
 }
 
+/// Env first; when unset/empty, Workers KV `AIXODIA_CONFIG`; then an optional
+/// hard default. `ALLOWED_GITHUB_USERS` has no default (empty => the GitHub
+/// path fails closed), while `ALLOWED_ORIGINS` always ends up usable.
+async fn resolve_allowed(
+    env_name: &str,
+    kv_key: &str,
+    db: &DbClient,
+    default: Option<&str>,
+) -> Vec<String> {
+    if let Ok(value) = env::var(env_name) {
+        let parsed = parse_csv(&value);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    match db.config_kv_get(kv_key).await {
+        Ok(Some(value)) => {
+            let parsed = parse_csv(&value);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!("config KV {kv_key}: {err}"),
+    }
+    default.map(parse_csv).unwrap_or_default()
+}
+
 impl ClientAuth {
-    /// `ALLOWED_GITHUB_USERS` and `ALLOWED_ORIGINS` are required: an empty list
-    /// means "nobody may log in" / "no browser origin is trusted", never "allow
-    /// all". Failing closed is the point of removing the Worker's allowlist.
-    pub fn from_env(cf_token: String) -> Arc<Self> {
+    /// `ALLOWED_GITHUB_USERS` / `ALLOWED_ORIGINS` resolve env -> Workers KV
+    /// `AIXODIA_CONFIG` -> default. The GitHub allowlist may be empty (fails
+    /// closed on that path only); `master_token` never needs it.
+    pub async fn from_env(cf_token: String, db: &DbClient) -> Arc<Self> {
         let ttl_secs = env::var("AIXODIA_CLIENT_TOKEN_TTL")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value >= 60 && *value <= 86_400)
             .unwrap_or(900);
+        let allowed_users =
+            resolve_allowed("ALLOWED_GITHUB_USERS", "client/allowed_users", db, None).await;
+        let allowed_origins = resolve_allowed(
+            "ALLOWED_ORIGINS",
+            "client/allowed_origins",
+            db,
+            Some(DEFAULT_ALLOWED_ORIGINS),
+        )
+        .await;
+        if allowed_users.is_empty() {
+            tracing::warn!(
+                "ALLOWED_GITHUB_USERS/KV unset: GitHub-token exchange is disabled; master_token still works"
+            );
+        }
         Arc::new(Self {
             cf_token,
-            allowed_users: csv("ALLOWED_GITHUB_USERS"),
-            allowed_origins: csv("ALLOWED_ORIGINS"),
+            allowed_users,
+            allowed_origins,
             ttl_secs,
             sessions: RwLock::new(HashMap::new()),
         })
@@ -78,6 +126,10 @@ impl ClientAuth {
         Router::new()
             .route("/v1/auth/token", post(issue_token))
             .with_state(self.clone())
+    }
+
+    fn master_matches(&self, presented: &str) -> bool {
+        !self.cf_token.is_empty() && !presented.is_empty() && presented == self.cf_token
     }
 
     async fn valid(&self, token: &str) -> Option<String> {
@@ -110,6 +162,28 @@ impl ClientAuth {
             );
         }
         headers
+    }
+
+    async fn issue_session(&self, sub: String) -> Response {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let expires_at = now_unix() + self.ttl_secs;
+        self.sessions.write().await.insert(
+            token.clone(),
+            Session {
+                sub: sub.clone(),
+                exp: expires_at,
+            },
+        );
+        (
+            StatusCode::OK,
+            Json(json!({
+                "token": token,
+                "expires_at": expires_at,
+                "user": sub,
+                "scope": "client",
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -157,7 +231,7 @@ pub async fn client_guard(
     );
     if !open {
         let presented = bearer(request.headers());
-        let by_master = !auth.cf_token.is_empty() && presented == auth.cf_token;
+        let by_master = auth.master_matches(presented);
         let by_session = auth.valid(presented).await.is_some();
         if !by_master && !by_session {
             return with_cors(
@@ -177,34 +251,64 @@ pub async fn client_guard(
 
 #[derive(Deserialize)]
 struct TokenRequest {
-    github_token: String,
+    #[serde(default)]
+    github_token: Option<String>,
+    #[serde(default)]
+    master_token: Option<String>,
 }
 
-/// Exchange a GitHub OAuth access token for a short-lived engine token.
-/// The engine never sees a client secret and never stores the GitHub token.
+/// Exchange a GitHub OAuth access token OR the master `CF_TOKEN` for a
+/// short-lived engine token. `CF_TOKEN` is never returned to the client.
 async fn issue_token(
     State(auth): State<Arc<ClientAuth>>,
     Json(body): Json<TokenRequest>,
 ) -> Response {
-    if auth.allowed_users.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "ALLOWED_GITHUB_USERS is not configured"})),
-        )
-            .into_response();
-    }
-    if body.github_token.trim().is_empty() {
+    let master = body
+        .master_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let github = body
+        .github_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if master.is_none() && github.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "github_token is required"})),
+            Json(json!({"error": "github_token or master_token is required"})),
         )
             .into_response();
     }
 
+    // master_token: for an Android/CLI client that holds CF_TOKEN but has no
+    // GitHub PAT. Works even when the GitHub allowlist is empty (fail-closed
+    // applies to the GitHub path only).
+    if let Some(master) = master {
+        if auth.master_matches(master) {
+            return auth.issue_session("master".to_string()).await;
+        }
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "master_token rejected", "code": "MASTER_TOKEN_REJECTED"})),
+        )
+            .into_response();
+    }
+
+    if auth.allowed_users.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "ALLOWED_GITHUB_USERS is not configured (env or AIXODIA_CONFIG/client/allowed_users)"})),
+        )
+            .into_response();
+    }
+    let github_token = github.unwrap_or_default();
+
     let client = reqwest::Client::new();
     let response = client
         .get("https://api.github.com/user")
-        .header(header::AUTHORIZATION, format!("Bearer {}", body.github_token.trim()))
+        .header(header::AUTHORIZATION, format!("Bearer {}", github_token))
         .header(header::ACCEPT, "application/vnd.github+json")
         .header(header::USER_AGENT, "aixodia-engine")
         .send()
@@ -239,23 +343,50 @@ async fn issue_token(
             .into_response();
     }
 
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    let expires_at = now_unix() + auth.ttl_secs;
-    auth.sessions.write().await.insert(
-        token.clone(),
-        Session {
-            sub: login.to_string(),
-            exp: expires_at,
-        },
-    );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "token": token,
-            "expires_at": expires_at,
-            "user": login,
-            "scope": "client",
-        })),
-    )
-        .into_response()
+    auth.issue_session(login.to_string()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_auth(cf_token: &str) -> ClientAuth {
+        ClientAuth {
+            cf_token: cf_token.to_string(),
+            allowed_users: Vec::new(),
+            allowed_origins: parse_csv(DEFAULT_ALLOWED_ORIGINS),
+            ttl_secs: 900,
+            sessions: RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn master_token_matches_only_the_real_cf_token() {
+        let auth = test_auth("secret");
+        assert!(auth.master_matches("secret"));
+        assert!(!auth.master_matches("wrong"));
+        assert!(!auth.master_matches(""));
+    }
+
+    #[test]
+    fn master_token_path_needs_no_github_allowlist() {
+        let auth = test_auth("secret");
+        assert!(auth.allowed_users.is_empty());
+        assert!(auth.master_matches("secret"));
+    }
+
+    #[test]
+    fn allowed_origins_default_is_usable() {
+        let auth = test_auth("secret");
+        assert_eq!(auth.allowed_origins.len(), 2);
+        assert!(auth
+            .allowed_origins
+            .iter()
+            .any(|o| o == "http://localhost:5173"));
+    }
+
+    #[test]
+    fn parse_csv_trims_and_drops_empty() {
+        assert_eq!(parse_csv(" a, ,b ,c"), vec!["a", "b", "c"]);
+    }
 }

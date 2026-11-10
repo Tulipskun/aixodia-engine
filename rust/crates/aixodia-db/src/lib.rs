@@ -914,4 +914,16 @@ mod tests {
             serde_json::from_value(envelope.result).expect("query results");
         assert_eq!(results.first().expect("statement").rows.len(), 2);
     }
+
+    #[test]
+    fn valid_device_name_follows_the_worker_grammar() {
+        assert!(valid_device_name("redroid14-x86-64-c64742"));
+        assert!(valid_device_name("a"));
+        assert!(!valid_device_name(""));
+        assert!(!valid_device_name("-leading"));
+        assert!(!valid_device_name("trailing-"));
+        assert!(!valid_device_name("Upper"));
+        assert!(!valid_device_name("a/b"));
+        assert!(!valid_device_name(&"x".repeat(33)));
+    }
 }

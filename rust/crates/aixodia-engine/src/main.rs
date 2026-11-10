@@ -95,10 +95,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     if token.is_empty() {
         anyhow::bail!("CF_TOKEN is not set");
     }
-    // Browser clients no longer go through the dashboard Worker: the engine
-    // issues its own short-lived token and answers CORS preflights itself.
-    let client_auth = client_auth::ClientAuth::from_env(token.clone());
-
     let db = DbClient::new();
     if !db.verify(&token).await {
         anyhow::bail!("CF_TOKEN is invalid");
@@ -107,6 +103,11 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         tracing::warn!("provider kv: {err}");
     }
     db.verify_config_kv().await?;
+
+    // Browser clients no longer go through the dashboard Worker: the engine
+    // issues its own short-lived token and answers CORS preflights itself.
+    // ALLOWED_* fall back to Workers KV AIXODIA_CONFIG, so verify the db first.
+    let client_auth = client_auth::ClientAuth::from_env(token.clone(), &db).await;
     let tunnel_token = db
         .config_kv_get("tunnel_token")
         .await?

@@ -5,12 +5,13 @@
 > **จบใน session เดียว:** งานทั้ง 5 ข้อทำเสร็จทีละขั้น (≥4 commits) ไม่มี handoff ไป AI อื่น ไม่มีงานรอ operator
 
 ## Status & checkpoints
-Status: `IN PROGRESS (all work stays in this session) — steps 1–2/4 shipped; steps 3–4 follow, each committed + pushed. No operator input needed. Every push succeeds; final tree clean & ahead 0.`
+Status: `IN PROGRESS (all work stays in this session) — steps 1–3/4 shipped; step 4 (final docs + verify) follows, committed + pushed. No operator input needed. Every push succeeds; final tree clean & ahead 0.`
 
 | # | สถานะ | สิ่งที่ทำ | Commit |
 | --- | --- | --- | --- |
 | 1 | ✅ | toolchain fix: `rust-toolchain.toml`, `cargo check --workspace` + `cargo test -p aixodia-engine` ผ่านบน 1.99.1; sync MAIN.md/task.md | df71f1e |
-| 2 | ✅ | devices endpoints: `devices.rs` + `DbClient::device_names()` (KV `DEVICE_TUNNELS`), 3 routes รวมเข้า mux ผ่าน `client_guard`; sync MAIN.md/task.md | (this commit) |
+| 2 | ✅ | devices endpoints: `devices.rs` + `DbClient::device_names()` (KV `DEVICE_TUNNELS`), 3 routes รวมเข้า mux ผ่าน `client_guard`; sync MAIN.md/task.md | 9c34413 |
+| 3 | ✅ | `master_token` ใน `/v1/auth/token` + env→KV(`AIXODIA_CONFIG`)→default fallback; GitHub fail-closed, master ยังทำงาน; unit tests; sync MAIN.md/task.md | (this commit) |
 
 ## งาน (5 ข้อ จาก operator)
 1. ทำให้ build ผ่านจริง (toolchain 1.99.1, btls-sys, check/test)
