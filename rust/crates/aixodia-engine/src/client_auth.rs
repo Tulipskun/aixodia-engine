@@ -30,6 +30,7 @@ use sha2::Sha256;
 
 /// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
 const DEFAULT_ALLOWED_ORIGINS: &str = "https://dashboard.aixodia.dpdns.org,http://localhost:5173";
+const DEFAULT_GITHUB_REDIRECT_URI: &str = "https://dashboard.aixodia.dpdns.org/";
 
 /// Refresh credentials are deliberately stateless: they survive Engine restarts
 /// without creating realtime KV/D1 session rows. The refresh token is stored by
@@ -51,6 +52,7 @@ pub struct ClientAuth {
     ttl_secs: u64,
     github_client_id: String,
     github_client_secret: String,
+    github_redirect_uri: String,
 }
 
 fn now_unix() -> u64 {
@@ -119,6 +121,10 @@ impl ClientAuth {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "Ov23lieKSrKCRs5YKwdO".to_string());
+        let github_redirect_uri = env::var("GITHUB_REDIRECT_URI")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_GITHUB_REDIRECT_URI.to_string());
         let github_client_secret = match env::var("GITHUB_CLIENT_SECRET")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -139,6 +145,7 @@ impl ClientAuth {
             ttl_secs,
             github_client_id,
             github_client_secret,
+            github_redirect_uri,
         })
     }
 
@@ -455,7 +462,7 @@ async fn exchange_github_code(
     Json(body): Json<GitHubCodeRequest>,
 ) -> Response {
     if body.code.trim().is_empty() || body.code_verifier.trim().is_empty()
-        || body.redirect_uri.trim().is_empty() || body.client_id != auth.github_client_id {
+        || body.redirect_uri != auth.github_redirect_uri || body.client_id != auth.github_client_id {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid authorization-code request","code":"INVALID_OAUTH_REQUEST"}))).into_response();
     }
     if auth.github_client_secret.is_empty() {
@@ -472,7 +479,7 @@ async fn exchange_github_code(
             ("client_id", auth.github_client_id.as_str()),
             ("client_secret", auth.github_client_secret.as_str()),
             ("code", body.code.trim()),
-            ("redirect_uri", body.redirect_uri.trim()),
+            ("redirect_uri", auth.github_redirect_uri.as_str()),
             ("code_verifier", body.code_verifier.trim()),
         ]).send().await {
         Ok(response) => match response.json::<Value>().await {
@@ -540,6 +547,7 @@ mod tests {
             ttl_secs: 900,
             github_client_id: "test-client".to_string(),
             github_client_secret: "test-secret".to_string(),
+            github_redirect_uri: DEFAULT_GITHUB_REDIRECT_URI.to_string(),
         }
     }
 
