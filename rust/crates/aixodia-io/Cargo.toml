@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aixodia-auth = { path = "../aixodia-auth" }
 aixodia-backup = { path = "../aixodia-backup" }
 aixodia-config = { path = "../aixodia-config" }
 aixodia-db = { path = "../aixodia-db" }

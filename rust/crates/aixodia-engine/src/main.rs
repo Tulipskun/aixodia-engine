@@ -99,6 +99,12 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     if !db.verify(&token).await {
         anyhow::bail!("CF_TOKEN is invalid");
     }
+    // GitHub bearer verification for the relay API surface. The allowlist comes
+    // from ALLOWED_GITHUB_USERS; unset or empty fails closed — every bearer is
+    // rejected and the static-token comparison is gone.
+    let github_auth = std::sync::Arc::new(aixodia_io::GitHubAuth::new(
+        &std::env::var("ALLOWED_GITHUB_USERS").unwrap_or_default(),
+    ));
     if let Err(err) = db.verify_kv().await {
         tracing::warn!("provider kv: {err}");
     }
@@ -187,7 +193,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         hub: hub.clone(),
         chat: chat.clone(),
         api: rpc.layer(middleware::from_fn_with_state(
-            token.clone(),
+            github_auth.clone(),
             aixodia_io::require_token,
         )),
         term: terminal.clone(),
@@ -245,7 +251,10 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
                         return;
                     }
                 }
-                if let Err(err) = db.config_kv_put_if_changed("daemon/version", &version).await {
+                if let Err(err) = db
+                    .config_kv_put_if_changed("daemon/version", &version)
+                    .await
+                {
                     tracing::warn!("publish daemon version: {err}");
                     return;
                 }

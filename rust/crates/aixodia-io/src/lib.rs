@@ -35,3 +35,5 @@ pub use gateway::{
     SESSION_ID_PATTERN, VERSION,
 };
 pub use upload::max_upload;
+
+pub use aixodia_auth::{AuthError, GitHubAuth};

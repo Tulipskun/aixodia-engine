@@ -2249,23 +2249,24 @@ async fn session_turns_honour_before_and_limit() {
     );
 }
 
-/// A request without the right bearer token is turned away; the right one gets
-/// through. The comparison is constant-time, so this only pins the behaviour.
+/// A request without a bearer that verifies against the GitHub allowlist is
+/// turned away. The allowlist here is empty, so every bearer is rejected while
+/// `/healthz` stays open — the static-token behaviour is gone.
 #[tokio::test]
-async fn the_token_guard_compares_the_whole_token() {
+async fn the_token_guard_rejects_bearers_that_do_not_verify() {
     let guarded = Router::new()
         .fallback(|| async { StatusCode::NO_CONTENT })
         .layer(axum::middleware::from_fn_with_state(
-            "secret".to_string(),
+            std::sync::Arc::new(aixodia_auth::GitHubAuth::new("")),
             crate::gateway::require_token,
         ));
 
-    for (header_value, want) in [
-        ("Bearer secret", StatusCode::NO_CONTENT),
-        ("Bearer secre", StatusCode::UNAUTHORIZED),
-        ("Bearer secrets", StatusCode::UNAUTHORIZED),
-        ("Bearer ", StatusCode::UNAUTHORIZED),
-        ("", StatusCode::UNAUTHORIZED),
+    for header_value in [
+        "Bearer secret",
+        "Bearer secre",
+        "Bearer secrets",
+        "Bearer ",
+        "",
     ] {
         let mut request = Request::builder()
             .method(Method::GET)
@@ -2280,8 +2281,8 @@ async fn the_token_guard_compares_the_whole_token() {
         let response = guarded.clone().oneshot(request).await.expect("router");
         assert_eq!(
             response.status(),
-            want,
-            "Authorization {header_value:?} should be {want}"
+            StatusCode::UNAUTHORIZED,
+            "Authorization {header_value:?} should be UNAUTHORIZED"
         );
     }
 

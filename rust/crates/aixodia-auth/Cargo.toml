@@ -1,0 +1,13 @@
+[package]
+name = "aixodia-auth"
+description = "GitHub bearer-token verification with a per-token cache and allowlist"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["full"] }
