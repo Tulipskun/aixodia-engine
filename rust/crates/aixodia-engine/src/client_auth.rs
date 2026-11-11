@@ -1,75 +1,120 @@
-//! Direct client access: CORS, short-lived access tokens, and persistent refresh credentials.
+//! Cloudflare Access guard for the engine's HTTP and WebSocket surface.
 //!
-//! The dashboard used to sit behind a Cloudflare Worker that injected
-//! `CF_TOKEN` server-side, kept the GitHub OAuth session and proxied
-//! `/api/engine/*`. With the Worker removed the browser talks to the engine
-//! itself, so the engine issues its own short-lived opaque token instead of
-//! ever handing `CF_TOKEN` to a browser. A GitHub OAuth access token OR the
-//! `CF_TOKEN` itself (`master_token`, for clients with no GitHub PAT) is
-//! exchanged for a short-lived access token plus a long-lived refresh token.
-//! Both are HMAC-signed with the server-only `CF_TOKEN`, so Engine restarts do
-//! not invalidate a user's refresh credential. `ALLOWED_GITHUB_USERS` / `ALLOWED_ORIGINS` come from
-//! env, else Workers KV `AIXODIA_CONFIG` (`client/*`), else a usable default.
+//! Sign-in moved out of the engine. Cloudflare Access sits in front of the
+//! engine's hostname, runs the GitHub / one-time-PIN login, and stamps every
+//! request it forwards with a `Cf-Access-Jwt-Assertion` header. The engine's
+//! only remaining job is to verify that JWT locally: it fetches the team's
+//! public keys from `https://<team>/cdn-cgi/access/certs`, checks the signature,
+//! `aud`, `exp` and issuer, and lets the request through.
+//!
+//! Why this replaced the old scheme: the engine used to run the GitHub code
+//! exchange itself, which made it a single point of failure for sign-in — if
+//! the engine was down, nobody could log in even though GitHub had already
+//! authorised them. Nothing here calls GitHub, and nothing here needs the
+//! engine to be reachable to *obtain* a session.
+//!
+//! `CF_TOKEN` (the master token) is still honoured: the local CLI and the
+//! in-process tools have no Access cookie to present, and the engine also uses
+//! it as a bearer over loopback.
 
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use aixodia_db::Client as DbClient;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::get;
 use axum::{Json, Router};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sha2::Sha256;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use serde::Deserialize;
+use serde_json::json;
 
 /// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
 const DEFAULT_ALLOWED_ORIGINS: &str = "https://dashboard.aixodia.dpdns.org,http://localhost:5173";
-/// Redirect URIs registered on the AIxodia Dashboard OAuth App (4000886).
-/// GitHub only accepts these exact values, so the Engine accepts the same set.
-const DEFAULT_GITHUB_REDIRECT_URIS: &[&str] = &[
-    "aixodia://oauth/callback",
-    "https://dashboard.aixodia.dpdns.org/sso/github/callback",
-];
 
-/// Refresh credentials are deliberately stateless: they survive Engine restarts
-/// without creating realtime KV/D1 session rows. The refresh token is stored by
-/// clients only under their platform's secure credential store.
-const REFRESH_TOKEN_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+/// The header Cloudflare Access adds to every request it authorises.
+const ACCESS_JWT_HEADER: &str = "cf-access-jwt-assertion";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TokenClaims {
-    sub: String,
+/// How long a fetched key set is trusted before it is fetched again. Access
+/// rotates keys rarely; ten minutes keeps rotation latency small without
+/// hammering the certs endpoint.
+const JWKS_TTL: Duration = Duration::from_secs(600);
+
+/// Grace period served from cache when the certs endpoint cannot be reached,
+/// so a Cloudflare blip does not lock the operator out of their own engine.
+const JWKS_OUTAGE_GRACE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Access signs with RSA and publishes `kid`s, so keys are cached per `kid`.
+#[derive(Debug, Clone, Deserialize)]
+struct AccessClaims {
+    aud: Vec<String>,
+    iss: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    sub: Option<String>,
     exp: u64,
-    kind: String,
-    scope: String,
 }
 
+/// One published signing key, as returned by `/cdn-cgi/access/certs`.
+#[derive(Debug, Clone, Deserialize)]
+struct Jwk {
+    kid: String,
+    #[serde(default)]
+    n: String,
+    #[serde(default)]
+    e: String,
+    #[serde(default)]
+    alg: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwksDocument {
+    keys: Vec<Jwk>,
+}
+
+/// Everything the guard needs, resolved once at startup.
 pub struct ClientAuth {
+    /// The Access team domain, e.g. `purple-queen-b699.cloudflareaccess.com`.
+    team_domain: String,
+    /// The Access application audience tag (`aud`) for this hostname.
+    app_aud: String,
+    /// Master token; still accepted as `Authorization: Bearer`.
     cf_token: String,
-    allowed_users: Vec<String>,
     allowed_origins: Vec<String>,
-    ttl_secs: u64,
-    github_client_id: String,
-    github_client_secret: String,
-    /// Every redirect URI registered on the GitHub OAuth App. The Engine
-    /// accepts the one the client actually used and forwards it verbatim, so
-    /// Android (custom scheme) and the dashboard (HTTPS callback) can share
-    /// one OAuth App and one client secret.
-    github_redirect_uris: Vec<String>,
     db: DbClient,
+    cache: tokio::sync::Mutex<KeyCache>,
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+struct KeyCache {
+    keys: HashMap<String, DecodingKey>,
+    fetched_at: Option<Instant>,
+    last_success: Option<Instant>,
+}
+
+impl KeyCache {
+    fn new() -> Self {
+        Self {
+            keys: HashMap::new(),
+            fetched_at: None,
+            last_success: None,
+        }
+    }
+
+    fn fresh(&self) -> bool {
+        self.fetched_at
+            .is_some_and(|at| at.elapsed() < JWKS_TTL && !self.keys.is_empty())
+    }
+
+    fn usable_after_outage(&self) -> bool {
+        self.last_success
+            .is_some_and(|at| at.elapsed() < JWKS_OUTAGE_GRACE)
+            && !self.keys.is_empty()
+    }
 }
 
 fn parse_csv(value: &str) -> Vec<String> {
@@ -80,19 +125,6 @@ fn parse_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn configured_github_secret(cached: &str, kv_value: Option<String>) -> Option<String> {
-    let cached = cached.trim();
-    if !cached.is_empty() {
-        return Some(cached.to_string());
-    }
-    kv_value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-/// Env first; when unset/empty, Workers KV `AIXODIA_CONFIG`; then an optional
-/// hard default. `ALLOWED_GITHUB_USERS` has no default (empty => the GitHub
-/// path fails closed), while `ALLOWED_ORIGINS` always ends up usable.
 async fn resolve_allowed(
     env_name: &str,
     kv_key: &str,
@@ -118,18 +150,34 @@ async fn resolve_allowed(
     default.map(parse_csv).unwrap_or_default()
 }
 
+/// Env first, then Workers KV `AIXODIA_CONFIG`.
+async fn resolve_scalar(env_name: &str, kv_key: &str, db: &DbClient) -> String {
+    if let Ok(value) = env::var(env_name) {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    db.config_kv_get(kv_key)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 impl ClientAuth {
-    /// `ALLOWED_GITHUB_USERS` / `ALLOWED_ORIGINS` resolve env -> Workers KV
-    /// `AIXODIA_CONFIG` -> default. The GitHub allowlist may be empty (fails
-    /// closed on that path only); `master_token` never needs it.
+    /// `ACCESS_TEAM_DOMAIN` / `ACCESS_APP_AUD` come from env, else Workers KV
+    /// `AIXODIA_CONFIG` (`access/*`). When either is missing the Access path
+    /// fails closed and only the master token works.
     pub async fn from_env(cf_token: String, db: &DbClient) -> Arc<Self> {
-        let ttl_secs = env::var("AIXODIA_CLIENT_TOKEN_TTL")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value >= 60 && *value <= 86_400)
-            .unwrap_or(900);
-        let allowed_users =
-            resolve_allowed("ALLOWED_GITHUB_USERS", "client/allowed_users", db, None).await;
+        let team_domain = resolve_scalar("ACCESS_TEAM_DOMAIN", "access/team_domain", db)
+            .await
+            .trim_start_matches("https://")
+            .trim_end_matches('/')
+            .to_string();
+        let app_aud = resolve_scalar("ACCESS_APP_AUD", "access/app_aud", db).await;
         let allowed_origins = resolve_allowed(
             "ALLOWED_ORIGINS",
             "client/allowed_origins",
@@ -137,113 +185,34 @@ impl ClientAuth {
             Some(DEFAULT_ALLOWED_ORIGINS),
         )
         .await;
-        let github_client_id = env::var("GITHUB_CLIENT_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "Ov23lieKSrKCRs5YKwdO".to_string());
-        let github_redirect_uris = match env::var("GITHUB_REDIRECT_URI")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(value) => parse_csv(&value),
-            None => DEFAULT_GITHUB_REDIRECT_URIS
-                .iter()
-                .map(|uri| (*uri).to_string())
-                .collect(),
-        };
-        let github_client_secret = match env::var("GITHUB_CLIENT_SECRET")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(value) => value,
-            None => db
-                .config_kv_get("client/github_client_secret")
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-        };
-        if allowed_users.is_empty() {
-            tracing::warn!("ALLOWED_GITHUB_USERS/KV unset: GitHub authorization-code sign-in is disabled; master_token still works");
-        }
-        if github_client_secret.is_empty() {
-            tracing::warn!("GITHUB_CLIENT_SECRET or AIXODIA_CONFIG/client/github_client_secret is not configured");
+        if team_domain.is_empty() || app_aud.is_empty() {
+            tracing::warn!(
+                "ACCESS_TEAM_DOMAIN/ACCESS_APP_AUD unset: Cloudflare Access sign-in is disabled; only the master token works"
+            );
         }
         Arc::new(Self {
+            team_domain,
+            app_aud,
             cf_token,
-            allowed_users,
             allowed_origins,
-            ttl_secs,
-            github_client_id,
-            github_client_secret,
-            github_redirect_uris,
             db: db.clone(),
+            cache: tokio::sync::Mutex::new(KeyCache::new()),
         })
     }
 
-    /// The one route that needs no engine bearer: it is the exchange itself.
+    /// Every route is guarded by `client_guard`; nothing needs a public router.
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/v1/auth/token", post(issue_token))
-            .route("/v1/auth/github/exchange", post(exchange_github_code))
-            .route("/v1/auth/refresh", post(refresh_token))
+            .route("/v1/auth/whoami", get(whoami))
             .with_state(self.clone())
+    }
+
+    fn access_enabled(&self) -> bool {
+        !self.team_domain.is_empty() && !self.app_aud.is_empty()
     }
 
     fn master_matches(&self, presented: &str) -> bool {
         !self.cf_token.is_empty() && !presented.is_empty() && presented == self.cf_token
-    }
-
-    fn subject_allowed(&self, subject: &str) -> bool {
-        subject == "master" || self.allowed_users.iter().any(|allowed| allowed == subject)
-    }
-
-    fn sign_token(&self, subject: &str, kind: &str, expires_at: u64) -> String {
-        let claims = TokenClaims {
-            sub: subject.to_string(),
-            exp: expires_at,
-            kind: kind.to_string(),
-            scope: "client".to_string(),
-        };
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&claims).expect("serializing fixed token claims cannot fail"),
-        );
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.cf_token.as_bytes())
-            .expect("HMAC accepts keys of any length");
-        mac.update(payload.as_bytes());
-        format!(
-            "{payload}.{}",
-            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-        )
-    }
-
-    fn verify_token(&self, token: &str, expected_kind: &str) -> Option<TokenClaims> {
-        let (payload, signature) = token.split_once('.')?;
-        if payload.is_empty()
-            || signature.is_empty()
-            || signature.contains('.')
-            || self.cf_token.is_empty()
-        {
-            return None;
-        }
-        let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(self.cf_token.as_bytes()).ok()?;
-        mac.update(payload.as_bytes());
-        mac.verify_slice(&signature).ok()?;
-        let claims: TokenClaims =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
-        if claims.exp <= now_unix()
-            || claims.kind != expected_kind
-            || claims.scope != "client"
-            || !self.subject_allowed(&claims.sub)
-        {
-            return None;
-        }
-        Some(claims)
-    }
-
-    fn valid(&self, token: &str) -> Option<String> {
-        self.verify_token(token, "access").map(|claims| claims.sub)
     }
 
     /// CORS headers for a preflight or a normal response. An unknown Origin
@@ -272,48 +241,92 @@ impl ClientAuth {
         headers
     }
 
-    fn issue_session(&self, sub: String) -> Response {
-        let now = now_unix();
-        let expires_at = now + self.ttl_secs;
-        let refresh_expires_at = now + REFRESH_TOKEN_TTL_SECS;
-        let token = self.sign_token(&sub, "access", expires_at);
-        let refresh_token = self.sign_token(&sub, "refresh", refresh_expires_at);
-        (
-            StatusCode::OK,
-            Json(json!({
-                "token": token,
-                "expires_at": expires_at,
-                "refresh_token": refresh_token,
-                "refresh_expires_at": refresh_expires_at,
-                "user": sub,
-                "scope": "client",
-            })),
-        )
-            .into_response()
+    /// Fetch and cache the team's signing keys. Returns the keys to use, or an
+    /// empty map when the endpoint is unreachable and nothing is cached.
+    async fn signing_keys(&self) -> HashMap<String, DecodingKey> {
+        {
+            let cache = self.cache.lock().await;
+            if cache.fresh() {
+                return cache.keys.clone();
+            }
+        }
+
+        let url = format!("https://{}/cdn-cgi/access/certs", self.team_domain);
+        let fetched = async {
+            let response = reqwest::Client::new()
+                .get(&url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|err| err.to_string())?
+                .error_for_status()
+                .map_err(|err| err.to_string())?
+                .json::<JwksDocument>()
+                .await
+                .map_err(|err| err.to_string())?;
+            let mut keys = HashMap::new();
+            for jwk in response.keys {
+                if jwk.n.is_empty() || jwk.e.is_empty() {
+                    continue;
+                }
+                if let Ok(alg) = jwk.alg.as_deref().unwrap_or("RS256").parse::<Algorithm>() {
+                    if let Ok(key) = DecodingKey::from_rsa_components(&jwk.n, &jwk.e) {
+                        let _ = alg;
+                        keys.insert(jwk.kid, key);
+                    }
+                }
+            }
+            Ok::<_, String>(keys)
+        }
+        .await;
+
+        let mut cache = self.cache.lock().await;
+        match fetched {
+            Ok(keys) if !keys.is_empty() => {
+                cache.keys = keys.clone();
+                cache.fetched_at = Some(Instant::now());
+                cache.last_success = Some(Instant::now());
+                keys
+            }
+            Ok(_) => {
+                tracing::warn!("Access certs endpoint returned no usable keys");
+                cache.keys.clone()
+            }
+            Err(err) => {
+                tracing::warn!("Access certs fetch failed: {err}");
+                if cache.usable_after_outage() {
+                    cache.keys.clone()
+                } else {
+                    HashMap::new()
+                }
+            }
+        }
     }
 
-    fn refresh_session(&self, refresh_token: &str) -> Response {
-        let Some(claims) = self.verify_token(refresh_token, "refresh") else {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "refresh token rejected", "code": "REFRESH_TOKEN_REJECTED"})),
-            )
-                .into_response();
-        };
-        let expires_at = now_unix() + self.ttl_secs;
-        let token = self.sign_token(&claims.sub, "access", expires_at);
-        (
-            StatusCode::OK,
-            Json(json!({
-                "token": token,
-                "expires_at": expires_at,
-                "refresh_token": refresh_token,
-                "refresh_expires_at": claims.exp,
-                "user": claims.sub,
-                "scope": "client",
-            })),
+    /// Verify a `Cf-Access-Jwt-Assertion` header value. Returns the subject
+    /// (email when present, else `sub`) on success.
+    async fn verify_access_jwt(&self, token: &str) -> Option<String> {
+        if !self.access_enabled() || token.is_empty() {
+            return None;
+        }
+        let header = decode_header(token).ok()?;
+        let kid = header.kid.unwrap_or_default();
+        let keys = self.signing_keys().await;
+        let key = keys.get(&kid)?;
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[self.app_aud.as_str()]);
+        validation.set_issuer(&[format!("https://{}", self.team_domain)]);
+        validation.validate_exp = true;
+
+        let data = decode::<AccessClaims>(token, key, &validation).ok()?;
+        Some(
+            data.claims
+                .email
+                .filter(|value| !value.is_empty())
+                .or(data.claims.sub)
+                .unwrap_or_default(),
         )
-            .into_response()
     }
 }
 
@@ -327,6 +340,14 @@ fn bearer(headers: &HeaderMap) -> &str {
         .trim()
 }
 
+fn access_jwt(headers: &HeaderMap) -> &str {
+    headers
+        .get(ACCESS_JWT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim()
+}
+
 fn with_cors(mut response: Response, cors: &HeaderMap) -> Response {
     for (name, value) in cors.iter() {
         response.headers_mut().insert(name, value.clone());
@@ -334,10 +355,11 @@ fn with_cors(mut response: Response, cors: &HeaderMap) -> Response {
     response
 }
 
-/// Replaces `aixodia_io::require_token` for the outer mux. The original bearer
-/// still works (Android, CLI, in-process tools); a short-lived client token is
-/// accepted as well. The open paths match the old guard exactly, plus the new
-/// exchange route.
+/// Rejects any request that carries neither an Access JWT nor the master token.
+///
+/// Paths are no longer individually opened for sign-in: there is no sign-in
+/// route left in the engine, so only `/healthz` stays public (it has to, or
+/// Cloudflare and local probes could not reach it).
 pub async fn client_guard(
     State(auth): State<Arc<ClientAuth>>,
     request: Request,
@@ -358,420 +380,40 @@ pub async fn client_guard(
     }
 
     let path = request.uri().path().to_string();
-    let open = matches!(
-        path.as_str(),
-        "/healthz"
-            | "/terminal"
-            | "/room"
-            | "/v1/auth/token"
-            | "/v1/auth/github/exchange"
-            | "/v1/auth/refresh"
-    );
-    if !open {
-        let presented = bearer(request.headers());
-        let by_master = auth.master_matches(presented);
-        let by_session = auth.valid(presented).is_some();
-        if !by_master && !by_session {
-            return with_cors(
-                (
-                    StatusCode::UNAUTHORIZED,
-                    cors.clone(),
-                    Json(json!({"error": "unauthorized", "code": "TOKEN_REJECTED"})),
-                )
-                    .into_response(),
-                &cors,
-            );
-        }
+    if path == "/healthz" {
+        return with_cors(next.run(request).await, &cors);
     }
 
-    with_cors(next.run(request).await, &cors)
-}
-
-#[derive(Deserialize)]
-struct TokenRequest {
-    #[serde(default)]
-    github_token: Option<String>,
-    #[serde(default)]
-    master_token: Option<String>,
-}
-
-/// Exchange a GitHub OAuth access token OR the master `CF_TOKEN` for a
-/// short-lived engine token. `CF_TOKEN` is never returned to the client.
-async fn issue_token(
-    State(auth): State<Arc<ClientAuth>>,
-    Json(body): Json<TokenRequest>,
-) -> Response {
-    let master = body
-        .master_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let github = body
-        .github_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    if master.is_none() && github.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "github_token or master_token is required"})),
-        )
-            .into_response();
+    let master = bearer(request.headers());
+    if auth.master_matches(master) {
+        return with_cors(next.run(request).await, &cors);
     }
 
-    // master_token: for an Android/CLI client that holds CF_TOKEN but has no
-    // GitHub PAT. Works even when the GitHub allowlist is empty (fail-closed
-    // applies to the GitHub path only).
-    if let Some(master) = master {
-        if auth.master_matches(master) {
-            return auth.issue_session("master".to_string());
-        }
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "master_token rejected", "code": "MASTER_TOKEN_REJECTED"})),
-        )
-            .into_response();
-    }
-
-    if auth.allowed_users.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "ALLOWED_GITHUB_USERS is not configured (env or AIXODIA_CONFIG/client/allowed_users)"})),
-        )
-            .into_response();
-    }
-    let github_token = github.unwrap_or_default();
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get("https://api.github.com/user")
-        .header(header::AUTHORIZATION, format!("Bearer {}", github_token))
-        .header(header::ACCEPT, "application/vnd.github+json")
-        .header(header::USER_AGENT, "aixodia-engine")
-        .send()
-        .await;
-    let Ok(response) = response else {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "GitHub is unreachable"})),
-        )
-            .into_response();
-    };
-    if !response.status().is_success() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "GitHub token rejected"})),
-        )
-            .into_response();
-    }
-    let Ok(user) = response.json::<Value>().await else {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "GitHub returned an unreadable user"})),
-        )
-            .into_response();
-    };
-    let login = user.get("login").and_then(Value::as_str).unwrap_or("");
-    if !auth.allowed_users.iter().any(|allowed| allowed == login) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "GitHub user is not allowed"})),
-        )
-            .into_response();
-    }
-
-    auth.issue_session(login.to_string())
-}
-
-#[derive(Deserialize)]
-struct GitHubCodeRequest {
-    code: String,
-    code_verifier: String,
-    redirect_uri: String,
-    client_id: String,
-}
-
-/// Exchange a GitHub authorization code on the Engine. The client secret is
-/// read only by the server from env/KV; clients send a PKCE verifier, never a secret.
-async fn exchange_github_code(
-    State(auth): State<Arc<ClientAuth>>,
-    Json(body): Json<GitHubCodeRequest>,
-) -> Response {
-    if body.code.trim().is_empty()
-        || body.code_verifier.trim().is_empty()
-        || !auth
-            .github_redirect_uris
-            .iter()
-            .any(|uri| uri == &body.redirect_uri)
-        || body.client_id != auth.github_client_id
-    {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid authorization-code request","code":"INVALID_OAUTH_REQUEST"}))).into_response();
-    }
-    // Resolve KV lazily when the process started before the secret was provisioned.
-    // Environment configuration remains authoritative and the secret is never logged.
-    let github_client_secret = if !auth.github_client_secret.trim().is_empty() {
-        Some(auth.github_client_secret.clone())
-    } else {
-        auth.db
-            .config_kv_get("client/github_client_secret")
-            .await
-            .ok()
-            .flatten()
-    };
-    let Some(github_client_secret) =
-        configured_github_secret(&auth.github_client_secret, github_client_secret)
-    else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"GitHub OAuth client secret is not configured","code":"OAUTH_NOT_CONFIGURED"}))).into_response();
-    };
-    if auth.allowed_users.is_empty() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"ALLOWED_GITHUB_USERS is not configured","code":"GITHUB_ALLOWLIST_NOT_CONFIGURED"}))).into_response();
-    }
-    let client = reqwest::Client::new();
-    let token_response = match client.post("https://github.com/login/oauth/access_token")
-        .header(header::ACCEPT, "application/json")
-        .header(header::USER_AGENT, "aixodia-engine")
-        .form(&[
-            ("client_id", auth.github_client_id.as_str()),
-            ("client_secret", github_client_secret.as_str()),
-            ("code", body.code.trim()),
-            ("redirect_uri", body.redirect_uri.trim()),
-            ("code_verifier", body.code_verifier.trim()),
-        ]).send().await {
-        Ok(response) => match response.json::<Value>().await {
-            Ok(value) => value,
-            Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub returned an unreadable token response","code":"GITHUB_BAD_RESPONSE"}))).into_response(),
-        },
-        Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub is unreachable","code":"GITHUB_UNREACHABLE"}))).into_response(),
-    };
-    let github_token = token_response
-        .get("access_token")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if github_token.is_empty() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({
-            "error": token_response.get("error_description").and_then(Value::as_str).unwrap_or("GitHub authorization code was rejected"),
-            "code": "GITHUB_CODE_REJECTED"
-        }))).into_response();
-    }
-    let user_response = match client
-        .get("https://api.github.com/user")
-        .header(header::AUTHORIZATION, format!("Bearer {github_token}"))
-        .header(header::ACCEPT, "application/vnd.github+json")
-        .header(header::USER_AGENT, "aixodia-engine")
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error":"GitHub is unreachable","code":"GITHUB_UNREACHABLE"})),
+    let jwt = access_jwt(request.headers());
+    match auth.verify_access_jwt(jwt).await {
+        Some(subject) if !subject.is_empty() => with_cors(next.run(request).await, &cors),
+        _ => with_cors(
+            (
+                StatusCode::UNAUTHORIZED,
+                cors.clone(),
+                Json(json!({"error": "unauthorized", "code": "ACCESS_JWT_REJECTED"})),
             )
-                .into_response()
-        }
-    };
-    if !user_response.status().is_success() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"GitHub token rejected","code":"GITHUB_TOKEN_REJECTED"})),
-        )
-            .into_response();
+                .into_response(),
+            &cors,
+        ),
     }
-    let user = match user_response.json::<Value>().await {
-        Ok(value) => value,
-        Err(_) => return (
-            StatusCode::BAD_GATEWAY,
-            Json(
-                json!({"error":"GitHub returned an unreadable user","code":"GITHUB_BAD_RESPONSE"}),
-            ),
-        )
-            .into_response(),
-    };
-    let login = user.get("login").and_then(Value::as_str).unwrap_or("");
-    if !auth.allowed_users.iter().any(|allowed| allowed == login) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error":"GitHub user is not allowed","code":"GITHUB_USER_NOT_ALLOWED"})),
-        )
-            .into_response();
-    }
-    auth.issue_session(login.to_string())
 }
 
-#[derive(Deserialize)]
-struct RefreshRequest {
-    refresh_token: String,
-}
-
-async fn refresh_token(
-    State(auth): State<Arc<ClientAuth>>,
-    Json(body): Json<RefreshRequest>,
-) -> Response {
-    if body.refresh_token.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "refresh_token is required"})),
-        )
-            .into_response();
-    }
-    auth.refresh_session(body.refresh_token.trim())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_auth(cf_token: &str) -> ClientAuth {
-        ClientAuth {
-            cf_token: cf_token.to_string(),
-            allowed_users: Vec::new(),
-            allowed_origins: parse_csv(DEFAULT_ALLOWED_ORIGINS),
-            ttl_secs: 900,
-            github_client_id: "test-client".to_string(),
-            github_client_secret: "test-secret".to_string(),
-            github_redirect_uris: DEFAULT_GITHUB_REDIRECT_URIS
-                .iter()
-                .map(|uri| (*uri).to_string())
-                .collect(),
-            db: DbClient::new(),
-        }
-    }
-
-    #[test]
-    fn github_secret_prefers_environment_over_kv() {
-        assert_eq!(
-            configured_github_secret(" env-secret ", Some("kv-secret".to_string())),
-            Some("env-secret".to_string())
-        );
-    }
-
-    #[test]
-    fn github_secret_falls_back_to_kv_when_environment_is_empty() {
-        assert_eq!(
-            configured_github_secret("", Some(" kv-secret ".to_string())),
-            Some("kv-secret".to_string())
-        );
-    }
-
-    #[test]
-    fn github_secret_rejects_missing_or_blank_configuration() {
-        assert_eq!(configured_github_secret("", None), None);
-        assert_eq!(configured_github_secret("  ", Some("  ".to_string())), None);
-    }
-
-    #[test]
-    fn master_token_matches_only_the_real_cf_token() {
-        let auth = test_auth("secret");
-        assert!(auth.master_matches("secret"));
-        assert!(!auth.master_matches("wrong"));
-        assert!(!auth.master_matches(""));
-    }
-
-    #[test]
-    fn master_token_path_needs_no_github_allowlist() {
-        let auth = test_auth("secret");
-        assert!(auth.allowed_users.is_empty());
-        assert!(auth.master_matches("secret"));
-    }
-
-    #[test]
-    fn allowed_origins_default_is_usable() {
-        let auth = test_auth("secret");
-        assert_eq!(auth.allowed_origins.len(), 2);
-        assert!(auth
-            .allowed_origins
-            .iter()
-            .any(|o| o == "http://localhost:5173"));
-    }
-
-    #[test]
-    fn parse_csv_trims_and_drops_empty() {
-        assert_eq!(parse_csv(" a, ,b ,c"), vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn signed_access_and_refresh_tokens_are_distinct_and_restart_independent() {
-        let mut auth = test_auth("server-secret");
-        auth.allowed_users = vec!["Tulipskun".to_string()];
-        let access = auth.sign_token("Tulipskun", "access", now_unix() + 900);
-        let refresh = auth.sign_token("Tulipskun", "refresh", now_unix() + REFRESH_TOKEN_TTL_SECS);
-
-        assert_eq!(auth.valid(&access).as_deref(), Some("Tulipskun"));
-        assert!(auth.verify_token(&access, "refresh").is_none());
-        assert!(auth.valid(&refresh).is_none());
-        assert_eq!(
-            auth.verify_token(&refresh, "refresh").unwrap().sub,
-            "Tulipskun"
-        );
-
-        // No in-memory session registry is involved: another ClientAuth instance
-        // with the same server secret and allowlist verifies the same token.
-        let mut restarted = test_auth("server-secret");
-        restarted.allowed_users = vec!["Tulipskun".to_string()];
-        assert_eq!(restarted.valid(&access).as_deref(), Some("Tulipskun"));
-        assert_eq!(
-            restarted.verify_token(&refresh, "refresh").unwrap().sub,
-            "Tulipskun"
-        );
-    }
-
-    #[test]
-    fn signed_tokens_reject_tampering_and_expiry() {
-        let auth = test_auth("server-secret");
-        let token = auth.sign_token("master", "access", now_unix() + 900);
-        let mut tampered = token.clone();
-        tampered.push('x');
-        assert!(auth.valid(&tampered).is_none());
-        let expired = auth.sign_token("master", "access", now_unix() - 1);
-        assert!(auth.valid(&expired).is_none());
-    }
-
-    #[test]
-    fn refresh_tokens_stop_working_when_github_user_is_removed_from_allowlist() {
-        let mut auth = test_auth("server-secret");
-        auth.allowed_users = vec!["Tulipskun".to_string()];
-        let refresh = auth.sign_token("Tulipskun", "refresh", now_unix() + REFRESH_TOKEN_TTL_SECS);
-        assert!(auth.verify_token(&refresh, "refresh").is_some());
-        auth.allowed_users.clear();
-        assert!(auth.verify_token(&refresh, "refresh").is_none());
-    }
-
-    #[test]
-    fn master_signed_refresh_remains_valid_without_github_allowlist() {
-        let auth = test_auth("server-secret");
-        let refresh = auth.sign_token("master", "refresh", now_unix() + REFRESH_TOKEN_TTL_SECS);
-        assert!(auth.verify_token(&refresh, "refresh").is_some());
-    }
-
-    #[tokio::test]
-    async fn refresh_issues_a_new_access_token_without_reauthenticating_with_github() {
-        let mut auth = test_auth("server-secret");
-        auth.allowed_users = vec!["Tulipskun".to_string()];
-        let refresh = auth.sign_token("Tulipskun", "refresh", now_unix() + REFRESH_TOKEN_TTL_SECS);
-        let response = auth.refresh_session(&refresh);
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        let access = json.get("token").and_then(Value::as_str).unwrap();
-        assert_eq!(json.get("user").and_then(Value::as_str), Some("Tulipskun"));
-        assert_eq!(
-            json.get("refresh_token").and_then(Value::as_str),
-            Some(refresh.as_str())
-        );
-        assert_eq!(auth.valid(access).as_deref(), Some("Tulipskun"));
-    }
-
-    #[test]
-    fn refresh_rejects_access_tokens_and_tampered_credentials() {
-        let auth = test_auth("server-secret");
-        let access = auth.sign_token("master", "access", now_unix() + 900);
-        let access_response = auth.refresh_session(&access);
-        assert_eq!(access_response.status(), StatusCode::UNAUTHORIZED);
-        let tampered = format!("{access}x");
-        let tampered_response = auth.refresh_session(&tampered);
-        assert_eq!(tampered_response.status(), StatusCode::UNAUTHORIZED);
-    }
+/// Reports which credentials the caller presented. Useful when the app has to
+/// tell "the Access session expired" apart from "the engine rejected me".
+async fn whoami(State(auth): State<Arc<ClientAuth>>, headers: HeaderMap) -> Response {
+    let master = auth.master_matches(bearer(&headers));
+    let subject = auth.verify_access_jwt(access_jwt(&headers)).await;
+    Json(json!({
+        "master": master,
+        "access_subject": subject,
+        "access_enabled": auth.access_enabled(),
+        "host": auth.team_domain,
+    }))
+    .into_response()
 }
