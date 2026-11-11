@@ -96,8 +96,10 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         anyhow::bail!("CF_TOKEN is not set");
     }
     let db = DbClient::new();
-    if !db.verify(&token).await {
-        anyhow::bail!("CF_TOKEN is invalid");
+    if let Err(reason) = db.verify_detailed(&token).await {
+        // The reason matters: a bad token and an unreachable API both used to
+        // print "CF_TOKEN is invalid", which sent operators to the wrong place.
+        anyhow::bail!("CF_TOKEN could not be verified: {reason}");
     }
     // GitHub bearer verification for the relay API surface. The allowlist comes
     // from ALLOWED_GITHUB_USERS; unset or empty fails closed — every bearer is
