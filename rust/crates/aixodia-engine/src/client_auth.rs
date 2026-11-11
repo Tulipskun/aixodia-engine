@@ -130,7 +130,12 @@ impl ClientAuth {
             .filter(|value| !value.trim().is_empty())
         {
             Some(value) => value,
-            None => db.config_kv_get("client/github_client_secret").await.ok().flatten().unwrap_or_default(),
+            None => db
+                .config_kv_get("client/github_client_secret")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
         };
         if allowed_users.is_empty() {
             tracing::warn!("ALLOWED_GITHUB_USERS/KV unset: GitHub authorization-code sign-in is disabled; master_token still works");
@@ -328,7 +333,12 @@ pub async fn client_guard(
     let path = request.uri().path().to_string();
     let open = matches!(
         path.as_str(),
-        "/healthz" | "/terminal" | "/room" | "/v1/auth/token" | "/v1/auth/github/exchange" | "/v1/auth/refresh"
+        "/healthz"
+            | "/terminal"
+            | "/room"
+            | "/v1/auth/token"
+            | "/v1/auth/github/exchange"
+            | "/v1/auth/refresh"
     );
     if !open {
         let presented = bearer(request.headers());
@@ -461,8 +471,11 @@ async fn exchange_github_code(
     State(auth): State<Arc<ClientAuth>>,
     Json(body): Json<GitHubCodeRequest>,
 ) -> Response {
-    if body.code.trim().is_empty() || body.code_verifier.trim().is_empty()
-        || body.redirect_uri != auth.github_redirect_uri || body.client_id != auth.github_client_id {
+    if body.code.trim().is_empty()
+        || body.code_verifier.trim().is_empty()
+        || body.redirect_uri != auth.github_redirect_uri
+        || body.client_id != auth.github_client_id
+    {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid authorization-code request","code":"INVALID_OAUTH_REQUEST"}))).into_response();
     }
     if auth.github_client_secret.is_empty() {
@@ -488,30 +501,57 @@ async fn exchange_github_code(
         },
         Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub is unreachable","code":"GITHUB_UNREACHABLE"}))).into_response(),
     };
-    let github_token = token_response.get("access_token").and_then(Value::as_str).unwrap_or("");
+    let github_token = token_response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if github_token.is_empty() {
         return (StatusCode::UNAUTHORIZED, Json(json!({
             "error": token_response.get("error_description").and_then(Value::as_str).unwrap_or("GitHub authorization code was rejected"),
             "code": "GITHUB_CODE_REJECTED"
         }))).into_response();
     }
-    let user_response = match client.get("https://api.github.com/user")
+    let user_response = match client
+        .get("https://api.github.com/user")
         .header(header::AUTHORIZATION, format!("Bearer {github_token}"))
         .header(header::ACCEPT, "application/vnd.github+json")
-        .header(header::USER_AGENT, "aixodia-engine").send().await {
+        .header(header::USER_AGENT, "aixodia-engine")
+        .send()
+        .await
+    {
         Ok(response) => response,
-        Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub is unreachable","code":"GITHUB_UNREACHABLE"}))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error":"GitHub is unreachable","code":"GITHUB_UNREACHABLE"})),
+            )
+                .into_response()
+        }
     };
     if !user_response.status().is_success() {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"GitHub token rejected","code":"GITHUB_TOKEN_REJECTED"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"GitHub token rejected","code":"GITHUB_TOKEN_REJECTED"})),
+        )
+            .into_response();
     }
     let user = match user_response.json::<Value>().await {
         Ok(value) => value,
-        Err(_) => return (StatusCode::BAD_GATEWAY, Json(json!({"error":"GitHub returned an unreadable user","code":"GITHUB_BAD_RESPONSE"}))).into_response(),
+        Err(_) => return (
+            StatusCode::BAD_GATEWAY,
+            Json(
+                json!({"error":"GitHub returned an unreadable user","code":"GITHUB_BAD_RESPONSE"}),
+            ),
+        )
+            .into_response(),
     };
     let login = user.get("login").and_then(Value::as_str).unwrap_or("");
     if !auth.allowed_users.iter().any(|allowed| allowed == login) {
-        return (StatusCode::FORBIDDEN, Json(json!({"error":"GitHub user is not allowed","code":"GITHUB_USER_NOT_ALLOWED"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"GitHub user is not allowed","code":"GITHUB_USER_NOT_ALLOWED"})),
+        )
+            .into_response();
     }
     auth.issue_session(login.to_string())
 }

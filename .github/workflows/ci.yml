@@ -25,9 +25,9 @@ jobs:
           toolchain: '1.99.1'
           components: rustfmt, clippy
 
-      - name: Format
+      - name: Format validation
         working-directory: rust
-        run: cargo fmt --all
+        run: cargo fmt --all -- --check
 
       - name: Build
         working-directory: rust
@@ -37,9 +37,6 @@ jobs:
         working-directory: rust
         run: cargo test --workspace
 
-      - name: Format check
-        working-directory: rust
-        run: cargo fmt --check
 
       - name: Clippy
         working-directory: rust
