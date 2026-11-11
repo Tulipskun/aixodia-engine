@@ -1,8 +1,8 @@
-//! Self-update and in-place restart.
+//! Manual update and in-place restart.
 //!
-//! This is a direct port of the engine's Go `selfupdate` package. It lets a
-//! running engine replace its own binary and restart without ending the host
-//! session:
+//! This lets a running engine replace its own binary and restart without ending
+//! the host session. Nothing happens automatically: an operator runs
+//! `aixodia update`, and only then does the engine check GitHub.
 //!
 //! * [`latest`] compares the published release asset against the running
 //!   executable and reports whether they differ.
@@ -14,8 +14,10 @@
 //! * [`notify_update`] makes `kill -USR1 <pid>` mean "install the published build
 //!   and continue as it"; the signal is the whole handshake, so no inbound port
 //!   has to be this engine's.
-//! * [`run_loop`] checks the published build every ten minutes, once the engine
-//!   has had two minutes to finish starting.
+//!
+//! There is deliberately no polling loop. An engine that checked GitHub on a
+//! timer could restart itself mid-session without an operator asking for it,
+//! which made rollout state hard to reason about. Updates are manual only.
 //!
 //! On Linux the running bytes are always read from `/proc/self/exe`, which
 //! stays bound to the inode that was loaded even after `install.sh` renames a
@@ -29,11 +31,9 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio_util::sync::CancellationToken;
 
 /// The published release this engine tracks.
 pub const RELEASE_URL: &str =
@@ -44,12 +44,6 @@ pub const TARGET_PATH: &str = "/usr/local/bin/aixodia-engine";
 
 /// `User-Agent` sent to GitHub and to the asset host.
 pub const USER_AGENT: &str = "aixodia-engine/1.0";
-
-/// How long `run_loop` waits before its first check.
-pub const START_GRACE: Duration = Duration::from_secs(2 * 60);
-
-/// How often `run_loop` checks the published build.
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Errors from the self-update path.
 #[derive(Debug, thiserror::Error)]
@@ -419,8 +413,8 @@ pub const UPDATE_SIGNAL: i32 = 0;
 
 /// Makes `kill -USR1 <pid>` mean "install the published build and continue as
 /// it". `idle` reports whether a chat is in flight; when it is, the signal only
-/// notes the request and the next [`run_loop`] tick applies the same build as
-/// soon as the chat ends.
+/// notes the request and nothing is installed until the operator sends it again
+/// after the chat ends.
 ///
 /// The returned guard stops the handler when dropped.
 #[cfg(unix)]
@@ -573,61 +567,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Checks the published build every ten minutes, once the engine has had two
-/// minutes to finish starting, and installs it when it changed and no chat is
-/// in flight. A check that fails repeats every tick, so it is logged when the
-/// error changes, not on every attempt.
-pub async fn run_loop<F>(cancel: CancellationToken, idle: F)
-where
-    F: Fn() -> bool,
-{
-    let mut last_err = String::new();
-
-    tokio::select! {
-        _ = cancel.cancelled() => return,
-        _ = tokio::time::sleep(START_GRACE) => {}
-    }
-    loop {
-        if idle() {
-            match need_update().await {
-                Ok((true, release)) => {
-                    tracing::info!(published = %release.updated_at, "selfupdate: installing the build");
-                    // On success this does not return: the new binary takes over.
-                    match apply(release, &target_path()).await {
-                        Ok(()) => note(&mut last_err, None),
-                        Err(err) => note(&mut last_err, Some(&err)),
-                    }
-                }
-                Ok((false, _)) => note(&mut last_err, None),
-                Err(err) => note(&mut last_err, Some(&err)),
-            }
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(CHECK_INTERVAL) => {}
-        }
-    }
-}
-
-/// Logs a failed check when the message changes, not on every attempt.
-fn note(last_err: &mut String, err: Option<&Error>) {
-    match err {
-        None => {
-            if !last_err.is_empty() {
-                tracing::info!("selfupdate: the release is reachable again");
-                last_err.clear();
-            }
-        }
-        Some(err) => {
-            let message = err.to_string();
-            if message != *last_err {
-                tracing::warn!(%message, "selfupdate:");
-                *last_err = message;
-            }
-        }
-    }
-}
-
 // --- tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -637,6 +576,7 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
 
     /// The self-update tests share the process-wide HOME and SIGUSR1 handler,
     /// so they must run one at a time: a guard dropped by one test would leave

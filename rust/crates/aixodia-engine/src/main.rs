@@ -289,7 +289,9 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
                 && !gateway.owes_backups()
         }
     };
-    tokio::spawn(selfupdate::run_loop(cancel.clone(), idle.clone()));
+    // Updates are manual only: `aixodia update` sends SIGUSR1 to a running
+    // engine that is idle, or runs `aixodia-engine update` when it is stopped.
+    // Nothing here polls GitHub on its own.
     let _update = selfupdate::notify_update(idle);
 
     let shutdown = cancel.clone();

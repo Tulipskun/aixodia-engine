@@ -40,9 +40,10 @@ curl -fsSL https://raw.githubusercontent.com/Tulipskun/aixodia-engine/main/insta
 Installs to `/usr/local/bin`: `aixodia-engine`, `aixodia`, and `cloudflared` (if it
 is not already on your PATH). Linux x86_64 and arm64.
 
-Updating replaces the published binary without stopping or restarting the
-running engine. The engine swaps its executable image in place,
-keeping the same pid, working directory, standard streams and active session.
+Updating is manual: run `aixodia update` and the published binary replaces the
+running one without stopping or restarting the engine. The engine swaps its
+executable image in place, keeping the same pid, working directory, standard
+streams and active session.
 
 ## Run
 
@@ -78,9 +79,9 @@ to the running process; the engine waits for active chats to finish, installs
 the published build and execs the new image in the same process. Its output
 keeps going to the log file it opened at start.
 
-The engine also checks for a published build every ten minutes and applies it
-only while no chat is in flight. The update is an in-place exec, not a
-background restart.
+The engine never updates itself on a timer. It only checks GitHub when an
+operator runs `aixodia update`, so rollout timing is always explicit. The
+update is an in-place exec, not a background restart.
 
 Local state lives in `~/.aixodia/`: `aixodia-logs.db`, `uploads/`, the
 cloudflared child-process pid file, the engine pid file `aixodia.pid` and the

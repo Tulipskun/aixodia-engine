@@ -12,8 +12,8 @@
 #   cloudflared     the tunnel helper, if it is not already installed
 #
 # Updating is the same command again: it replaces the files and stops there.
-# A running engine picks the new build up in place with `aixodia update`, which
-# signals it to exec itself (same pid, session intact).
+# A running engine picks the new build up in place only when asked, with
+# `aixodia update`, which signals it to exec itself (same pid, session intact).
 set -euo pipefail
 
 REPO_SLUG="Tulipskun/aixodia-engine"
