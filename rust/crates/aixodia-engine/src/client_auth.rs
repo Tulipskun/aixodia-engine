@@ -53,6 +53,7 @@ pub struct ClientAuth {
     github_client_id: String,
     github_client_secret: String,
     github_redirect_uri: String,
+    db: DbClient,
 }
 
 fn now_unix() -> u64 {
@@ -68,6 +69,16 @@ fn parse_csv(value: &str) -> Vec<String> {
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+fn configured_github_secret(cached: &str, kv_value: Option<String>) -> Option<String> {
+    let cached = cached.trim();
+    if !cached.is_empty() {
+        return Some(cached.to_string());
+    }
+    kv_value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Env first; when unset/empty, Workers KV `AIXODIA_CONFIG`; then an optional
@@ -151,6 +162,7 @@ impl ClientAuth {
             github_client_id,
             github_client_secret,
             github_redirect_uri,
+            db: db.clone(),
         })
     }
 
@@ -478,9 +490,22 @@ async fn exchange_github_code(
     {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid authorization-code request","code":"INVALID_OAUTH_REQUEST"}))).into_response();
     }
-    if auth.github_client_secret.is_empty() {
+    // Resolve KV lazily when the process started before the secret was provisioned.
+    // Environment configuration remains authoritative and the secret is never logged.
+    let github_client_secret = if !auth.github_client_secret.trim().is_empty() {
+        Some(auth.github_client_secret.clone())
+    } else {
+        auth.db
+            .config_kv_get("client/github_client_secret")
+            .await
+            .ok()
+            .flatten()
+    };
+    let Some(github_client_secret) =
+        configured_github_secret(&auth.github_client_secret, github_client_secret)
+    else {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"GitHub OAuth client secret is not configured","code":"OAUTH_NOT_CONFIGURED"}))).into_response();
-    }
+    };
     if auth.allowed_users.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"ALLOWED_GITHUB_USERS is not configured","code":"GITHUB_ALLOWLIST_NOT_CONFIGURED"}))).into_response();
     }
@@ -490,7 +515,7 @@ async fn exchange_github_code(
         .header(header::USER_AGENT, "aixodia-engine")
         .form(&[
             ("client_id", auth.github_client_id.as_str()),
-            ("client_secret", auth.github_client_secret.as_str()),
+            ("client_secret", github_client_secret.as_str()),
             ("code", body.code.trim()),
             ("redirect_uri", auth.github_redirect_uri.as_str()),
             ("code_verifier", body.code_verifier.trim()),
@@ -588,7 +613,30 @@ mod tests {
             github_client_id: "test-client".to_string(),
             github_client_secret: "test-secret".to_string(),
             github_redirect_uri: DEFAULT_GITHUB_REDIRECT_URI.to_string(),
+            db: DbClient::new(),
         }
+    }
+
+    #[test]
+    fn github_secret_prefers_environment_over_kv() {
+        assert_eq!(
+            configured_github_secret(" env-secret ", Some("kv-secret".to_string())),
+            Some("env-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn github_secret_falls_back_to_kv_when_environment_is_empty() {
+        assert_eq!(
+            configured_github_secret("", Some(" kv-secret ".to_string())),
+            Some("kv-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn github_secret_rejects_missing_or_blank_configuration() {
+        assert_eq!(configured_github_secret("", None), None);
+        assert_eq!(configured_github_secret("  ", Some("  ".to_string())), None);
     }
 
     #[test]
