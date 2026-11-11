@@ -289,9 +289,14 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
                 && !gateway.owes_backups()
         }
     };
-    // Updates are manual only: `aixodia update` sends SIGUSR1 to a running
-    // engine that is idle, or runs `aixodia-engine update` when it is stopped.
-    // Nothing here polls GitHub on its own.
+    // Updates install only while no chat is in flight, and always as an
+    // in-place exec, so the pid never changes. A request that arrives during a
+    // chat is queued and applied by the loop once the engine goes idle.
+    let update_idle = idle.clone();
+    let update_cancel = cancel.clone();
+    tokio::spawn(async move {
+        selfupdate::run_loop(update_cancel, update_idle).await;
+    });
     let _update = selfupdate::notify_update(idle);
 
     let shutdown = cancel.clone();

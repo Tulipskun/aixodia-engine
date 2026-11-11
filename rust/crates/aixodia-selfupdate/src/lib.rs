@@ -1,23 +1,25 @@
-//! Manual update and in-place restart.
+//! Updates and in-place restart.
 //!
 //! This lets a running engine replace its own binary and restart without ending
-//! the host session. Nothing happens automatically: an operator runs
-//! `aixodia update`, and only then does the engine check GitHub.
+//! the host session. The swap is always `execve`, so the pid never changes:
+//! only the image behind it is replaced.
 //!
 //! * [`latest`] compares the published release asset against the running
 //!   executable and reports whether they differ.
 //! * [`install`] downloads the published asset, verifies it by sha256 against
-//!   the running copy, and swaps it into place. `aixodia update` uses this and
-//!   lets the launcher decide when the engine restarts.
+//!   the running copy, and swaps it into place.
 //! * [`apply`] installs and, when the binary changed, replaces this process
 //!   with it: same pid, same arguments, same environment.
 //! * [`notify_update`] makes `kill -USR1 <pid>` mean "install the published build
 //!   and continue as it"; the signal is the whole handshake, so no inbound port
 //!   has to be this engine's.
+//! * [`run_loop`] checks the published build every ten minutes and applies a
+//!   queued request as soon as the engine is idle.
 //!
-//! There is deliberately no polling loop. An engine that checked GitHub on a
-//! timer could restart itself mid-session without an operator asking for it,
-//! which made rollout state hard to reason about. Updates are manual only.
+//! Every install is gated on the engine being idle: a chat in flight never gets
+//! its process replaced underneath it. A request that arrives mid-chat is
+//! queued with [`mark_pending`] and applied by [`run_loop`] when the chat ends,
+//! so one `aixodia update` is enough.
 //!
 //! On Linux the running bytes are always read from `/proc/self/exe`, which
 //! stays bound to the inode that was loaded even after `install.sh` renames a
@@ -31,9 +33,11 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 /// The published release this engine tracks.
 pub const RELEASE_URL: &str =
@@ -44,6 +48,13 @@ pub const TARGET_PATH: &str = "/usr/local/bin/aixodia-engine";
 
 /// `User-Agent` sent to GitHub and to the asset host.
 pub const USER_AGENT: &str = "aixodia-engine/1.0";
+
+/// How long [`run_loop`] waits after start before its first check, so a fresh
+/// boot is not immediately interrupted by a download.
+pub const START_GRACE: Duration = Duration::from_secs(2 * 60);
+
+/// How often [`run_loop`] checks the published build.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Errors from the self-update path.
 #[derive(Debug, thiserror::Error)]
@@ -221,6 +232,29 @@ type ApplyFn = Arc<dyn Fn(Release, String) -> ApplyFuture + Send + Sync>;
 
 static NEED_FN: RwLock<Option<NeedFn>> = RwLock::new(None);
 static APPLY_FN: RwLock<Option<ApplyFn>> = RwLock::new(None);
+
+/// Set when an update was requested while a chat was still running.
+///
+/// The signal handler cannot wait for the chat to finish, and the operator must
+/// not have to send the signal a second time, so the request is remembered here
+/// and [`take_pending`] hands it back once the engine reports idle. This is what
+/// makes one `aixodia update` enough even during a long turn.
+static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that an update is wanted but could not be applied yet.
+pub fn mark_pending() {
+    PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Returns true once if an update is queued, clearing the flag.
+pub fn take_pending() -> bool {
+    PENDING.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// True while an update is queued, without consuming it.
+pub fn is_pending() -> bool {
+    PENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 fn default_need() -> NeedFn {
     Arc::new(|| Box::pin(async { need_update().await }))
@@ -412,9 +446,9 @@ pub const UPDATE_SIGNAL: i32 = libc::SIGUSR1;
 pub const UPDATE_SIGNAL: i32 = 0;
 
 /// Makes `kill -USR1 <pid>` mean "install the published build and continue as
-/// it". `idle` reports whether a chat is in flight; when it is, the signal only
-/// notes the request and nothing is installed until the operator sends it again
-/// after the chat ends.
+/// it". `idle` reports whether a chat is in flight; when it is, the request is
+/// queued with [`mark_pending`] and applied by [`run_loop`] as soon as the
+/// engine goes idle, so the operator never has to send the signal twice.
 ///
 /// The returned guard stops the handler when dropped.
 #[cfg(unix)]
@@ -426,7 +460,10 @@ where
     let handler = Arc::new(move || {
         tracing::info!("selfupdate: update requested on signal");
         if !idle() {
-            tracing::info!("selfupdate: a chat is in flight; applying when it ends");
+            mark_pending();
+            tracing::info!(
+                "selfupdate: a chat is in flight; queued and applying as soon as it ends"
+            );
             return;
         }
         let (need, apply) = halves();
@@ -567,6 +604,85 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// Checks the published build every [`CHECK_INTERVAL`] after [`START_GRACE`],
+/// and installs it only while no chat is in flight.
+///
+/// Two things trigger an install:
+///
+/// * a queued request from `kill -USR1` (see [`take_pending`]), which is honoured
+///   on the first tick that finds the engine idle, and
+/// * the scheduled check, which only queues a build it finds when idle and
+///   leaves it queued otherwise, so a chat in progress defers the swap instead
+///   of cancelling it.
+///
+/// The swap itself is an in-place exec: the pid, session, working directory and
+/// open log file all survive, so nothing outside the process has to be restarted.
+pub async fn run_loop<F>(cancel: CancellationToken, idle: F)
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let mut last_err = String::new();
+
+    tokio::select! {
+        _ = cancel.cancelled() => return,
+        _ = tokio::time::sleep(START_GRACE) => {}
+    }
+    loop {
+        if idle() {
+            match need_update().await {
+                Ok((true, release)) => {
+                    tracing::info!(published = %release.updated_at, "selfupdate: installing the build");
+                    // On success this does not return: the new binary takes
+                    // over with this pid.
+                    match apply(release, &target_path()).await {
+                        Ok(()) => note(&mut last_err, None),
+                        Err(err) => {
+                            // Keep the request so the next tick retries it.
+                            mark_pending();
+                            note(&mut last_err, Some(&err));
+                        }
+                    }
+                }
+                Ok((false, _)) => {
+                    // The queued request is satisfied: the running image is
+                    // already the published build.
+                    if take_pending() {
+                        tracing::info!("selfupdate: queued update is already installed");
+                    }
+                    note(&mut last_err, None);
+                }
+                Err(err) => {
+                    mark_pending();
+                    note(&mut last_err, Some(&err));
+                }
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(CHECK_INTERVAL) => {}
+        }
+    }
+}
+
+/// Logs a failed check when the message changes, not on every attempt.
+fn note(last_err: &mut String, err: Option<&Error>) {
+    match err {
+        None => {
+            if !last_err.is_empty() {
+                tracing::info!("selfupdate: the release is reachable again");
+                last_err.clear();
+            }
+        }
+        Some(err) => {
+            let message = err.to_string();
+            if message != *last_err {
+                tracing::warn!(%message, "selfupdate:");
+                *last_err = message;
+            }
+        }
+    }
+}
+
 // --- tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -576,7 +692,6 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::time::Duration;
 
     /// The self-update tests share the process-wide HOME and SIGUSR1 handler,
     /// so they must run one at a time: a guard dropped by one test would leave
@@ -822,7 +937,7 @@ mod tests {
     /// A chat in flight must not be cut short by a deploy: the request is noted
     /// and left for the next tick, so nothing is installed while the turn runs.
     #[test]
-    fn update_signal_waits_for_an_idle_engine() {
+    fn update_signal_queues_while_busy_and_never_applies_immediately() {
         let _serial = serial();
         let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = applied.clone();
@@ -848,18 +963,38 @@ mod tests {
             }));
         });
 
+        // Clear any request left behind by an earlier test before starting.
+        take_pending();
+
         let _guard = notify_update(|| false);
         UpdateSignalGuard::raise().unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             !applied.load(std::sync::atomic::Ordering::SeqCst),
-            "a busy engine must not apply an update"
+            "a busy engine must not apply an update immediately"
+        );
+        assert!(
+            is_pending(),
+            "the request must be remembered so it applies after the chat ends"
         );
 
         with_halves(|need, apply| {
             *need = None;
             *apply = None;
         });
+        take_pending();
+    }
+
+    /// A queued request is consumed exactly once, so the loop applies it once.
+    #[test]
+    fn pending_request_is_taken_once() {
+        let _serial = serial();
+        take_pending();
+        assert!(!take_pending(), "nothing queued means nothing taken");
+        mark_pending();
+        assert!(is_pending());
+        assert!(take_pending(), "the first take sees the request");
+        assert!(!take_pending(), "the second take must not repeat it");
     }
 
     /// Nothing published means nothing to do: the signal must not fall through
