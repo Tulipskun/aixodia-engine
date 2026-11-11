@@ -28,10 +28,21 @@ jobs:
           targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 
       - name: Install cross linker (arm64) and BoringSSL build deps
+        # apt is retried because the runner's mirror resolution has been
+        # flaky: a DNS blip on archive.ubuntu.com fails the whole release even
+        # though nothing is wrong with the code being released.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            cmake ninja-build clang libclang-dev
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y \
+                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+                cmake ninja-build clang libclang-dev; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying in 15s" >&2
+            sleep 15
+          done
+          echo "apt failed after 3 attempts" >&2
+          exit 1
 
       - name: Test foreground engine and launcher
         run: |
