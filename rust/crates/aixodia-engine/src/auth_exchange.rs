@@ -273,12 +273,22 @@ pub async fn callback(
     // Deep link back into the app. The code is single-use and useless without
     // the verifier, so exposing it here is the same trade every OAuth native
     // app makes.
+    //
+    // This has to be a link the user taps. Chrome (and every other modern
+    // browser) blocks a scripted location.href to a custom scheme that the user
+    // did not gesture on: the navigation is silently dropped and the browser
+    // stays on this page, which looks exactly like the app never being
+    // returned to. A visible button is the only form that works, and it is what
+    // RFC 8252 asks for anyway — the user sees the hand-off happen.
     let deep_link = format!("aixodia://auth/callback?code={code}");
     let escaped = html_escape(&deep_link);
     let body = format!(
-        "<p>You're signed in. Return to the AIxodia app.</p>\
-         <p><a href=\"{escaped}\">Open AIxodia</a></p>\
-         <script>location.href=\"{escaped}\"</script>"
+        "<p>You're signed in. Tap below to return to AIxodia.</p>\
+         <p><a href=\"{escaped}\" style=\"display:inline-block;margin-top:1rem;padding:.75rem 1.5rem;\
+            border-radius:.6rem;background:#7dd3fc;color:#0b1220;font-weight:600;\
+            text-decoration:none\">Open AIxodia</a></p>\
+         <p style=\"opacity:.6;font-size:.8rem;margin-top:1.5rem\">If nothing happens, \
+            close this tab and open the app again.</p>"
     );
     html_page(StatusCode::OK, "Signed in", &body)
 }
