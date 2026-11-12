@@ -7,6 +7,7 @@
 
 #[allow(dead_code)]
 mod auth_exchange;
+mod auth_gate;
 mod client_auth;
 mod d1log;
 mod devices;

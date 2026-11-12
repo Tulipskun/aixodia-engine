@@ -94,6 +94,10 @@ pub struct ClientAuth {
     allowed_origins: Vec<String>,
     cache: tokio::sync::Mutex<KeyCache>,
     exchange: crate::auth_exchange::Exchange,
+    /// Emails allowed to ask for a token by name (`AUTH_ALLOWED_EMAILS`).
+    allowlist: crate::auth_gate::Allowlist,
+    /// Tokens issued by the email gate, and their confirm/active state.
+    gate: std::sync::Arc<crate::auth_gate::Gate>,
 }
 
 struct KeyCache {
@@ -196,6 +200,12 @@ impl ClientAuth {
                 "ACCESS_TEAM_DOMAIN/ACCESS_APP_AUD unset: Cloudflare Access sign-in is disabled; only the master token works"
             );
         }
+        let allowlist = crate::auth_gate::Allowlist::parse(
+            &resolve_scalar("AUTH_ALLOWED_EMAILS", "auth/allowed_emails", db).await,
+        );
+        if allowlist.is_empty() {
+            tracing::warn!("AUTH_ALLOWED_EMAILS unset: the email gate will refuse every request");
+        }
         Arc::new(Self {
             team_domain,
             app_aud,
@@ -203,7 +213,19 @@ impl ClientAuth {
             allowed_origins,
             cache: tokio::sync::Mutex::new(KeyCache::new()),
             exchange: crate::auth_exchange::Exchange::new(),
+            allowlist,
+            gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
         })
+    }
+
+    /// Emails permitted to ask for a token by name.
+    pub fn allowlist(&self) -> &crate::auth_gate::Allowlist {
+        &self.allowlist
+    }
+
+    /// Tokens issued by the email gate.
+    pub fn gate(&self) -> &std::sync::Arc<crate::auth_gate::Gate> {
+        &self.gate
     }
 
     /// The sign-in exchange state, used by the native-app auth routes.
@@ -227,6 +249,10 @@ impl ClientAuth {
                 "/v1/auth/exchange",
                 post(crate::auth_exchange::exchange_code),
             )
+            .route("/v1/auth/request", post(crate::auth_gate::request))
+            .route("/v1/auth/confirm", get(crate::auth_gate::confirm_page))
+            .route("/v1/auth/confirm", post(crate::auth_gate::confirm))
+            .route("/v1/auth/status", get(crate::auth_gate::status))
             .with_state(self.clone())
     }
 
@@ -384,10 +410,20 @@ fn with_cors(mut response: Response, cors: &HeaderMap) -> Response {
 /// single-use code, and `/v1/auth/callback` is guarded by the Access JWT that
 /// Cloudflare puts on it — requiring a token to reach them would make sign-in
 /// impossible.
+///
+/// `/v1/auth/request` is the email gate's entry point: it has to be reachable
+/// before a token exists. `/v1/auth/confirm` is the page and post that activate
+/// the token, and `/v1/auth/status` takes the token itself as the credential, so
+/// none of them can require the guard.
 fn is_public_auth_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/auth/authorize" | "/v1/auth/callback" | "/v1/auth/exchange"
+        "/v1/auth/authorize"
+            | "/v1/auth/callback"
+            | "/v1/auth/exchange"
+            | "/v1/auth/request"
+            | "/v1/auth/confirm"
+            | "/v1/auth/status"
     )
 }
 
@@ -423,6 +459,19 @@ pub async fn client_guard(
     let master = bearer(request.headers());
     if auth.master_matches(master) {
         return with_cors(next.run(request).await, &cors);
+    }
+
+    // A token from the email gate: usable only once the user pressed Confirm on
+    // the web page. Reported apart from "no credential" so the app can tell
+    // "finish confirming" from "sign in again".
+    if !master.is_empty() {
+        match crate::auth_gate::check_token(&auth, master).await {
+            Ok(_) => return with_cors(next.run(request).await, &cors),
+            Err(crate::auth_gate::Rejection::Unknown) => {}
+            Err(rejection) => {
+                return with_cors(crate::auth_gate::rejection_response(rejection), &cors)
+            }
+        }
     }
 
     let jwt = access_jwt(request.headers());
