@@ -161,15 +161,15 @@ the previous app build; this build's chat and terminal no longer use it.
 ## Development
 
 ```bash
-cd rust
 cargo build --workspace
 cargo test --workspace
 cargo fmt --check
 cargo clippy --workspace --all-targets
-bash ../aixodia_test.sh   # launcher
+bash aixodia_test.sh   # launcher
 ```
 
-The engine is Rust (`rust/`). The `aixodia-engine` binary is built by
+The engine is Rust. Cargo sits at the repository root; the code is under
+`crates/`. The `aixodia-engine` binary is built by
 `.github/workflows/release.yml` and published to the rolling `engine-latest`
 release, which is what `install.sh` downloads.
 
