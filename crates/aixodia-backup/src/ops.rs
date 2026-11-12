@@ -537,8 +537,16 @@ const VOLATILE: &[&str] = &[".aixodia", "logs", "*.log", "*.pid", "*.state"];
 
 /// Where the containers are built. Not under the root, because a backup of `/root`
 /// must not find its own scratch in the tree it is scanning.
+///
+/// The name carries a counter as well as the pid: two backups running in the same
+/// process used to share one directory, so whichever finished first deleted the
+/// scratch the other was still downloading into. The second one then failed to
+/// open its own container and reported the tree as unrestorable — a real bug, not
+/// only a test artefact, since a backup of a second root can overlap the first.
 fn scratch_dir() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("aixodia-shards-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("aixodia-shards-{}-{}", std::process::id(), n));
     fs::create_dir_all(&dir).map_err(|source| Error::Io {
         path: dir.display().to_string(),
         source,
