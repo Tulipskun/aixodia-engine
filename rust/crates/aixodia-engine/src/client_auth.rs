@@ -27,7 +27,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
@@ -88,6 +88,7 @@ pub struct ClientAuth {
     allowed_origins: Vec<String>,
     db: DbClient,
     cache: tokio::sync::Mutex<KeyCache>,
+    exchange: crate::auth_exchange::Exchange,
 }
 
 struct KeyCache {
@@ -197,13 +198,31 @@ impl ClientAuth {
             allowed_origins,
             db: db.clone(),
             cache: tokio::sync::Mutex::new(KeyCache::new()),
+            exchange: crate::auth_exchange::Exchange::new(),
         })
     }
 
-    /// Every route is guarded by `client_guard`; nothing needs a public router.
+    /// The sign-in exchange state, used by the native-app auth routes.
+    pub fn exchange(&self) -> &crate::auth_exchange::Exchange {
+        &self.exchange
+    }
+
+    /// The Access subject this request proves, for the callback handler.
+    pub async fn access_subject(&self, headers: &HeaderMap) -> Option<String> {
+        self.verify_access_jwt(access_jwt(headers)).await
+    }
+
+    /// Every route is guarded by `client_guard`; the sign-in routes opt out
+    /// because the caller has no credential yet (see `is_public_auth_path`).
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/v1/auth/whoami", get(whoami))
+            .route("/v1/auth/authorize", post(crate::auth_exchange::authorize))
+            .route("/v1/auth/callback", get(crate::auth_exchange::callback))
+            .route(
+                "/v1/auth/exchange",
+                post(crate::auth_exchange::exchange_code),
+            )
             .with_state(self.clone())
     }
 
@@ -355,6 +374,19 @@ fn with_cors(mut response: Response, cors: &HeaderMap) -> Response {
     response
 }
 
+/// Sign-in routes the caller must reach *before* holding a credential.
+///
+/// `/v1/auth/authorize` and `/v1/auth/exchange` are guarded by PKCE plus a
+/// single-use code, and `/v1/auth/callback` is guarded by the Access JWT that
+/// Cloudflare puts on it — requiring a token to reach them would make sign-in
+/// impossible.
+fn is_public_auth_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/auth/authorize" | "/v1/auth/callback" | "/v1/auth/exchange"
+    )
+}
+
 /// Rejects any request that carries neither an Access JWT nor the master token.
 ///
 /// Paths are no longer individually opened for sign-in: there is no sign-in
@@ -380,7 +412,7 @@ pub async fn client_guard(
     }
 
     let path = request.uri().path().to_string();
-    if path == "/healthz" {
+    if path == "/healthz" || is_public_auth_path(&path) {
         return with_cors(next.run(request).await, &cors);
     }
 

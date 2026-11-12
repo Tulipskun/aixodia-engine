@@ -6,6 +6,7 @@
 //! stable endpoint through Workers KV.
 
 #[allow(dead_code)]
+mod auth_exchange;
 mod client_auth;
 mod d1log;
 mod devices;

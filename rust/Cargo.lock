@@ -111,6 +111,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "libc",
+ "rand 0.8.8",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
