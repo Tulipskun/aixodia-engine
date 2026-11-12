@@ -462,7 +462,7 @@ mod tests {
             assert_eq!(challenge_for(&verifier), entry.challenge);
             pending.remove(&code);
         }
-        let mut pending = exchange.pending.lock().await;
+        let pending = exchange.pending.lock().await;
         assert!(!pending.contains_key(&code), "a code must not be reusable");
     }
 

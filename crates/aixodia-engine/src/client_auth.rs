@@ -49,6 +49,12 @@ const JWKS_TTL: Duration = Duration::from_secs(600);
 const JWKS_OUTAGE_GRACE: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Access signs with RSA and publishes `kid`s, so keys are cached per `kid`.
+///
+/// `aud`, `iss` and `exp` are checked by `jsonwebtoken` against the validation
+/// built in `verify_access`, which reads them through `serde` rather than through
+/// these fields — so they are deserialised but never read here. Keeping them in
+/// the struct is what makes a malformed claim set fail to decode at all.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct AccessClaims {
     aud: Vec<String>,
@@ -86,7 +92,6 @@ pub struct ClientAuth {
     /// Master token; still accepted as `Authorization: Bearer`.
     cf_token: String,
     allowed_origins: Vec<String>,
-    db: DbClient,
     cache: tokio::sync::Mutex<KeyCache>,
     exchange: crate::auth_exchange::Exchange,
 }
@@ -196,7 +201,6 @@ impl ClientAuth {
             app_aud,
             cf_token,
             allowed_origins,
-            db: db.clone(),
             cache: tokio::sync::Mutex::new(KeyCache::new()),
             exchange: crate::auth_exchange::Exchange::new(),
         })
