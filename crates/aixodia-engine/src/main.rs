@@ -118,6 +118,10 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // issues its own short-lived token and answers CORS preflights itself.
     // ALLOWED_* fall back to Workers KV AIXODIA_CONFIG, so verify the db first.
     let client_auth = client_auth::ClientAuth::from_env(token.clone(), &db).await;
+    // Pulls the Worker's live token set before answering requests, then keeps it
+    // current every minute so a token issued while this process was down still
+    // works (see auth_system.md's sync rules).
+    client_auth.spawn_sync_task();
     let tunnel_token = db
         .config_kv_get("tunnel_token")
         .await?

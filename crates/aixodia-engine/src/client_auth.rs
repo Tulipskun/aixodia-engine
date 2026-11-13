@@ -91,8 +91,13 @@ struct JwksDocument {
 pub struct ClientAuth {
     /// The Access team domain, e.g. `aixodia.cloudflareaccess.com`.
     team_domain: String,
-    /// The Access application audience tag (`aud`) for this hostname.
-    app_aud: String,
+    /// The Access application audience tags (`aud`) this engine accepts.
+    ///
+    /// A browser that signed in to the dashboard holds a token shaped for the
+    /// dashboard app, while the app signs in to the engine's own app; the two
+    /// audiences differ, and rejecting either one turned a valid sign-in into
+    /// `ACCESS_JWT_REJECTED`. Comma-separated so one deployment serves both.
+    app_aud: Vec<String>,
     /// Master token; still accepted as `Authorization: Bearer`.
     cf_token: String,
     allowed_origins: Vec<String>,
@@ -103,6 +108,18 @@ pub struct ClientAuth {
     /// Recently confirmed tokens, so one page load costs one Worker lookup rather
     /// than one per request. Holds only tokens the Worker has just accepted.
     gate_cache: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    /// SHA-256 hashes of the tokens the Worker says are live.
+    ///
+    /// This is the device flow's fast path: the Worker is the only issuer, and it
+    /// pushes `activate`/`revoke` here plus answers a full pull on startup and
+    /// every minute. Holding hashes rather than tokens means a dump of this
+    /// process yields nothing that works anywhere else.
+    active_tokens: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Shared secret for the sync endpoints, so only the Worker can change the set.
+    sync_secret: String,
+    /// False until the first pull succeeds; until then the set is not trusted and
+    /// the Worker is asked per request instead.
+    synced: std::sync::atomic::AtomicBool,
 }
 
 struct KeyCache {
@@ -192,7 +209,13 @@ impl ClientAuth {
             .trim_start_matches("https://")
             .trim_end_matches('/')
             .to_string();
-        let app_aud = resolve_scalar("ACCESS_APP_AUD", "access/app_aud", db).await;
+        let app_aud = resolve_scalar("ACCESS_APP_AUD", "access/app_aud", db)
+            .await
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         let allowed_origins = resolve_allowed(
             "ALLOWED_ORIGINS",
             "client/allowed_origins",
@@ -220,6 +243,9 @@ impl ClientAuth {
             exchange: crate::auth_exchange::Exchange::new(),
             auth_worker,
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
+            sync_secret: resolve_scalar("AUTH_SYNC_SECRET", "auth/sync_secret", db).await,
+            synced: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -359,7 +385,96 @@ impl ClientAuth {
                 "/v1/auth/exchange",
                 post(crate::auth_exchange::exchange_code),
             )
+            .route("/auth/sessions/sync", post(sync_handler))
+            .route("/auth/sessions/active", get(active_handler))
             .with_state(self.clone())
+    }
+
+    // ------------------------------------------------------------ token sync
+
+    /// How many tokens the local set holds, for the sync answer.
+    pub fn active_count(&self) -> usize {
+        self.active_tokens.read().map(|set| set.len()).unwrap_or(0)
+    }
+
+    /// Whether the first full pull has succeeded yet.
+    pub fn is_synced(&self) -> bool {
+        self.synced.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True when the given bearer token is in the locally held set.
+    pub fn token_is_active(&self, token: &str) -> bool {
+        let hash = sha256_hex(token);
+        self.active_tokens.read().map(|set| set.contains(&hash)).unwrap_or(false)
+    }
+
+    /// Replace the local set from the Worker's answer.
+    pub async fn sync_tokens_from_worker(&self) -> bool {
+        let url = format!("{}/auth/sessions/active", self.auth_worker.trim_end_matches('/'));
+        let secret = self.sync_secret.clone();
+        let Ok(response) = reqwest::Client::new()
+            .get(&url)
+            .header("x-auth-sync", &secret)
+            .header(header::ACCEPT, "application/json")
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|err| tracing::warn!("token sync pull failed: {err}"))
+        else {
+            return false
+        };
+        let Ok(payload) = response.json::<serde_json::Value>().await else {
+            tracing::warn!("token sync pull: non-JSON answer");
+            return false
+        };
+        let mut set = std::collections::HashSet::new();
+        if let Some(hashes) = payload.get("hashes").and_then(|v| v.as_array()) {
+            for hash in hashes {
+                if let Some(value) = hash.as_str() {
+                    if is_hex_64(value) {
+                        set.insert(value.to_string());
+                    }
+                }
+            }
+        }
+        *self.active_tokens.write().unwrap_or_else(|err| err.into_inner()) = set;
+        self.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Apply a push from the Worker. Returns true when the secret matched.
+    pub fn apply_sync_push(&self, secret: &str, activate: &[String], revoke: &[String]) -> bool {
+        if secret.is_empty() || secret != self.sync_secret {
+            return false
+        }
+        let mut set = self.active_tokens.write().unwrap_or_else(|err| err.into_inner());
+        for hash in activate {
+            if is_hex_64(hash) {
+                set.insert(hash.clone());
+            }
+        }
+        for hash in revoke {
+            set.remove(hash);
+        }
+        true
+    }
+
+    /// Pull once before serving that first request, then keep pulling so a token
+    /// the push missed (engine was down) arrives within a minute.
+    pub fn spawn_sync_task(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            for attempt in 1.. {
+                if this.sync_tokens_from_worker().await || attempt >= 3 {
+                    break
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                this.sync_tokens_from_worker().await;
+            }
+        });
     }
 
     fn access_enabled(&self) -> bool {
@@ -470,7 +585,7 @@ impl ClientAuth {
         let key = keys.get(&kid)?;
 
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_audience(&[self.app_aud.as_str()]);
+        validation.set_audience(&self.app_aud);
         validation.set_issuer(&[format!("https://{}", self.team_domain)]);
         validation.validate_exp = true;
 
@@ -510,6 +625,74 @@ fn with_cors(mut response: Response, cors: &HeaderMap) -> Response {
     response
 }
 
+/// SHA-256 of a token, hex. The Worker stores and pushes the same form.
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn is_hex_64(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `GET /auth/sessions/active` — the local set, for debugging and for a caller
+/// that wants to know how much the engine currently trusts.
+///
+/// Answers counts, not hashes: the list is the Worker's to publish, and echoing
+/// it here would let any caller probe which tokens exist once they hold the
+/// secret.
+async fn active_handler(State(auth): State<Arc<ClientAuth>>) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({"active": auth.active_count(), "synced": auth.is_synced()})),
+    )
+        .into_response()
+}
+
+/// `POST /auth/sessions/sync` — the Worker pushes activations and revocations.
+///
+/// Guarded by the shared secret rather than by Access: the Worker is a machine
+/// caller with no browser session. Reaching this route requires the secret, so a
+/// wrong or absent value is refused before any state changes.
+async fn sync_handler(
+    State(auth): State<Arc<ClientAuth>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let secret = headers
+        .get("x-auth-sync")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad_json"}))).into_response();
+    };
+    let list = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    if !auth.apply_sync_push(secret, &list("activate"), &list("revoke")) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "forbidden", "code": "BAD_SYNC_SECRET"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "active": auth.active_count()})),
+    )
+        .into_response()
+}
+
 /// Sign-in routes the caller must reach *before* holding a credential.
 ///
 /// `/v1/auth/authorize` and `/v1/auth/exchange` are guarded by PKCE plus a
@@ -524,7 +707,13 @@ fn with_cors(mut response: Response, cors: &HeaderMap) -> Response {
 fn is_public_auth_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/auth/authorize" | "/v1/auth/callback" | "/v1/auth/exchange"
+        "/v1/auth/authorize"
+            | "/v1/auth/callback"
+            | "/v1/auth/exchange"
+            // The Worker is a machine caller with no browser session; the shared
+            // secret is the credential, checked inside the handlers.
+            | "/auth/sessions/sync"
+            | "/auth/sessions/active"
     )
 }
 
@@ -579,6 +768,13 @@ pub async fn client_guard(
 
     let master = bearer(request.headers());
     if auth.master_matches(master) {
+        return with_cors(next.run(request).await, &cors);
+    }
+
+    // A token the Worker has pushed or this process pulled. Checked first because
+    // it costs one hash and a set lookup; a synced set is authoritative for
+    // tokens it contains (revocations arrive by push or the next pull).
+    if !master.is_empty() && auth.token_is_active(master) {
         return with_cors(next.run(request).await, &cors);
     }
 
@@ -690,7 +886,7 @@ mod dashboard_url_tests {
     fn the_first_https_origin_is_the_dashboard() {
         let auth = crate::client_auth::ClientAuth {
             team_domain: String::new(),
-            app_aud: String::new(),
+            app_aud: Vec::new(),
             cf_token: String::new(),
             allowed_origins: vec![
                 // Plain-HTTP origins exist for local development and must not be
@@ -702,6 +898,9 @@ mod dashboard_url_tests {
             exchange: crate::auth_exchange::Exchange::new(),
             auth_worker: String::new(),
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
+            sync_secret: String::new(),
+            synced: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(auth.dashboard_url(), "https://aixodia.dpdns.org");
     }
@@ -711,14 +910,95 @@ mod dashboard_url_tests {
     fn nothing_configured_falls_back_to_the_engine_itself() {
         let auth = crate::client_auth::ClientAuth {
             team_domain: String::new(),
-            app_aud: String::new(),
+            app_aud: Vec::new(),
             cf_token: String::new(),
             allowed_origins: Vec::new(),
             cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
             exchange: crate::auth_exchange::Exchange::new(),
             auth_worker: String::new(),
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
+            sync_secret: String::new(),
+            synced: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(auth.dashboard_url(), "/");
+    }
+}
+
+#[cfg(test)]
+mod token_sync_tests {
+    use super::*;
+
+    fn auth_with(secret: &str) -> Arc<ClientAuth> {
+        Arc::new(crate::client_auth::ClientAuth {
+            team_domain: String::new(),
+            app_aud: Vec::new(),
+            cf_token: String::new(),
+            allowed_origins: Vec::new(),
+            cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
+            exchange: crate::auth_exchange::Exchange::new(),
+            auth_worker: String::new(),
+            gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
+            sync_secret: secret.to_string(),
+            synced: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// A push carrying the right secret activates and revokes exactly the hashes
+    /// it names — and nothing else.
+    #[test]
+    fn a_push_adds_and_removes_only_what_it_names() {
+        let auth = auth_with("s3cret");
+        let first = sha256_hex("token-one");
+        let second = sha256_hex("token-two");
+
+        assert!(auth.apply_sync_push("s3cret", &[first.clone(), second.clone()], &[]));
+        assert_eq!(auth.active_count(), 2);
+        assert!(auth.token_is_active("token-one"));
+        assert!(auth.token_is_active("token-two"));
+
+        assert!(auth.apply_sync_push("s3cret", &[], &[first]));
+        assert_eq!(auth.active_count(), 1);
+        assert!(!auth.token_is_active("token-one"));
+        assert!(auth.token_is_active("token-two"));
+    }
+
+    /// Without the shared secret nothing changes: this endpoint is not the door
+    /// anyone with a network path may open.
+    #[test]
+    fn a_push_with_the_wrong_secret_changes_nothing() {
+        let auth = auth_with("s3cret");
+        let hash = sha256_hex("token-one");
+        assert!(!auth.apply_sync_push("wrong", &[hash], &[]));
+        assert_eq!(auth.active_count(), 0);
+    }
+
+    /// An unconfigured secret must not mean "accept everything".
+    #[test]
+    fn an_empty_secret_never_authenticates() {
+        let auth = auth_with("");
+        let hash = sha256_hex("token-one");
+        assert!(!auth.apply_sync_push("", &[hash], &[]));
+        assert_eq!(auth.active_count(), 0);
+    }
+
+    /// Malformed hashes are dropped rather than stored: the set is compared
+    /// against SHA-256 hex, so anything else would be dead weight or a trap.
+    #[test]
+    fn malformed_hashes_are_ignored() {
+        let auth = auth_with("s3cret");
+        assert!(auth.apply_sync_push("s3cret", &["not-a-hash".to_string(), "ab".repeat(33)], &[]));
+        assert_eq!(auth.active_count(), 0);
+    }
+
+    /// Tokens are held as hashes, so the plaintext never reaches this process's
+    /// memory in the first place.
+    #[test]
+    fn only_the_hash_of_a_token_is_ever_compared() {
+        let auth = auth_with("s3cret");
+        auth.apply_sync_push("s3cret", &[sha256_hex("secret-token")], &[]);
+        assert!(auth.token_is_active("secret-token"));
+        assert!(!auth.token_is_active("another-token"));
     }
 }
