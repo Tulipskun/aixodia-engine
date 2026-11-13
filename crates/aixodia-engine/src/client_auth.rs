@@ -89,7 +89,7 @@ struct JwksDocument {
 
 /// Everything the guard needs, resolved once at startup.
 pub struct ClientAuth {
-    /// The Access team domain, e.g. `purple-queen-b699.cloudflareaccess.com`.
+    /// The Access team domain, e.g. `aixodia.cloudflareaccess.com`.
     team_domain: String,
     /// The Access application audience tag (`aud`) for this hostname.
     app_aud: String,
