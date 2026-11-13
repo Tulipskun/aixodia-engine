@@ -228,6 +228,21 @@ impl ClientAuth {
         &self.gate
     }
 
+    /// The browser address of the console, for redirecting a human who has just
+    /// signed in.
+    ///
+    /// Taken from the first configured allowed origin rather than a constant, so
+    /// that a deployment pointing at a different dashboard does not send people
+    /// to someone else's. Falls back to the engine's own host, which has no page
+    /// but is at least not another site.
+    fn dashboard_url(&self) -> String {
+        self.allowed_origins
+            .iter()
+            .find(|origin| origin.starts_with("https://"))
+            .cloned()
+            .unwrap_or_else(|| "/".to_string())
+    }
+
     /// The sign-in exchange state, used by the native-app auth routes.
     pub fn exchange(&self) -> &crate::auth_exchange::Exchange {
         &self.exchange
@@ -491,7 +506,34 @@ pub async fn client_guard(
 
 /// Reports which credentials the caller presented. Useful when the app has to
 /// tell "the Access session expired" apart from "the engine rejected me".
+///
+/// A browser that lands here was sent by `signIn()` in the dashboard: that
+/// navigates to this guarded URL so Cloudflare Access will run the login, and
+/// Access returns the browser to the path it was asked for. Without the redirect
+/// below the user finishes signing in and is shown this JSON, which looks like
+/// the sign-in failed rather than succeeded.
+///
+/// The two cases are told apart by what the caller asked for: a programmatic
+/// client (the app, fetch) sends no `Accept: text/html` and keeps getting JSON.
 async fn whoami(State(auth): State<Arc<ClientAuth>>, headers: HeaderMap) -> Response {
+    // `Accept` is the only signal available. A browser navigation always prefers
+    // HTML; `fetch` omits it or asks for JSON.
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/html"));
+
+    if wants_html {
+        // Back to the dashboard, which the operator already has open. Chosen over
+        // showing a "you're signed in" page because the next useful thing the
+        // user wants is the console, not an acknowledgement.
+        return (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, auth.dashboard_url())],
+        )
+            .into_response();
+    }
+
     let master = auth.master_matches(bearer(&headers));
     let subject = auth.verify_access_jwt(access_jwt(&headers)).await;
     Json(json!({
@@ -501,4 +543,44 @@ async fn whoami(State(auth): State<Arc<ClientAuth>>, headers: HeaderMap) -> Resp
         "host": auth.team_domain,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod dashboard_url_tests {
+    /// The redirect target is the console, taken from the configured origins.
+    #[test]
+    fn the_first_https_origin_is_the_dashboard() {
+        let auth = crate::client_auth::ClientAuth {
+            team_domain: String::new(),
+            app_aud: String::new(),
+            cf_token: String::new(),
+            allowed_origins: vec![
+                // Plain-HTTP origins exist for local development and must not be
+                // chosen: a redirect there would break a real sign-in.
+                "http://localhost:5173".to_string(),
+                "https://dashboard.aixodia.dpdns.org".to_string(),
+            ],
+            cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
+            exchange: crate::auth_exchange::Exchange::new(),
+            allowlist: crate::auth_gate::Allowlist::default(),
+            gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
+        };
+        assert_eq!(auth.dashboard_url(), "https://dashboard.aixodia.dpdns.org");
+    }
+
+    /// With nothing configured the fallback must not point at another site.
+    #[test]
+    fn nothing_configured_falls_back_to_the_engine_itself() {
+        let auth = crate::client_auth::ClientAuth {
+            team_domain: String::new(),
+            app_aud: String::new(),
+            cf_token: String::new(),
+            allowed_origins: Vec::new(),
+            cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
+            exchange: crate::auth_exchange::Exchange::new(),
+            allowlist: crate::auth_gate::Allowlist::default(),
+            gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
+        };
+        assert_eq!(auth.dashboard_url(), "/");
+    }
 }
