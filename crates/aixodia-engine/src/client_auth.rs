@@ -34,7 +34,11 @@ use serde::Deserialize;
 use serde_json::json;
 
 /// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
-const DEFAULT_ALLOWED_ORIGINS: &str = "https://dashboard.aixodia.dpdns.org,http://localhost:5173";
+///
+/// The console lives at the bare hostname and the engine at `engine.`: they are
+/// separate Cloudflare Apps now, so the engine's own origin is no longer the one
+/// a browser shows the console on.
+const DEFAULT_ALLOWED_ORIGINS: &str = "https://aixodia.dpdns.org,http://localhost:5173";
 
 /// The header Cloudflare Access adds to every request it authorises.
 const ACCESS_JWT_HEADER: &str = "cf-access-jwt-assertion";
@@ -558,14 +562,14 @@ mod dashboard_url_tests {
                 // Plain-HTTP origins exist for local development and must not be
                 // chosen: a redirect there would break a real sign-in.
                 "http://localhost:5173".to_string(),
-                "https://dashboard.aixodia.dpdns.org".to_string(),
+                "https://aixodia.dpdns.org".to_string(),
             ],
             cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
             exchange: crate::auth_exchange::Exchange::new(),
             allowlist: crate::auth_gate::Allowlist::default(),
             gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
         };
-        assert_eq!(auth.dashboard_url(), "https://dashboard.aixodia.dpdns.org");
+        assert_eq!(auth.dashboard_url(), "https://aixodia.dpdns.org");
     }
 
     /// With nothing configured the fallback must not point at another site.
