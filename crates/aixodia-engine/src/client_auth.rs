@@ -278,7 +278,7 @@ impl ClientAuth {
             }
         }
 
-        let url = format!("{}/v1/auth/verify", self.auth_worker.trim_end_matches('/'));
+        let url = format!("{}/auth/verify", self.auth_worker.trim_end_matches('/'));
         let response = match reqwest::Client::new()
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
