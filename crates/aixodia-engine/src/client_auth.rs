@@ -98,13 +98,6 @@ pub struct ClientAuth {
     allowed_origins: Vec<String>,
     cache: tokio::sync::Mutex<KeyCache>,
     exchange: crate::auth_exchange::Exchange,
-    /// Emails allowed to ask for a token by name (`AUTH_ALLOWED_EMAILS`).
-    allowlist: crate::auth_gate::Allowlist,
-    /// Tokens issued by the email gate, and their confirm/active state.
-    ///
-    /// Only used when `auth_worker` is empty. With a Worker configured, the Worker
-    /// is the authority and this map is never consulted.
-    gate: std::sync::Arc<crate::auth_gate::Gate>,
     /// Base URL of the auth Worker, e.g. `https://aixodia-auth.example.workers.dev`.
     auth_worker: String,
     /// Recently confirmed tokens, so one page load costs one Worker lookup rather
@@ -212,11 +205,11 @@ impl ClientAuth {
                 "ACCESS_TEAM_DOMAIN/ACCESS_APP_AUD unset: Cloudflare Access sign-in is disabled; only the master token works"
             );
         }
-        let allowlist = crate::auth_gate::Allowlist::parse(
-            &resolve_scalar("AUTH_ALLOWED_EMAILS", "auth/allowed_emails", db).await,
-        );
-        if allowlist.is_empty() {
-            tracing::warn!("AUTH_ALLOWED_EMAILS unset: the email gate will refuse every request");
+        let auth_worker = resolve_scalar("AUTH_WORKER_URL", "auth/worker_url", db).await;
+        if auth_worker.is_empty() {
+            tracing::warn!(
+                "AUTH_WORKER_URL unset: no token can be verified, so only the master token will work"
+            );
         }
         Arc::new(Self {
             team_domain,
@@ -225,21 +218,9 @@ impl ClientAuth {
             allowed_origins,
             cache: tokio::sync::Mutex::new(KeyCache::new()),
             exchange: crate::auth_exchange::Exchange::new(),
-            allowlist,
-            gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
-            auth_worker: resolve_scalar("AUTH_WORKER_URL", "auth/worker_url", db).await,
+            auth_worker,
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
-    }
-
-    /// Emails permitted to ask for a token by name.
-    pub fn allowlist(&self) -> &crate::auth_gate::Allowlist {
-        &self.allowlist
-    }
-
-    /// Tokens issued by the email gate.
-    pub fn gate(&self) -> &std::sync::Arc<crate::auth_gate::Gate> {
-        &self.gate
     }
 
     /// The browser address of the console, for redirecting a human who has just
@@ -279,14 +260,10 @@ impl ClientAuth {
         use crate::auth_gate::GateVerdict;
 
         if self.auth_worker.is_empty() {
-            // No authority configured: fall back to the in-process gate so a
-            // deployment that has not moved yet still works.
-            return match crate::auth_gate::check_token(self, token).await {
-                Ok(_) => GateVerdict::Active,
-                Err(crate::auth_gate::Rejection::Pending) => GateVerdict::Pending,
-                Err(crate::auth_gate::Rejection::Expired) => GateVerdict::Expired,
-                Err(_) => GateVerdict::Unknown,
-            };
+            // No authority configured means no token can be vouched for. Failing
+            // closed is the only safe reading: the alternative would be accepting a
+            // credential nobody can check.
+            return GateVerdict::Unknown;
         }
 
         // Only a successful lookup is worth caching, and only the fact that the
@@ -364,6 +341,15 @@ impl ClientAuth {
 
     /// Every route is guarded by `client_guard`; the sign-in routes opt out
     /// because the caller has no credential yet (see `is_public_auth_path`).
+    ///
+    /// There is no `/v1/auth/request|confirm|status` here. Issuing and confirming
+    /// tokens is the auth Worker's job, and it serves those from its own origin:
+    /// leaving a second copy in the engine meant sign-in still depended on this
+    /// process being up, which is exactly the dependence that was the problem.
+    ///
+    /// What remains under `/v1/auth/` describes the caller and their engine
+    /// credential — asking for a token by name, and the GitHub-bound exchange for
+    /// the native app — which can only be answered by the process that holds them.
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/v1/auth/whoami", get(whoami))
@@ -373,10 +359,6 @@ impl ClientAuth {
                 "/v1/auth/exchange",
                 post(crate::auth_exchange::exchange_code),
             )
-            .route("/v1/auth/request", post(crate::auth_gate::request))
-            .route("/v1/auth/confirm", get(crate::auth_gate::confirm_page))
-            .route("/v1/auth/confirm", post(crate::auth_gate::confirm))
-            .route("/v1/auth/status", get(crate::auth_gate::status))
             .with_state(self.clone())
     }
 
@@ -542,12 +524,7 @@ fn with_cors(mut response: Response, cors: &HeaderMap) -> Response {
 fn is_public_auth_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/auth/authorize"
-            | "/v1/auth/callback"
-            | "/v1/auth/exchange"
-            | "/v1/auth/request"
-            | "/v1/auth/confirm"
-            | "/v1/auth/status"
+        "/v1/auth/authorize" | "/v1/auth/callback" | "/v1/auth/exchange"
     )
 }
 
@@ -619,13 +596,27 @@ pub async fn client_guard(
             }
             crate::auth_gate::GateVerdict::Pending => {
                 return with_cors(
-                    crate::auth_gate::rejection_response(crate::auth_gate::Rejection::Pending),
+                    (
+                        StatusCode::FORBIDDEN,
+                        axum::Json(serde_json::json!({
+                            "error": "unauthorized",
+                            "code": "pending_confirmation",
+                        })),
+                    )
+                        .into_response(),
                     &cors,
                 )
             }
             crate::auth_gate::GateVerdict::Expired => {
                 return with_cors(
-                    crate::auth_gate::rejection_response(crate::auth_gate::Rejection::Expired),
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({
+                            "error": "unauthorized",
+                            "code": "expired",
+                        })),
+                    )
+                        .into_response(),
                     &cors,
                 )
             }
@@ -709,8 +700,6 @@ mod dashboard_url_tests {
             ],
             cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
             exchange: crate::auth_exchange::Exchange::new(),
-            allowlist: crate::auth_gate::Allowlist::default(),
-            gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
             auth_worker: String::new(),
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
@@ -727,8 +716,6 @@ mod dashboard_url_tests {
             allowed_origins: Vec::new(),
             cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
             exchange: crate::auth_exchange::Exchange::new(),
-            allowlist: crate::auth_gate::Allowlist::default(),
-            gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
             auth_worker: String::new(),
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
