@@ -81,6 +81,25 @@ struct Session {
     confirmed_by: Option<String>,
 }
 
+/// What the auth Worker says about a token.
+///
+/// Separate from [`Rejection`] because `Unreachable` is not a judgement about the
+/// token at all: the authority could not be asked. Treating it as a rejection
+/// would make a brief Worker outage look like a bad credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateVerdict {
+    /// Confirmed and unexpired.
+    Active,
+    /// Issued, but the user has not pressed Confirm.
+    Pending,
+    /// Ran out of time.
+    Expired,
+    /// The authority has no record of it.
+    Unknown,
+    /// The authority could not be reached.
+    Unreachable,
+}
+
 /// Why a token was refused. The app shows these to the user, so each variant
 /// is distinguishable from the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

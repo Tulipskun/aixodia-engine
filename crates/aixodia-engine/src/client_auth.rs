@@ -101,7 +101,12 @@ pub struct ClientAuth {
     /// Emails allowed to ask for a token by name (`AUTH_ALLOWED_EMAILS`).
     allowlist: crate::auth_gate::Allowlist,
     /// Tokens issued by the email gate, and their confirm/active state.
+    ///
+    /// Only used when `auth_worker` is empty. With a Worker configured, the Worker
+    /// is the authority and this map is never consulted.
     gate: std::sync::Arc<crate::auth_gate::Gate>,
+    /// Base URL of the auth Worker, e.g. `https://aixodia-auth.example.workers.dev`.
+    auth_worker: String,
 }
 
 struct KeyCache {
@@ -219,6 +224,7 @@ impl ClientAuth {
             exchange: crate::auth_exchange::Exchange::new(),
             allowlist,
             gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
+            auth_worker: resolve_scalar("AUTH_WORKER_URL", "auth/worker_url", db).await,
         })
     }
 
@@ -245,6 +251,64 @@ impl ClientAuth {
             .find(|origin| origin.starts_with("https://"))
             .cloned()
             .unwrap_or_else(|| "/".to_string())
+    }
+
+    /// Asks the auth Worker whether a token is usable.
+    ///
+    /// The Worker owns the sessions, so this is the only place that can answer. It
+    /// is deliberately not cached: a session can be revoked between two requests,
+    /// and a cache here would serve a revoked token for as long as the TTL.
+    ///
+    /// An unreachable Worker is reported as `Unreachable`, not as an invalid
+    /// token: sign-in is already handled elsewhere, and telling a caller their
+    /// credential is bad when the authority is simply down would send them to
+    /// sign in again for no reason.
+    pub async fn gate_check(&self, token: &str) -> crate::auth_gate::GateVerdict {
+        use crate::auth_gate::GateVerdict;
+
+        if self.auth_worker.is_empty() {
+            // No authority configured: fall back to the in-process gate so a
+            // deployment that has not moved yet still works.
+            return match crate::auth_gate::check_token(self, token).await {
+                Ok(_) => GateVerdict::Active,
+                Err(crate::auth_gate::Rejection::Pending) => GateVerdict::Pending,
+                Err(crate::auth_gate::Rejection::Expired) => GateVerdict::Expired,
+                Err(_) => GateVerdict::Unknown,
+            };
+        }
+
+        let url = format!("{}/v1/auth/verify", self.auth_worker.trim_end_matches('/'));
+        let response = match reqwest::Client::new()
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("auth worker unreachable: {err}");
+                return GateVerdict::Unreachable;
+            }
+        };
+
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        let code = body
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        match (status.is_success(), code) {
+            (true, _) => GateVerdict::Active,
+            (false, "pending_confirmation") => GateVerdict::Pending,
+            (false, "expired") => GateVerdict::Expired,
+            (false, "unknown_token") => GateVerdict::Unknown,
+            _ => {
+                tracing::warn!("auth worker answered {status} without a usable code");
+                GateVerdict::Unreachable
+            }
+        }
     }
 
     /// The sign-in exchange state, used by the native-app auth routes.
@@ -480,15 +544,33 @@ pub async fn client_guard(
         return with_cors(next.run(request).await, &cors);
     }
 
-    // A token from the email gate: usable only once the user pressed Confirm on
-    // the web page. Reported apart from "no credential" so the app can tell
-    // "finish confirming" from "sign in again".
+    // A token from the email gate. The authority is the auth Worker, not this
+    // process: it holds the sessions and the allowlist, so a session revoked there
+    // is revoked here on the next request, and an engine restart does not
+    // invalidate anyone's sign-in.
+    //
+    // "unknown" is not conclusive — the token might be the master token, which was
+    // already checked above — so it falls through rather than being reported.
     if !master.is_empty() {
-        match crate::auth_gate::check_token(&auth, master).await {
-            Ok(_) => return with_cors(next.run(request).await, &cors),
-            Err(crate::auth_gate::Rejection::Unknown) => {}
-            Err(rejection) => {
-                return with_cors(crate::auth_gate::rejection_response(rejection), &cors)
+        match auth.gate_check(master).await {
+            crate::auth_gate::GateVerdict::Active => {
+                return with_cors(next.run(request).await, &cors)
+            }
+            crate::auth_gate::GateVerdict::Pending => {
+                return with_cors(
+                    crate::auth_gate::rejection_response(crate::auth_gate::Rejection::Pending),
+                    &cors,
+                )
+            }
+            crate::auth_gate::GateVerdict::Expired => {
+                return with_cors(
+                    crate::auth_gate::rejection_response(crate::auth_gate::Rejection::Expired),
+                    &cors,
+                )
+            }
+            // Unknown, or the Worker could not be reached. Either way this token is
+            // not proven and the Access JWT below is the remaining path.
+            crate::auth_gate::GateVerdict::Unknown | crate::auth_gate::GateVerdict::Unreachable => {
             }
         }
     }
@@ -568,6 +650,7 @@ mod dashboard_url_tests {
             exchange: crate::auth_exchange::Exchange::new(),
             allowlist: crate::auth_gate::Allowlist::default(),
             gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
+            auth_worker: String::new(),
         };
         assert_eq!(auth.dashboard_url(), "https://aixodia.dpdns.org");
     }
@@ -584,6 +667,7 @@ mod dashboard_url_tests {
             exchange: crate::auth_exchange::Exchange::new(),
             allowlist: crate::auth_gate::Allowlist::default(),
             gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
+            auth_worker: String::new(),
         };
         assert_eq!(auth.dashboard_url(), "/");
     }
