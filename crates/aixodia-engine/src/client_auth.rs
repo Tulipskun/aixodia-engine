@@ -107,6 +107,9 @@ pub struct ClientAuth {
     gate: std::sync::Arc<crate::auth_gate::Gate>,
     /// Base URL of the auth Worker, e.g. `https://aixodia-auth.example.workers.dev`.
     auth_worker: String,
+    /// Recently confirmed tokens, so one page load costs one Worker lookup rather
+    /// than one per request. Holds only tokens the Worker has just accepted.
+    gate_cache: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
 }
 
 struct KeyCache {
@@ -225,6 +228,7 @@ impl ClientAuth {
             allowlist,
             gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
             auth_worker: resolve_scalar("AUTH_WORKER_URL", "auth/worker_url", db).await,
+            gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -253,16 +257,24 @@ impl ClientAuth {
             .unwrap_or_else(|| "/".to_string())
     }
 
-    /// Asks the auth Worker whether a token is usable.
+    /// Asks the auth Worker whether a token is usable, reusing a recent answer.
     ///
-    /// The Worker owns the sessions, so this is the only place that can answer. It
-    /// is deliberately not cached: a session can be revoked between two requests,
-    /// and a cache here would serve a revoked token for as long as the TTL.
+    /// The Worker owns the sessions, so it is the only thing that can answer. But
+    /// asking on every request would put an internet round trip in front of every
+    /// call — including the polling and long-lived streams a console makes while a
+    /// user is just watching it — and would make the Worker's availability the
+    /// engine's availability, which is the coupling this split exists to remove.
     ///
-    /// An unreachable Worker is reported as `Unreachable`, not as an invalid
-    /// token: sign-in is already handled elsewhere, and telling a caller their
-    /// credential is bad when the authority is simply down would send them to
-    /// sign in again for no reason.
+    /// The answer is cached for [`GATE_CACHE_TTL`], and only while it is `Active`:
+    /// a rejection is never cached, so finishing a confirmation or fixing a
+    /// credential takes effect on the next request rather than after a wait.
+    ///
+    /// The cost is that a revoked session keeps working for up to that TTL. Five
+    /// seconds is chosen for that reason: it is long enough that a burst of
+    /// requests from one page load costs one lookup, and short enough that a
+    /// revoked token cannot be used for anything meaningful. Anything that has to
+    /// act on a revocation immediately has to wait for the session to expire, which
+    /// is the same guarantee every cached credential offers.
     pub async fn gate_check(&self, token: &str) -> crate::auth_gate::GateVerdict {
         use crate::auth_gate::GateVerdict;
 
@@ -275,6 +287,18 @@ impl ClientAuth {
                 Err(crate::auth_gate::Rejection::Expired) => GateVerdict::Expired,
                 Err(_) => GateVerdict::Unknown,
             };
+        }
+
+        // Only a successful lookup is worth caching, and only the fact that the
+        // token is usable — the cache must not become a way to outlive a revocation
+        // beyond the TTL, so the entry is keyed by token and expires on its own.
+        let key = gate_cache_key(token);
+        if let Ok(cache) = self.gate_cache.lock() {
+            if let Some(seen) = cache.get(&key) {
+                if seen.elapsed() < GATE_CACHE_TTL {
+                    return crate::auth_gate::GateVerdict::Active;
+                }
+            }
         }
 
         let url = format!("{}/v1/auth/verify", self.auth_worker.trim_end_matches('/'));
@@ -300,7 +324,24 @@ impl ClientAuth {
             .unwrap_or_default();
 
         match (status.is_success(), code) {
-            (true, _) => GateVerdict::Active,
+            (true, _) => {
+                // Bounded so a stream of one-off tokens cannot grow this map without
+                // limit; clearing is correct here because the entries are only a
+                // performance hint, never a permission.
+                if let Ok(mut cache) = self.gate_cache.lock() {
+                    if cache
+                        .get(&key)
+                        .is_some_and(|seen| seen.elapsed() >= GATE_CACHE_TTL)
+                    {
+                        cache.remove(&key);
+                    }
+                    if cache.len() >= GATE_CACHE_CAPACITY {
+                        cache.clear();
+                    }
+                    cache.insert(key, std::time::Instant::now());
+                }
+                GateVerdict::Active
+            }
             (false, "pending_confirmation") => GateVerdict::Pending,
             (false, "expired") => GateVerdict::Expired,
             (false, "unknown_token") => GateVerdict::Unknown,
@@ -512,6 +553,26 @@ fn is_public_auth_path(path: &str) -> bool {
 
 /// Rejects any request that carries neither an Access JWT nor the master token.
 ///
+/// How long a Worker verdict is reused.
+///
+/// Short on purpose: the trade is Worker load against how long a revoked session
+/// keeps working, and five seconds is long enough to collapse the requests a single
+/// page load makes and short enough that a revocation is not meaningfully delayed.
+const GATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Cap on cached tokens, so a client offering many distinct tokens cannot grow the
+/// map without limit.
+const GATE_CACHE_CAPACITY: usize = 512;
+
+/// A token is a secret, so it is hashed before being used as a key: the map must
+/// not become a place where live tokens can be read.
+fn gate_cache_key(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Paths are no longer individually opened for sign-in: there is no sign-in
 /// route left in the engine, so only `/healthz` stays public (it has to, or
 /// Cloudflare and local probes could not reach it).
@@ -651,6 +712,7 @@ mod dashboard_url_tests {
             allowlist: crate::auth_gate::Allowlist::default(),
             gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
             auth_worker: String::new(),
+            gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         assert_eq!(auth.dashboard_url(), "https://aixodia.dpdns.org");
     }
@@ -668,6 +730,7 @@ mod dashboard_url_tests {
             allowlist: crate::auth_gate::Allowlist::default(),
             gate: std::sync::Arc::new(crate::auth_gate::Gate::new()),
             auth_worker: String::new(),
+            gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         assert_eq!(auth.dashboard_url(), "/");
     }
