@@ -410,7 +410,6 @@ fn is_application_config_env(key: &std::ffi::OsStr) -> bool {
                 | "AUTH_ALLOWED_EMAILS"
                 | "CF_API_TOKEN"
                 | "CLOUDFLARE_API_TOKEN"
-                | "DISPLAY"
                 | "GITHUB_CLIENT_ID"
                 | "GITHUB_CLIENT_SECRET"
                 | "GITHUB_REDIRECT_URI"
@@ -741,14 +740,13 @@ mod tests {
             "HF_TOKEN",
             "RUST_LOG",
             "TUNNEL_TOKEN",
-            "DISPLAY",
         ] {
             assert!(
                 is_application_config_env(std::ffi::OsStr::new(key)),
                 "{key} must not survive an in-place Engine update"
             );
         }
-        for key in ["CF_TOKEN", "HOME", "PATH", "LANG", "XAUTHORITY"] {
+        for key in ["CF_TOKEN", "HOME", "PATH", "LANG", "DISPLAY", "XAUTHORITY"] {
             assert!(
                 !is_application_config_env(std::ffi::OsStr::new(key)),
                 "{key} is a credential or OS setting and must be preserved"
