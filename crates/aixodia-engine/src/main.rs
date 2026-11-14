@@ -103,12 +103,14 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         // print "CF_TOKEN is invalid", which sent operators to the wrong place.
         anyhow::bail!("CF_TOKEN could not be verified: {reason}");
     }
-    // GitHub bearer verification for the relay API surface. The allowlist comes
-    // from ALLOWED_GITHUB_USERS; unset or empty fails closed — every bearer is
-    // rejected and the static-token comparison is gone.
-    let github_auth = std::sync::Arc::new(aixodia_io::GitHubAuth::new(
-        &std::env::var("ALLOWED_GITHUB_USERS").unwrap_or_default(),
-    ));
+    // GitHub bearer allowlist is operator configuration in AIXODIA_CONFIG.
+    // Missing/empty fails closed; KV read errors abort startup rather than silently
+    // turning a configuration failure into an authorization failure.
+    let github_users = db
+        .config_kv_get("github/allowed_users")
+        .await?
+        .unwrap_or_default();
+    let github_auth = std::sync::Arc::new(aixodia_io::GitHubAuth::new(&github_users));
     if let Err(err) = db.verify_kv().await {
         tracing::warn!("provider kv: {err}");
     }
@@ -117,7 +119,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // Browser clients no longer go through the dashboard Worker: the engine
     // issues its own short-lived token and answers CORS preflights itself.
     // ALLOWED_* fall back to Workers KV AIXODIA_CONFIG, so verify the db first.
-    let client_auth = client_auth::ClientAuth::from_env(token.clone(), &db).await;
+    let client_auth = client_auth::ClientAuth::from_kv(token.clone(), &db).await?;
     // Pulls the Worker's live token set before answering requests, then keeps it
     // current every minute so a token issued while this process was down still
     // works (see auth_system.md's sync rules).
@@ -221,7 +223,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .merge(terminal.router())
         .merge(aixodia_relay::router(relay_cfg))
         .merge(client_auth.router())
-        .merge(devices::Devices::new(db.clone()).router())
+        .merge(devices::Devices::new(db.clone()).await?.router())
         .route(
             "/ws",
             get(move |request: axum::extract::Request| {
