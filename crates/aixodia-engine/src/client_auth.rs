@@ -32,7 +32,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::json;
 
-/// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
+/// Safe built-in browser origins used only when the optional KV key is absent.
 ///
 /// The console lives at the bare hostname and the engine at `engine.`: they are
 /// separate Cloudflare Apps now, so the engine's own origin is no longer the one
