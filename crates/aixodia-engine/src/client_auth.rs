@@ -790,6 +790,16 @@ pub async fn client_guard(
         return with_cors(next.run(request).await, &cors);
     }
 
+    // A terminal socket carries a single-use ticket instead of a bearer: the
+    // browser-shaped clients cannot set a header on a WebSocket, so the engine
+    // mints a short-lived ticket over an authenticated POST and the dial carries
+    // it in the query. Only the terminal handler can consume one — this layer has
+    // no ticket store — so it is let through and the handler refuses a bad or
+    // spent ticket itself.
+    if path == "/terminal" && request.uri().query().is_some_and(|q| q.contains("ticket=")) {
+        return with_cors(next.run(request).await, &cors);
+    }
+
     let master = bearer(request.headers());
     if auth.master_matches(master) {
         return with_cors(next.run(vouched(request)).await, &cors);
@@ -1043,6 +1053,21 @@ mod vouched_header_tests {
             .unwrap();
         request.headers_mut().remove(VERIFIED_HEADER);
         assert!(request.headers().get(VERIFIED_HEADER).is_none());
+    }
+
+    /// A terminal dial carries its credential in the query, not a header, so the
+    /// guard must not refuse it: the terminal handler consumes the ticket and
+    /// answers 401 for a bad one.
+    #[test]
+    fn a_socket_dial_with_a_ticket_is_let_through() {
+        let allowed = |uri: &str| {
+            uri.starts_with("/terminal") && uri.contains("ticket=")
+        };
+        assert!(allowed("/terminal?ticket=abc"));
+        assert!(allowed("/terminal?ticket=abc&id=t-1&cols=80&rows=24"));
+        // Without a ticket the guard still decides, so a bare dial is not opened.
+        assert!(!allowed("/terminal"));
+        assert!(!allowed("/terminal?cols=80"));
     }
 
     /// The stamp must match what the downstream handlers actually read.
