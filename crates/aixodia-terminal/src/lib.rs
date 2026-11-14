@@ -693,9 +693,9 @@ impl Server {
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/terminal", get(websocket))
-            .route("/v1/terminals/ticket", post(ticket))
-            .route("/v1/terminals", get(list))
-            .route("/v1/terminals/:id", delete(close))
+            .route("/api/terminals/ticket", post(ticket))
+            .route("/api/terminals", get(list))
+            .route("/api/terminals/:id", delete(close))
             .with_state(self.clone())
     }
 

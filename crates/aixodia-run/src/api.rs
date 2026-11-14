@@ -1,4 +1,4 @@
-//! The run API: `POST /v1/runs`, `GET /v1/runs/{id}`, its event stream and
+//! The run API: `POST /api/runs`, `GET /api/runs/{id}`, its event stream and
 //! cancellation.
 //!
 //! Port of the Go `run/api.go`.
@@ -22,10 +22,10 @@ use crate::manager::{sort_events, Manager};
 
 pub fn router(manager: Arc<Manager>) -> Router {
     Router::new()
-        .route("/v1/runs", post(handle_create))
-        .route("/v1/runs/:id", get(handle_get))
-        .route("/v1/runs/:id/events", get(handle_events))
-        .route("/v1/runs/:id/cancel", post(handle_cancel))
+        .route("/api/runs", post(handle_create))
+        .route("/api/runs/:id", get(handle_get))
+        .route("/api/runs/:id/events", get(handle_events))
+        .route("/api/runs/:id/cancel", post(handle_cancel))
         .with_state(manager)
 }
 
@@ -268,7 +268,7 @@ mod tests {
         let app = router(manager.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/runs")
+            .uri("/api/runs")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"session_id":"s1","message":"hi"}"#))
             .expect("request");
@@ -288,7 +288,7 @@ mod tests {
         }
 
         let request = Request::builder()
-            .uri(format!("/v1/runs/{id}/events?after=0&poll=1"))
+            .uri(format!("/api/runs/{id}/events?after=0&poll=1"))
             .body(Body::empty())
             .expect("request");
         let response =
@@ -317,7 +317,7 @@ mod tests {
         let app = router(manager.clone());
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/runs")
+            .uri("/api/runs")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"session_id":"s1","message":"hi"}"#))
             .expect("request");
@@ -339,7 +339,7 @@ mod tests {
         }
 
         let request = Request::builder()
-            .uri(format!("/v1/runs/{id}"))
+            .uri(format!("/api/runs/{id}"))
             .body(Body::empty())
             .expect("request");
         let response = app.oneshot(request).await.expect("response");

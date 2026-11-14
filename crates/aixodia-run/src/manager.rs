@@ -2,7 +2,7 @@
 //!
 //! Port of the Go `run/manager.go`. The chat handler is injected as
 //! [`ChatExecutor`] instead of being called over HTTP: the run still shares
-//! routing, history and persistence with `POST /v1/chat/completions`, because
+//! routing, history and persistence with `POST /api/chat/completions`, because
 //! the gateway's executor is the same code.
 
 use std::collections::HashMap;
@@ -412,7 +412,7 @@ impl Manager {
     }
 
     /// Stops a live run. The worker records the terminal status once the chat
-    /// handler returns, so callers can poll `GET /v1/runs/{id}`.
+    /// handler returns, so callers can poll `GET /api/runs/{id}`.
     pub async fn cancel(&self, id: &str) -> Result<Run> {
         if let Some(run) = self.lookup(id) {
             run.cancel.cancel();

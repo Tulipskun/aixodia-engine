@@ -102,9 +102,9 @@ impl Devices {
 
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/v1/devices", get(list_devices))
-            .route("/v1/devices/:id/tools", get(device_tools))
-            .route("/v1/devices/:id/action", post(device_action))
+            .route("/api/devices", get(list_devices))
+            .route("/api/devices/:id/tools", get(device_tools))
+            .route("/api/devices/:id/action", post(device_action))
             .with_state(self.clone())
     }
 

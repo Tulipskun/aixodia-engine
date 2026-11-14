@@ -90,7 +90,22 @@ impl Error {
 /// Whether the handshake carries the engine token. An empty configured token
 /// never matches, so an engine started without `CF_TOKEN` cannot end up serving
 /// everyone who knocks.
+/// The header the engine's auth middleware sets once it has accepted the
+/// caller's credential.
+///
+/// Handlers below the middleware still ask `bearer_ok` themselves, and those
+/// checks only knew about the master token — so a perfectly good Worker-issued
+/// token was refused by the terminal, relay and mobile routes even though the
+/// middleware had just let it through. The middleware stamps this header after
+/// it verifies, so an accepted token is accepted everywhere.
+pub const VERIFIED_HEADER: &str = "x-aixodia-verified";
+
 pub fn bearer_ok(headers: &HeaderMap, token: &str) -> bool {
+    // Already vouched for upstream (the engine's auth middleware). That check
+    // knows the Worker's token set; this one only knows the master token.
+    if headers.get(VERIFIED_HEADER).is_some() {
+        return true;
+    }
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())

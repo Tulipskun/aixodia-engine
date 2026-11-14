@@ -296,6 +296,8 @@ fn write_fake(content: &str, tool_calls: &[&str], finish: &str) -> String {
 /// (a tool call, then the answer) once the tool result comes back.
 async fn fake_upstream() -> String {
     let app = Router::new().fallback(|request: Request<Body>| async move {
+        // This fake stands in for OpenAI, so it keeps OpenAI's path: only the
+        // engine's own surface moved to /api.
         if request.uri().path() != "/v1/chat/completions" {
             return (StatusCode::NOT_FOUND, "").into_response();
         }
@@ -421,7 +423,7 @@ async fn chat_completion_runs_a_tool_and_returns_the_answer() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"model":"mock/test-model","messages":[{"role":"user","content":"what time is it"}]}"#,
     )
     .await;
@@ -440,7 +442,7 @@ async fn chat_completion_streams() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"model":"mock/test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
     )
     .await;
@@ -466,13 +468,13 @@ async fn the_stream_pushes_only_rows_the_store_has() {
     let (gateway, _upstream) = new_test_gateway(store.clone()).await;
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
     let (_, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
     )
     .await;
@@ -604,7 +606,7 @@ async fn a_store_that_takes_its_time_does_not_hold_the_answer() {
     ));
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
@@ -612,7 +614,7 @@ async fn a_store_that_takes_its_time_does_not_hold_the_answer() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
     )
     .await;
@@ -729,13 +731,13 @@ async fn the_stream_pushes_cache_usage_and_actual_reasoning() {
     ));
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"model":"mock/test-model"}"#,
     )
     .await;
     let (_, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
     )
     .await;
@@ -810,13 +812,13 @@ async fn the_stream_reports_running_usage_each_round() {
     ));
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
     let (_, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","model":"mock/test-model","messages":[{"role":"user","content":"กี่โมง"}],"stream":true}"#,
     )
     .await;
@@ -850,7 +852,7 @@ async fn retry_stream_includes_the_recorded_user_without_reading_history_twice()
     let (gateway, _upstream) = new_test_gateway(store.clone()).await;
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"model":"mock/test-model"}"#,
     )
     .await;
@@ -861,7 +863,7 @@ async fn retry_stream_includes_the_recorded_user_without_reading_history_twice()
 
     let (_, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","append":true,"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
     )
     .await;
@@ -881,7 +883,7 @@ async fn a_retry_resumes_the_stored_turn_without_appending_a_user() {
     let (gateway, _upstream) = new_test_gateway(store.clone()).await;
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"model":"mock/test-model"}"#,
     )
     .await;
@@ -892,7 +894,7 @@ async fn a_retry_resumes_the_stored_turn_without_appending_a_user() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","retry":true,"stream":true}"#,
     )
     .await;
@@ -959,7 +961,7 @@ async fn a_retry_rejects_a_finished_turn() {
     let (gateway, _upstream) = new_test_gateway(store.clone()).await;
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"model":"mock/test-model"}"#,
     )
     .await;
@@ -979,7 +981,7 @@ async fn a_retry_rejects_a_finished_turn() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","retry":true,"stream":true}"#,
     )
     .await;
@@ -1166,7 +1168,7 @@ async fn chat_rejects_an_unknown_model() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"model":"nope","messages":[{"role":"user","content":"hi"}]}"#,
     )
     .await;
@@ -1185,7 +1187,7 @@ async fn creating_a_session_keeps_the_client_draft_id_and_is_idempotent() {
 
     let (first_status, first_body) = post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"id":"s-draft-42","title":"New chat"}"#,
     )
     .await;
@@ -1195,7 +1197,7 @@ async fn creating_a_session_keeps_the_client_draft_id_and_is_idempotent() {
 
     let (second_status, second_body) = post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"id":"s-draft-42","title":"Different"}"#,
     )
     .await;
@@ -1210,7 +1212,7 @@ async fn creating_a_session_keeps_the_client_draft_id_and_is_idempotent() {
 
     let (bad_status, _) = post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"id":"../outside","title":"bad"}"#,
     )
     .await;
@@ -1225,7 +1227,7 @@ async fn chatting_in_a_session_persists_the_turns() {
 
     let (created_status, created_body) = post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
@@ -1233,7 +1235,7 @@ async fn chatting_in_a_session_persists_the_turns() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","messages":[{"role":"user","content":"hello"}]}"#,
     )
     .await;
@@ -1345,14 +1347,14 @@ async fn tool_steps_replay_on_the_next_turn() {
     let (gateway, _upstream) = new_test_gateway(store.clone()).await;
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
 
     post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","messages":[{"role":"user","content":"hello"}]}"#,
     )
     .await;
@@ -1360,7 +1362,7 @@ async fn tool_steps_replay_on_the_next_turn() {
     // the tool steps.
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"done"},{"role":"user","content":"again"}]}"#,
     )
     .await;
@@ -1669,7 +1671,7 @@ async fn the_tool_round_limit_still_gives_an_answer() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"model":"mock/test-model","messages":[{"role":"user","content":"what time"}]}"#,
     )
     .await;
@@ -1688,7 +1690,7 @@ async fn rejects_an_invalid_utf8_body() {
     bad.extend_from_slice(&[0xe0, 0xb8]); // a truncated Thai character
     bad.extend_from_slice(br#""}]}"#);
 
-    let (status, _) = send(&gateway.router(), Method::POST, "/v1/chat/completions", bad).await;
+    let (status, _) = send(&gateway.router(), Method::POST, "/api/chat/completions", bad).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1700,7 +1702,7 @@ async fn rejects_an_oversized_request_body() {
     let (status, reply) = send(
         &gateway.router(),
         Method::POST,
-        "/v1/chat/completions",
+        "/api/chat/completions",
         body,
     )
     .await;
@@ -2032,14 +2034,14 @@ async fn tool_steps_survive_a_failed_turn() {
 
         let (created, body) = post_json(
             &gateway.router(),
-            "/v1/sessions",
+            "/api/sessions",
             r#"{"title":"t","model":"mock/test-model"}"#,
         )
         .await;
         assert_eq!(created, StatusCode::CREATED, "body = {body}");
         post_json(
             &gateway.router(),
-            "/v1/chat/completions",
+            "/api/chat/completions",
             &format!(
                 r#"{{"session_id":"s1","stream":{stream},"messages":[{{"role":"user","content":"what time"}}]}}"#
             ),
@@ -2101,7 +2103,7 @@ async fn out_of_rounds_keeps_going_and_ends_with_a_result() {
 
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"model":"mock/test-model","messages":[{"role":"user","content":"งานยาว"}]}"#,
     )
     .await;
@@ -2169,19 +2171,19 @@ async fn reasoning_is_stored_and_replayed_on_the_next_turn() {
 
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
     post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","append":true,"messages":[{"role":"user","content":"ข้อความแรก"}]}"#,
     )
     .await;
     post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","append":true,"messages":[{"role":"user","content":"ข้อความที่สอง"}]}"#,
     )
     .await;
@@ -2228,20 +2230,20 @@ async fn session_turns_honour_before_and_limit() {
             .unwrap_or_default()
     };
 
-    let (status, body) = get_json(&router, "/v1/sessions/s1/turns?limit=60").await;
+    let (status, body) = get_json(&router, "/api/sessions/s1/turns?limit=60").await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     let newest = page(&body);
     assert_eq!(newest.len(), 60);
     assert_eq!(newest[0].seq, 191);
     assert_eq!(newest[59].seq, 250);
 
-    let (_, body) = get_json(&router, "/v1/sessions/s1/turns?before_seq=191&limit=60").await;
+    let (_, body) = get_json(&router, "/api/sessions/s1/turns?before_seq=191&limit=60").await;
     let older = page(&body);
     assert_eq!(older.len(), 60);
     assert_eq!(older[0].seq, 131);
     assert_eq!(older[59].seq, 190);
 
-    let (_, body) = get_json(&router, "/v1/sessions/s1/turns").await;
+    let (_, body) = get_json(&router, "/api/sessions/s1/turns").await;
     assert_eq!(
         page(&body).len(),
         250,
@@ -2270,7 +2272,7 @@ async fn the_token_guard_rejects_bearers_that_do_not_verify() {
     ] {
         let mut request = Request::builder()
             .method(Method::GET)
-            .uri("/v1/sessions")
+            .uri("/api/sessions")
             .body(Body::empty())
             .expect("request");
         if !header_value.is_empty() {
@@ -2330,13 +2332,13 @@ async fn the_cache_read_from_usage_details_reaches_the_stored_turn() {
 
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
     let (status, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","messages":[{"role":"user","content":"hi"}]}"#,
     )
     .await;
@@ -2386,14 +2388,14 @@ async fn the_request_rounds_and_blocks_ride_the_stream() {
     ));
     post_json(
         &gateway.router(),
-        "/v1/sessions",
+        "/api/sessions",
         r#"{"title":"t","model":"mock/test-model"}"#,
     )
     .await;
 
     let (_, body) = post_json(
         &gateway.router(),
-        "/v1/chat/completions",
+        "/api/chat/completions",
         r#"{"session_id":"s1","model":"mock/test-model","messages":[{"role":"user","content":"กี่โมง"}],"stream":true}"#,
     )
     .await;
@@ -2480,6 +2482,7 @@ async fn a_keyless_turn_retries_after_a_throttle_answer() {
     let app = Router::new().fallback(move |request: Request<Body>| {
         let seen = seen.clone();
         async move {
+            // Fake upstreams stand in for OpenAI, whose path did not move.
             if request.uri().path() != "/v1/chat/completions" {
                 return (StatusCode::NOT_FOUND, "").into_response();
             }
@@ -2521,7 +2524,7 @@ async fn a_keyless_turn_retries_after_a_throttle_answer() {
     });
     let started = Instant::now();
     let (status, body) =
-        post_json(&gateway.router(), "/v1/chat/completions", &body.to_string()).await;
+        post_json(&gateway.router(), "/api/chat/completions", &body.to_string()).await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     assert!(body.contains("after wait"), "body = {body}");
     assert_eq!(*hits.lock().unwrap(), 2);
@@ -2548,7 +2551,7 @@ async fn a_new_session_without_a_route_uses_the_saved_main() {
         .unwrap();
     *gateway.state.write().unwrap() = Some(state);
 
-    let (status, body) = post_json(&gateway.router(), "/v1/sessions", r#"{"title":"new"}"#).await;
+    let (status, body) = post_json(&gateway.router(), "/api/sessions", r#"{"title":"new"}"#).await;
     assert_eq!(status, StatusCode::CREATED, "body = {body}");
     let session: Value = serde_json::from_str(&body).expect("session json");
     let id = session["id"].as_str().expect("session id").to_string();
@@ -2558,7 +2561,7 @@ async fn a_new_session_without_a_route_uses_the_saved_main() {
         "messages": [{"role": "user", "content": "hi"}],
     });
     let (status, body) =
-        post_json(&gateway.router(), "/v1/chat/completions", &body.to_string()).await;
+        post_json(&gateway.router(), "/api/chat/completions", &body.to_string()).await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     assert!(body.contains("done"), "body = {body}");
 }
@@ -2601,7 +2604,7 @@ async fn the_objectives_endpoint_splits_goals_from_plans() {
     ));
     gateway.set_objective_store(store);
 
-    let (status, body) = get_json(&gateway.router(), "/v1/sessions/s1/objectives").await;
+    let (status, body) = get_json(&gateway.router(), "/api/sessions/s1/objectives").await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     let v: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(
@@ -2620,7 +2623,7 @@ async fn the_objectives_endpoint_splits_goals_from_plans() {
     // A chat nothing was ever recorded for answers with empty lists, and a
     // daemon with no store at all answers the same way — never an error the
     // app would have to tell apart from "no goals yet".
-    let (status, body) = get_json(&gateway.router(), "/v1/sessions/other/objectives").await;
+    let (status, body) = get_json(&gateway.router(), "/api/sessions/other/objectives").await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     let v: Value = serde_json::from_str(&body).expect("json");
     assert!(

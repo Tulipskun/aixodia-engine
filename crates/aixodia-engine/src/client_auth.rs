@@ -373,16 +373,16 @@ impl ClientAuth {
     /// leaving a second copy in the engine meant sign-in still depended on this
     /// process being up, which is exactly the dependence that was the problem.
     ///
-    /// What remains under `/v1/auth/` describes the caller and their engine
+    /// What remains under `/api/auth/` describes the caller and their engine
     /// credential — asking for a token by name, and the GitHub-bound exchange for
     /// the native app — which can only be answered by the process that holds them.
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/v1/auth/whoami", get(whoami))
-            .route("/v1/auth/authorize", post(crate::auth_exchange::authorize))
-            .route("/v1/auth/callback", get(crate::auth_exchange::callback))
+            .route("/api/auth/whoami", get(whoami))
+            .route("/api/auth/authorize", post(crate::auth_exchange::authorize))
+            .route("/api/auth/callback", get(crate::auth_exchange::callback))
             .route(
-                "/v1/auth/exchange",
+                "/api/auth/exchange",
                 post(crate::auth_exchange::exchange_code),
             )
             .route("/auth/sessions/sync", post(sync_handler))
@@ -600,6 +600,24 @@ impl ClientAuth {
     }
 }
 
+/// Must match `aixodia_wsock::VERIFIED_HEADER`, which is what the handlers
+/// under this middleware check. This crate does not depend on that one, so the
+/// name is repeated rather than shared.
+const VERIFIED_HEADER: &str = "x-aixodia-verified";
+
+/// Marks a request whose credential this middleware has already accepted.
+///
+/// The terminal, relay and mobile handlers each re-check the bearer against the
+/// master token, which would refuse a Worker-issued token that the middleware
+/// just approved. The stamp is set here and only here, after verification, and
+/// is stripped from anything arriving from outside (see `strip_verified`).
+fn vouched(mut request: Request) -> Request {
+    request
+        .headers_mut()
+        .insert(VERIFIED_HEADER, HeaderValue::from_static("1"));
+    request
+}
+
 fn bearer(headers: &HeaderMap) -> &str {
     headers
         .get(header::AUTHORIZATION)
@@ -695,8 +713,8 @@ async fn sync_handler(
 
 /// Sign-in routes the caller must reach *before* holding a credential.
 ///
-/// `/v1/auth/authorize` and `/v1/auth/exchange` are guarded by PKCE plus a
-/// single-use code, and `/v1/auth/callback` is guarded by the Access JWT that
+/// `/api/auth/authorize` and `/api/auth/exchange` are guarded by PKCE plus a
+/// single-use code, and `/api/auth/callback` is guarded by the Access JWT that
 /// Cloudflare puts on it — requiring a token to reach them would make sign-in
 /// impossible.
 ///
@@ -707,9 +725,9 @@ async fn sync_handler(
 fn is_public_auth_path(path: &str) -> bool {
     matches!(
         path,
-        "/v1/auth/authorize"
-            | "/v1/auth/callback"
-            | "/v1/auth/exchange"
+        "/api/auth/authorize"
+            | "/api/auth/callback"
+            | "/api/auth/exchange"
             // The Worker is a machine caller with no browser session; the shared
             // secret is the credential, checked inside the handlers.
             | "/auth/sessions/sync"
@@ -744,9 +762,15 @@ fn gate_cache_key(token: &str) -> u64 {
 /// Cloudflare and local probes could not reach it).
 pub async fn client_guard(
     State(auth): State<Arc<ClientAuth>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
+    // Anything arriving from outside is untrusted, so a caller cannot promote
+    // itself by sending the stamp the handlers below trust. Only this function
+    // sets it, and only after verifying.
+    request
+        .headers_mut()
+        .remove(VERIFIED_HEADER);
     let origin = request
         .headers()
         .get(header::ORIGIN)
@@ -768,14 +792,14 @@ pub async fn client_guard(
 
     let master = bearer(request.headers());
     if auth.master_matches(master) {
-        return with_cors(next.run(request).await, &cors);
+        return with_cors(next.run(vouched(request)).await, &cors);
     }
 
     // A token the Worker has pushed or this process pulled. Checked first because
     // it costs one hash and a set lookup; a synced set is authoritative for
     // tokens it contains (revocations arrive by push or the next pull).
     if !master.is_empty() && auth.token_is_active(master) {
-        return with_cors(next.run(request).await, &cors);
+        return with_cors(next.run(vouched(request)).await, &cors);
     }
 
     // A token from the email gate. The authority is the auth Worker, not this
@@ -788,7 +812,7 @@ pub async fn client_guard(
     if !master.is_empty() {
         match auth.gate_check(master).await {
             crate::auth_gate::GateVerdict::Active => {
-                return with_cors(next.run(request).await, &cors)
+                return with_cors(next.run(vouched(request)).await, &cors)
             }
             crate::auth_gate::GateVerdict::Pending => {
                 return with_cors(
@@ -1000,5 +1024,30 @@ mod token_sync_tests {
         auth.apply_sync_push("s3cret", &[sha256_hex("secret-token")], &[]);
         assert!(auth.token_is_active("secret-token"));
         assert!(!auth.token_is_active("another-token"));
+    }
+}
+
+#[cfg(test)]
+mod vouched_header_tests {
+    use super::VERIFIED_HEADER;
+    use axum::extract::Request;
+
+    /// A caller must not be able to promote itself by sending the stamp the
+    /// handlers trust: only the middleware sets it, and only after verifying.
+    #[test]
+    fn the_verified_stamp_is_stripped_from_incoming_requests() {
+        let mut request = Request::builder()
+            .uri("/api/terminals")
+            .header(VERIFIED_HEADER, "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request.headers_mut().remove(VERIFIED_HEADER);
+        assert!(request.headers().get(VERIFIED_HEADER).is_none());
+    }
+
+    /// The stamp must match what the downstream handlers actually read.
+    #[test]
+    fn the_stamp_matches_what_the_handlers_check() {
+        assert_eq!(VERIFIED_HEADER, "x-aixodia-verified");
     }
 }

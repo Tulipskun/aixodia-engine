@@ -376,18 +376,26 @@ impl Gateway {
         Router::new()
             .route("/healthz", get(healthz))
             .route("/restart", post(crate::restart::api_restart))
-            .route("/v1/providers", get(list_providers))
-            .route("/v1/models", get(crate::models::list_models))
-            .route("/v1/sessions", post(create_session).get(list_sessions))
+            // These four were the /v1 surface: an OpenAI-shaped view of the same
+            // data the console renders. /v1 is gone, so they live under
+            // /api/catalog to stay distinct from the console handlers merged in
+            // below (which own /api/providers and /api/sessions/:id).
+            .route("/api/catalog/providers", get(list_providers))
+            // The OpenAI-shaped catalog used to sit at /v1/models, beside the
+            // console's own /api/models. With /v1 gone they need different names:
+            // this one is the upstream passthrough, the other is what the
+            // settings screen renders.
+            .route("/api/models/catalog", get(crate::models::list_models))
+            .route("/api/sessions", post(create_session).get(list_sessions))
             .route(
-                "/v1/sessions/:id",
+                "/api/catalog/sessions/:id",
                 get(get_session)
                     .delete(delete_session)
                     .patch(update_session),
             )
-            .route("/v1/sessions/:id/turns", get(get_session_turns))
-            .route("/v1/sessions/:id/objectives", get(get_session_objectives))
-            .route("/v1/chat/completions", post(crate::chat::chat))
+            .route("/api/sessions/:id/turns", get(get_session_turns))
+            .route("/api/sessions/:id/objectives", get(get_session_objectives))
+            .route("/api/chat/completions", post(crate::chat::chat))
             .merge(self.register_api())
             // The gateway checks the request size itself, with the same
             // message Go's handler produces; axum's default 2 MiB limit would
@@ -422,7 +430,7 @@ impl Gateway {
                 get(crate::api::api_get_settings).put(crate::api::api_put_settings),
             )
             .route(
-                "/v1/attachments",
+                "/api/attachments",
                 post(crate::upload::api_upload_attachment),
             )
             .route("/api/logs", get(crate::api::api_logs))
