@@ -120,7 +120,10 @@ unsafe impl Send for Screen {}
 /// to a path that works.
 static X_FAILED: AtomicBool = AtomicBool::new(false);
 
-unsafe extern "C" fn note_error(_display: *mut xlib::Display, event: *mut xlib::XErrorEvent) -> i32 {
+unsafe extern "C" fn note_error(
+    _display: *mut xlib::Display,
+    event: *mut xlib::XErrorEvent,
+) -> i32 {
     X_FAILED.store(true, Ordering::SeqCst);
     let code = (*event).error_code;
     let minor = (*event).minor_code;
@@ -150,7 +153,9 @@ impl Screen {
             // XOpenDisplay keeps the string only for the duration of the call.
             let display = unsafe { xlib::XOpenDisplay(owned.as_ptr()) };
             if display.is_null() {
-                return Err(ScreenError::Open(format!("{display_name} did not accept the connection")));
+                return Err(ScreenError::Open(format!(
+                    "{display_name} did not accept the connection"
+                )));
             }
             return Self::from_display(display, width, height);
         };
@@ -163,7 +168,11 @@ impl Screen {
         Self::from_display(display, width, height)
     }
 
-    fn from_display(display: *mut xlib::Display, width: u32, height: u32) -> Result<Self, ScreenError> {
+    fn from_display(
+        display: *mut xlib::Display,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, ScreenError> {
         let screen = unsafe { xlib::XDefaultScreen(display) };
         let root = unsafe { xlib::XRootWindow(display, screen) };
         let depth = unsafe { xlib::XDefaultDepth(display, screen) } as u32;
@@ -171,11 +180,22 @@ impl Screen {
         // A root window smaller than the size asked for is not a failure: the
         // frame is simply smaller, and the client scales it up.
         let (screen_width, screen_height) = Self::root_size(display, root);
-        let width = if width == 0 { screen_width } else { width.min(screen_width) };
-        let height = if height == 0 { screen_height } else { height.min(screen_height) };
+        let width = if width == 0 {
+            screen_width
+        } else {
+            width.min(screen_width)
+        };
+        let height = if height == 0 {
+            screen_height
+        } else {
+            height.min(screen_height)
+        };
 
-        let (shm, image, using_shm) = Self::attach_shm(display, depth, width, height)
-            .or_else(|_| Self::attach_plain(display, depth, width, height).map(|i| (ptr::null_mut(), i, false)))?;
+        let (shm, image, using_shm) =
+            Self::attach_shm(display, depth, width, height).or_else(|_| {
+                Self::attach_plain(display, depth, width, height)
+                    .map(|i| (ptr::null_mut(), i, false))
+            })?;
 
         Ok(Self {
             display,
@@ -224,7 +244,9 @@ impl Screen {
         };
         if image.is_null() {
             unsafe { libc_shmdt(shm.data) };
-            return Err(ScreenError::Shm("XShmCreateImage returned nothing".to_string()));
+            return Err(ScreenError::Shm(
+                "XShmCreateImage returned nothing".to_string(),
+            ));
         }
 
         unsafe {
@@ -258,14 +280,31 @@ impl Screen {
         height: u32,
     ) -> Result<*mut xlib::XImage, ScreenError> {
         let visual = unsafe { xlib::XDefaultVisual(display, xlib::XDefaultScreen(display)) };
-        let image = unsafe { xlib::XCreateImage(display, visual, depth, xlib::ZPixmap, 0, ptr::null_mut(), width, height, 32, 0) };
+        let image = unsafe {
+            xlib::XCreateImage(
+                display,
+                visual,
+                depth,
+                xlib::ZPixmap,
+                0,
+                ptr::null_mut(),
+                width,
+                height,
+                32,
+                0,
+            )
+        };
         if image.is_null() {
-            return Err(ScreenError::Shm("XCreateImage returned nothing".to_string()));
+            return Err(ScreenError::Shm(
+                "XCreateImage returned nothing".to_string(),
+            ));
         }
         let bytes = (height as usize) * unsafe { (*image).bytes_per_line } as usize;
         let buffer = unsafe { libc_malloc(bytes) };
         if buffer.is_null() {
-            unsafe { xlib::XDestroyImage(image); }
+            unsafe {
+                xlib::XDestroyImage(image);
+            }
             return Err(ScreenError::Shm("no memory for a frame buffer".to_string()));
         }
         unsafe { (*image).data = buffer as *mut _ };
@@ -308,7 +347,16 @@ impl Screen {
             return Err(ScreenError::Gone);
         }
         let ok = if self.using_shm {
-            unsafe { xshm::XShmGetImage(self.display, self.window, self.image, 0, 0, xlib::XAllPlanes() as u32) }
+            unsafe {
+                xshm::XShmGetImage(
+                    self.display,
+                    self.window,
+                    self.image,
+                    0,
+                    0,
+                    xlib::XAllPlanes() as u32,
+                )
+            }
         } else {
             unsafe {
                 let image = xlib::XGetImage(
@@ -500,7 +548,9 @@ impl Screen {
         // reverse order, so a chord reads exactly as it would on the machine.
         let mut held = Vec::new();
         for modifier in mods {
-            let Ok(cname) = std::ffi::CString::new(modifier.as_str()) else { continue };
+            let Ok(cname) = std::ffi::CString::new(modifier.as_str()) else {
+                continue;
+            };
             let sym = unsafe { xlib::XStringToKeysym(cname.as_ptr()) };
             if sym == 0 {
                 continue;
@@ -537,7 +587,9 @@ impl Drop for Screen {
                 if !self.shm.is_null() {
                     let data = unsafe { (*self.shm).shmaddr };
                     if !data.is_null() {
-                        unsafe { libc_shmdt(data as *mut c_void); }
+                        unsafe {
+                            libc_shmdt(data as *mut c_void);
+                        }
                     }
                     unsafe { libc_free(self.shm as *mut c_void) };
                 }
@@ -559,9 +611,12 @@ struct SharedSegment {
 /// `shmget` + `shmat`, declared here so the crate does not need a libc binding
 /// for four calls.
 unsafe fn libc_shmat(size: usize) -> Result<SharedSegment, ScreenError> {
-    let info = libc_malloc(std::mem::size_of::<xshm::XShmSegmentInfo>()) as *mut xshm::XShmSegmentInfo;
+    let info =
+        libc_malloc(std::mem::size_of::<xshm::XShmSegmentInfo>()) as *mut xshm::XShmSegmentInfo;
     if info.is_null() {
-        return Err(ScreenError::Shm("no memory for the segment record".to_string()));
+        return Err(ScreenError::Shm(
+            "no memory for the segment record".to_string(),
+        ));
     }
     let id = shmget(0, size, IPC_PRIVATE | IPC_CREAT | 0o600);
     if id < 0 {
@@ -656,7 +711,10 @@ impl Input {
         unsafe {
             xlib::XSetErrorHandler(Some(note_error));
         }
-        Ok(Self { display, clipboard: None })
+        Ok(Self {
+            display,
+            clipboard: None,
+        })
     }
 
     /// Where the pointer is, in screen pixels.
@@ -708,7 +766,6 @@ impl Input {
     }
 }
 
-
 impl Input {
     /// Moves the pointer to an absolute position on the root window.
     pub fn move_pointer(&self, x: i32, y: i32) {
@@ -747,7 +804,9 @@ impl Input {
         if self.display.is_null() {
             return;
         }
-        let Ok(name) = std::ffi::CString::new(keysym_name) else { return };
+        let Ok(name) = std::ffi::CString::new(keysym_name) else {
+            return;
+        };
         let keysym = unsafe { xlib::XStringToKeysym(name.as_ptr()) };
         if keysym == 0 {
             return;
@@ -760,7 +819,9 @@ impl Input {
         // on the machine itself.
         let mut held = Vec::new();
         for modifier in mods {
-            let Ok(cname) = std::ffi::CString::new(modifier.as_str()) else { continue };
+            let Ok(cname) = std::ffi::CString::new(modifier.as_str()) else {
+                continue;
+            };
             let sym = unsafe { xlib::XStringToKeysym(cname.as_ptr()) };
             if sym == 0 {
                 continue;
@@ -863,7 +924,10 @@ impl ClipboardServer {
         // before there is anything to paste.
         let (lock, condvar) = &*ready;
         let started = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = condvar.wait_timeout_while(started, std::time::Duration::from_millis(500), |ready| !*ready);
+        let _ =
+            condvar.wait_timeout_while(started, std::time::Duration::from_millis(500), |ready| {
+                !*ready
+            });
 
         Some(Self {
             shared,
@@ -907,10 +971,25 @@ fn serve_selection(
 
     // A small window to own the selection against: the owner must be a window,
     // and it need never be mapped.
-    let window = unsafe { xlib::XCreateSimpleWindow(display, xlib::XDefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0) };
-    let clipboard = unsafe { xlib::XInternAtom(display, b"CLIPBOARD\0".as_ptr() as *const i8, xlib::False) };
-    let utf8 = unsafe { xlib::XInternAtom(display, b"UTF8_STRING\0".as_ptr() as *const i8, xlib::False) };
-    let targets = unsafe { xlib::XInternAtom(display, b"TARGETS\0".as_ptr() as *const i8, xlib::False) };
+    let window = unsafe {
+        xlib::XCreateSimpleWindow(
+            display,
+            xlib::XDefaultRootWindow(display),
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+        )
+    };
+    let clipboard =
+        unsafe { xlib::XInternAtom(display, b"CLIPBOARD\0".as_ptr() as *const i8, xlib::False) };
+    let utf8 =
+        unsafe { xlib::XInternAtom(display, b"UTF8_STRING\0".as_ptr() as *const i8, xlib::False) };
+    let targets =
+        unsafe { xlib::XInternAtom(display, b"TARGETS\0".as_ptr() as *const i8, xlib::False) };
 
     unsafe {
         xlib::XSetSelectionOwner(display, clipboard, window, xlib::CurrentTime);
@@ -941,7 +1020,10 @@ fn serve_selection(
         let request = unsafe { event.selection_request };
         let text = {
             let (lock, _) = &*shared;
-            lock.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+            lock.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_default()
         };
 
         let mut reply: xlib::XSelectionEvent = unsafe { std::mem::zeroed() };
@@ -985,7 +1067,13 @@ fn serve_selection(
             reply.property = request.property;
         }
         unsafe {
-            xlib::XSendEvent(display, request.requestor, 0, 0, &mut reply as *mut _ as *mut xlib::XEvent);
+            xlib::XSendEvent(
+                display,
+                request.requestor,
+                0,
+                0,
+                &mut reply as *mut _ as *mut xlib::XEvent,
+            );
             xlib::XFlush(display);
         }
     }

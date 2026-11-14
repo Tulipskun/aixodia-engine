@@ -170,7 +170,12 @@ async fn resolve_allowed(
 /// All runtime configuration is read from Workers KV `AIXODIA_CONFIG`.
 /// KV API errors are fatal; they must never be mistaken for missing keys.
 async fn resolve_scalar(kv_key: &str, db: &DbClient) -> anyhow::Result<String> {
-    Ok(db.config_kv_get(kv_key).await?.unwrap_or_default().trim().to_string())
+    Ok(db
+        .config_kv_get(kv_key)
+        .await?
+        .unwrap_or_default()
+        .trim()
+        .to_string())
 }
 
 impl ClientAuth {
@@ -190,12 +195,8 @@ impl ClientAuth {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let allowed_origins = resolve_allowed(
-            "client/allowed_origins",
-            db,
-            Some(DEFAULT_ALLOWED_ORIGINS),
-        )
-        .await?;
+        let allowed_origins =
+            resolve_allowed("client/allowed_origins", db, Some(DEFAULT_ALLOWED_ORIGINS)).await?;
         if team_domain.is_empty() || app_aud.is_empty() {
             tracing::warn!(
                 "Workers KV keys access/team_domain or access/app_aud are missing: Cloudflare Access sign-in is disabled; only the master token works"
@@ -378,12 +379,18 @@ impl ClientAuth {
     /// True when the given bearer token is in the locally held set.
     pub fn token_is_active(&self, token: &str) -> bool {
         let hash = sha256_hex(token);
-        self.active_tokens.read().map(|set| set.contains(&hash)).unwrap_or(false)
+        self.active_tokens
+            .read()
+            .map(|set| set.contains(&hash))
+            .unwrap_or(false)
     }
 
     /// Replace the local set from the Worker's answer.
     pub async fn sync_tokens_from_worker(&self) -> bool {
-        let url = format!("{}/auth/sessions/active", self.auth_worker.trim_end_matches('/'));
+        let url = format!(
+            "{}/auth/sessions/active",
+            self.auth_worker.trim_end_matches('/')
+        );
         let secret = self.sync_secret.clone();
         let Ok(response) = reqwest::Client::new()
             .get(&url)
@@ -394,11 +401,11 @@ impl ClientAuth {
             .await
             .map_err(|err| tracing::warn!("token sync pull failed: {err}"))
         else {
-            return false
+            return false;
         };
         let Ok(payload) = response.json::<serde_json::Value>().await else {
             tracing::warn!("token sync pull: non-JSON answer");
-            return false
+            return false;
         };
         let mut set = std::collections::HashSet::new();
         if let Some(hashes) = payload.get("hashes").and_then(|v| v.as_array()) {
@@ -410,17 +417,24 @@ impl ClientAuth {
                 }
             }
         }
-        *self.active_tokens.write().unwrap_or_else(|err| err.into_inner()) = set;
-        self.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .active_tokens
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = set;
+        self.synced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
     /// Apply a push from the Worker. Returns true when the secret matched.
     pub fn apply_sync_push(&self, secret: &str, activate: &[String], revoke: &[String]) -> bool {
         if secret.is_empty() || secret != self.sync_secret {
-            return false
+            return false;
         }
-        let mut set = self.active_tokens.write().unwrap_or_else(|err| err.into_inner());
+        let mut set = self
+            .active_tokens
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
         for hash in activate {
             if is_hex_64(hash) {
                 set.insert(hash.clone());
@@ -439,7 +453,7 @@ impl ClientAuth {
         tokio::spawn(async move {
             for attempt in 1.. {
                 if this.sync_tokens_from_worker().await || attempt >= 3 {
-                    break
+                    break;
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -741,9 +755,7 @@ pub async fn client_guard(
     // Anything arriving from outside is untrusted, so a caller cannot promote
     // itself by sending the stamp the handlers below trust. Only this function
     // sets it, and only after verifying.
-    request
-        .headers_mut()
-        .remove(VERIFIED_HEADER);
+    request.headers_mut().remove(VERIFIED_HEADER);
     let origin = request
         .headers()
         .get(header::ORIGIN)
@@ -1035,9 +1047,7 @@ mod vouched_header_tests {
     /// answers 401 for a bad one.
     #[test]
     fn a_socket_dial_with_a_ticket_is_let_through() {
-        let allowed = |uri: &str| {
-            uri.starts_with("/terminal") && uri.contains("ticket=")
-        };
+        let allowed = |uri: &str| uri.starts_with("/terminal") && uri.contains("ticket=");
         assert!(allowed("/terminal?ticket=abc"));
         assert!(allowed("/terminal?ticket=abc&id=t-1&cols=80&rows=24"));
         // Without a ticket the guard still decides, so a bare dial is not opened.

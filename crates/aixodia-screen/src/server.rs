@@ -186,11 +186,22 @@ struct Hello {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
     /// Pointer moved to an absolute position on the captured screen.
-    Move { x: i32, y: i32 },
+    Move {
+        x: i32,
+        y: i32,
+    },
     /// Button pressed at a position, in one message: a tap is a move and a
     /// press with no gap for the machine to see the pointer jump.
-    Down { x: i32, y: i32, button: String },
-    Up { x: i32, y: i32, button: String },
+    Down {
+        x: i32,
+        y: i32,
+        button: String,
+    },
+    Up {
+        x: i32,
+        y: i32,
+        button: String,
+    },
     /// A drag, in one step: press, move, release in that order.
     Drag {
         from_x: i32,
@@ -205,7 +216,11 @@ enum ClientMessage {
         duration_ms: u64,
     },
     /// One wheel notch; positive scrolls down.
-    Wheel { x: i32, y: i32, delta: i32 },
+    Wheel {
+        x: i32,
+        y: i32,
+        delta: i32,
+    },
     /// A key, by X keysym name, with modifiers held around it.
     Key {
         keysym: String,
@@ -234,7 +249,9 @@ enum ClientMessage {
     /// Characters the machine's layout cannot produce — Thai, emoji, anything
     /// outside its keyboard — are typed by borrowing an unused keycode rather
     /// than silently dropped, which is what pressing keys by name would do.
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Asks for a frame that stands on its own.
     ///
     /// A client only needs this when it has lost its decoder's state — after a
@@ -314,7 +331,11 @@ impl ScreenHub {
 
     /// The grid the tiles sit on, as the encoder is using it now.
     fn tile(&self) -> u32 {
-        self.settings.lock().unwrap_or_else(|e| e.into_inner()).encode.tile
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .encode
+            .tile
     }
 
     /// Applies a client's request, keeping what it did not mention.
@@ -481,9 +502,7 @@ impl ScreenHub {
         buffer.extend_from_slice(&(header.len() as u32).to_le_bytes());
         buffer.extend_from_slice(&header);
         buffer.extend_from_slice(&payload);
-        let _ = self
-            .frames
-            .send(Arc::new(Message::Binary(buffer.into())));
+        let _ = self.frames.send(Arc::new(Message::Binary(buffer.into())));
         Ok(1)
     }
 
@@ -496,16 +515,17 @@ impl ScreenHub {
         previous: &mut [u8],
     ) -> Result<usize, String> {
         let settings = self.settings_now();
-        let updates = encoder::diff_and_encode(frame, width, height, previous, force_all, settings.encode);
+        let updates =
+            encoder::diff_and_encode(frame, width, height, previous, force_all, settings.encode);
         if updates.is_empty() {
             return Ok(0);
         }
         // One message per frame: a header, the tile count, then each tile's
         // geometry and JPEG. Lengths are fixed-width so the client can walk the
         // buffer without a parser.
-        let _ = self
-            .frames
-            .send(Arc::new(Message::Binary(self.pack(width, height, &updates).into())));
+        let _ = self.frames.send(Arc::new(Message::Binary(
+            self.pack(width, height, &updates).into(),
+        )));
         Ok(updates.len())
     }
 
@@ -568,7 +588,8 @@ impl ScreenHub {
         // way. Without this the arrow lands somewhere the pointer never was on
         // any display that is not exactly the capture size.
         let cursor = self.cursor_in(width, height);
-        let mut buffer = Vec::with_capacity(64 + updates.iter().map(|t| t.jpeg.len() + 16).sum::<usize>());
+        let mut buffer =
+            Vec::with_capacity(64 + updates.iter().map(|t| t.jpeg.len() + 16).sum::<usize>());
         let header = serde_json::to_vec(&FrameHeader {
             kind: "frame",
             width,
@@ -618,8 +639,16 @@ impl ScreenHub {
             return;
         }
         let settings = self.settings_now();
-        let scale_x = if settings.width == 0 { 1.0 } else { captured_w as f64 / settings.width as f64 };
-        let scale_y = if settings.height == 0 { 1.0 } else { captured_h as f64 / settings.height as f64 };
+        let scale_x = if settings.width == 0 {
+            1.0
+        } else {
+            captured_w as f64 / settings.width as f64
+        };
+        let scale_y = if settings.height == 0 {
+            1.0
+        } else {
+            captured_h as f64 / settings.height as f64
+        };
         let to_x = |x: i32| (x as f64 * scale_x).round() as i32;
         let to_y = |y: i32| (y as f64 * scale_y).round() as i32;
 
@@ -681,7 +710,11 @@ impl ScreenHub {
             }
             ClientMessage::Wheel { x, y, delta } => {
                 input.move_pointer(to_x(x), to_y(y));
-                let button = if delta > 0 { Button::WheelDown } else { Button::WheelUp };
+                let button = if delta > 0 {
+                    Button::WheelDown
+                } else {
+                    Button::WheelUp
+                };
                 for _ in 0..delta.unsigned_abs().min(10) {
                     input.button(button, true);
                     input.button(button, false);
@@ -768,7 +801,11 @@ async fn info(State(hub): State<Arc<ScreenHub>>) -> axum::Json<Info> {
     }
 }
 
-async fn socket(ws: WebSocketUpgrade, State(hub): State<Arc<ScreenHub>>, request: axum::extract::Request) -> Response {
+async fn socket(
+    ws: WebSocketUpgrade,
+    State(hub): State<Arc<ScreenHub>>,
+    request: axum::extract::Request,
+) -> Response {
     // Either a bearer (a browser or the CLI) or the single-use ticket the app
     // fetched a moment ago. The middleware in front of this has already let a
     // ticket-bearing dial through, so this is where it is actually spent.
@@ -800,7 +837,9 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
         codec: settings.codec.as_str(),
     };
     if socket
-        .send(Message::Text(serde_json::to_string(&hello).unwrap_or_default().into()))
+        .send(Message::Text(
+            serde_json::to_string(&hello).unwrap_or_default().into(),
+        ))
         .await
         .is_err()
     {
@@ -829,9 +868,8 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
     // keeps it alive for the others when that first connection leaves.
     let before = hub.viewers.fetch_add(1, Ordering::SeqCst);
     let capture_hub = Arc::clone(&hub);
-    let capture = (before == 0).then(|| {
-        tokio::task::spawn_blocking(move || run_capture(capture_hub))
-    });
+    let capture =
+        (before == 0).then(|| tokio::task::spawn_blocking(move || run_capture(capture_hub)));
 
     loop {
         tokio::select! {
@@ -1060,7 +1098,10 @@ mod viewer_lifetime {
 
     #[test]
     fn no_viewers_stops_the_capture() {
-        assert!(!should_capture(0), "an engine nobody watches must not encode");
+        assert!(
+            !should_capture(0),
+            "an engine nobody watches must not encode"
+        );
     }
 
     #[test]
@@ -1195,7 +1236,10 @@ mod text_input {
         // The point of the message: a phone can type what the machine's own
         // keyboard cannot produce, and nothing is lost on the way.
         let thai = "สวัสดี ๑๒๓ 🎉";
-        let message = format!(r#"{{"type":"text","text":{}}}"#, serde_json::to_string(thai).unwrap());
+        let message = format!(
+            r#"{{"type":"text","text":{}}}"#,
+            serde_json::to_string(thai).unwrap()
+        );
         let parsed: ClientMessage = serde_json::from_str(&message).expect("thai text");
         match parsed {
             ClientMessage::Text { text } => assert_eq!(text, thai),
