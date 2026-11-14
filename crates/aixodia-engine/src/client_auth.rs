@@ -204,9 +204,18 @@ impl ClientAuth {
         }
         let auth_worker = resolve_scalar("auth/worker_url", db).await?;
         if auth_worker.is_empty() {
-            tracing::warn!(
-                "Workers KV key auth/worker_url is missing: no user token can be verified; only the master token will work"
+            anyhow::bail!(
+                "required Workers KV key auth/worker_url is missing; set it to the Auth Worker HTTPS base URL"
             );
+        }
+        let auth_worker_url = reqwest::Url::parse(&auth_worker)
+            .map_err(|err| anyhow::anyhow!("Workers KV key auth/worker_url is invalid: {err}"))?;
+        if auth_worker_url.scheme() != "https" || auth_worker_url.host_str().is_none() {
+            anyhow::bail!("Workers KV key auth/worker_url must be an https:// URL");
+        }
+        let sync_secret = resolve_scalar("auth/sync_secret", db).await?;
+        if sync_secret.is_empty() {
+            anyhow::bail!("required Workers KV key auth/sync_secret is missing");
         }
         Ok(Arc::new(Self {
             team_domain,
@@ -218,7 +227,7 @@ impl ClientAuth {
             auth_worker,
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
-            sync_secret: resolve_scalar("auth/sync_secret", db).await?,
+            sync_secret,
             synced: std::sync::atomic::AtomicBool::new(false),
         }))
     }
