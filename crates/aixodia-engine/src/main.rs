@@ -53,11 +53,9 @@ fn main() {
 }
 
 async fn async_main() {
+    // Log verbosity is a built-in default, not an environment configuration.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
         .try_init();
 
     tunnel::set_started_at(now_unix());
