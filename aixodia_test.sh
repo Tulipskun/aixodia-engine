@@ -30,7 +30,11 @@ if [ "$#" -gt 0 ] && [ "$1" = "update" ]; then
 fi
 printf '%s\n' "$$" > "$ENGINE_PID_FILE"
 printf '%s\n' "$PWD" > "$ENGINE_CWD_FILE"
-printf '%s\n' "$AIXODIA_HOME" > "$ENGINE_HOME_FILE"
+printf '%s\n' "$PWD" > "$ENGINE_HOME_FILE"
+printf '%s\n' \
+  "AIXODIA_HOME=${AIXODIA_HOME-unset}" \
+  "AIXODIA_PID_FILE=${AIXODIA_PID_FILE-unset}" \
+  "AIXODIA_LAUNCH_ENGINE=${AIXODIA_LAUNCH_ENGINE-unset}" > "$ENGINE_ENV_FILE"
 echo "engine stdout: redirected"
 echo "engine stderr: redirected" >&2
 exit 37
@@ -46,7 +50,11 @@ make_resident_engine() {
 mkdir -p "$(dirname "$ENGINE_HEALTH_FILE")"
 printf '%s\n' "$$" > "$ENGINE_PID_FILE"
 printf '%s\n' "$PWD" > "$ENGINE_CWD_FILE"
-printf '%s\n' "$AIXODIA_HOME" > "$ENGINE_HOME_FILE"
+printf '%s\n' "$PWD" > "$ENGINE_HOME_FILE"
+printf '%s\n' \
+  "AIXODIA_HOME=${AIXODIA_HOME-unset}" \
+  "AIXODIA_PID_FILE=${AIXODIA_PID_FILE-unset}" \
+  "AIXODIA_LAUNCH_ENGINE=${AIXODIA_LAUNCH_ENGINE-unset}" > "$ENGINE_ENV_FILE"
 printf '{"pid":%s,"status":"ok"}\n' "$$" > "$ENGINE_HEALTH_FILE"
 echo "engine boot: detached"
 trap 'rm -f "$ENGINE_HEALTH_FILE"; echo "engine stopped cleanly" > "$ENGINE_STOP_FILE"; exit 0' TERM
@@ -88,8 +96,8 @@ run_launcher() {
     PATH="$fakebin:$PATH" \
     ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" \
     ENGINE_HEALTH_FILE="$home/hz/healthz" \
-    ENGINE_HOME_FILE="$home/engine-home" ENGINE_STOP_FILE="$home/stopped" \
-    bash "$LAUNCHER" "$@"
+    ENGINE_HOME_FILE="$home/engine-home" ENGINE_ENV_FILE="$home/engine-env" \
+    ENGINE_STOP_FILE="$home/stopped" bash "$LAUNCHER" "$@"
 }
 
 # healthz appends /healthz to the base URL, so the stub publishes under it.
@@ -160,9 +168,16 @@ if wait_for_file "$home/pid"; then
   fi
   if [ "$(cat "$home/cwd" 2>/dev/null || true)" = "$home/state" ] &&
      [ "$(cat "$home/engine-home" 2>/dev/null || true)" = "$home/state" ]; then
-    pass "engine starts inside AIXODIA_HOME"
+    pass "engine starts inside the local state directory"
   else
     fail "engine working directory/state path mismatch (cwd=$(cat "$home/cwd" 2>/dev/null))"
+  fi
+  if grep -qx 'AIXODIA_HOME=unset' "$home/engine-env" &&
+     grep -qx 'AIXODIA_PID_FILE=unset' "$home/engine-env" &&
+     grep -qx 'AIXODIA_LAUNCH_ENGINE=unset' "$home/engine-env"; then
+    pass "launcher-only variables are not inherited by the engine"
+  else
+    fail "launcher-only variables leaked into the engine (env=$(cat "$home/engine-env" 2>/dev/null))"
   fi
   if grep -q "engine boot: detached" "$home/state/engine.log" 2>/dev/null; then
     pass "engine output is redirected to AIXODIA_HOME/engine.log"

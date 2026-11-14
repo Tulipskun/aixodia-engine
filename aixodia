@@ -137,8 +137,15 @@ cmd_start() {
   rotate_log
   echo "aixodia: starting in the background; state $AIXODIA_HOME"
   AIXODIA_PID_FILE="$file" AIXODIA_LAUNCH_ENGINE="$ENGINE_RESOLVED" \
-    setsid bash -c 'printf "%s\n" "$$" > "$AIXODIA_PID_FILE"; cd "$AIXODIA_HOME" || exit 1; exec "$AIXODIA_LAUNCH_ENGINE"' \
-    >> "$(log_path)" 2>&1 < /dev/null &
+    setsid bash -c '
+      pid_file="$AIXODIA_PID_FILE"
+      engine="$AIXODIA_LAUNCH_ENGINE"
+      state_dir="$AIXODIA_HOME"
+      printf "%s\n" "$$" > "$pid_file"
+      cd "$state_dir" || exit 1
+      unset AIXODIA_HOME AIXODIA_PID_FILE AIXODIA_LAUNCH_ENGINE
+      exec "$engine"
+    ' >> "$(log_path)" 2>&1 < /dev/null &
 
   # The child writes the pid file before it execs the engine, so a missing or
   # unrecognised pid here means it is still coming up. Three beats of a pid that
