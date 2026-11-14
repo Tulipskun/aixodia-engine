@@ -221,6 +221,12 @@ enum ClientMessage {
         #[serde(default)]
         codec: Option<String>,
     },
+    /// A string to type, in any language.
+    ///
+    /// Characters the machine's layout cannot produce — Thai, emoji, anything
+    /// outside its keyboard — are typed by borrowing an unused keycode rather
+    /// than silently dropped, which is what pressing keys by name would do.
+    Text { text: String },
     /// Asks for a frame that stands on its own.
     ///
     /// A client only needs this when it has lost its decoder's state — after a
@@ -562,8 +568,9 @@ impl ScreenHub {
             tracing::warn!(%err, "screen input dropped: no display");
             return;
         }
-        let screen = self.screen.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(screen) = screen.as_ref() else { return };
+        // Mutable: typing holds the clipboard, which is state on the screen.
+        let mut screen = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(screen) = screen.as_mut() else { return };
 
         // The client works in the captured coordinate space; the display is
         // whatever size it actually is. One multiply per event is cheaper than
@@ -617,6 +624,13 @@ impl ScreenHub {
                 }
             }
             ClientMessage::Key { keysym, mods } => screen.key(&keysym, &mods),
+            ClientMessage::Text { text } => {
+                // A screen of text is not a keystroke race: the whole string is
+                // typed here, and a failure is logged rather than dropped.
+                if let Err(err) = screen.type_text(&text) {
+                    tracing::warn!(%err, "screen: could not type the text");
+                }
+            }
             // Nothing to do to the display; the loop picks the request up.
             ClientMessage::Settings { .. } | ClientMessage::RequestKeyframe => {}
         }
@@ -1092,5 +1106,45 @@ mod codec_choice {
         // The loop takes the flag; three requests are still one keyframe.
         assert!(hub.keyframe_wanted.swap(false, Ordering::SeqCst));
         assert!(!hub.keyframe_wanted.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod text_input {
+    //! What a client's text message means.
+
+    use super::*;
+
+    #[test]
+    fn a_text_message_arrives_whole() {
+        let parsed: ClientMessage =
+            serde_json::from_str(r#"{"type":"text","text":"hello"}"#).expect("a text message");
+        match parsed {
+            ClientMessage::Text { text } => assert_eq!(text, "hello"),
+            _ => panic!("expected a text message"),
+        }
+    }
+
+    #[test]
+    fn text_in_another_language_is_carried_intact() {
+        // The point of the message: a phone can type what the machine's own
+        // keyboard cannot produce, and nothing is lost on the way.
+        let thai = "สวัสดี ๑๒๓ 🎉";
+        let message = format!(r#"{{"type":"text","text":{}}}"#, serde_json::to_string(thai).unwrap());
+        let parsed: ClientMessage = serde_json::from_str(&message).expect("thai text");
+        match parsed {
+            ClientMessage::Text { text } => assert_eq!(text, thai),
+            _ => panic!("expected a text message"),
+        }
+    }
+
+    #[test]
+    fn an_empty_text_message_is_harmless() {
+        let parsed: ClientMessage =
+            serde_json::from_str(r#"{"type":"text","text":""}"#).expect("empty text");
+        match parsed {
+            ClientMessage::Text { text } => assert!(text.is_empty()),
+            _ => panic!("expected a text message"),
+        }
     }
 }

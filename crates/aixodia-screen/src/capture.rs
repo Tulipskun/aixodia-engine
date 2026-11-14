@@ -15,8 +15,13 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use x11::xlib;
+use x11::xlib::SelectionNotify as SEL_EVENT;
+
+/// The X event code for a selection reply, which the binding does not export by name.
+const SEL_NOTIFY: i32 = SEL_EVENT as i32;
 use x11::xshm;
 use x11::xtest;
 
@@ -95,6 +100,8 @@ pub struct Screen {
     /// is only slower, and a display that refuses XShm is usually one behind a
     /// remote transport anyway.
     using_shm: bool,
+    /// The thread that holds the clipboard, when this display has typed text.
+    clipboard: Option<ClipboardServer>,
 }
 
 // The display pointer is only ever touched from the thread that opened it; the
@@ -179,6 +186,7 @@ impl Screen {
             shm,
             image,
             using_shm,
+            clipboard: None,
         })
     }
 
@@ -389,6 +397,73 @@ impl Screen {
         (found != 0).then_some((root_x, root_y))
     }
 
+    /// Types a string, in whatever language it is written in.
+    ///
+    /// Pressing keys by name only works for characters the machine's keyboard
+    /// already has. X will happily accept a remapped keycode, but the other
+    /// clients read the keyboard once and do not notice the change, so the
+    /// character never arrives — measured, not assumed.
+    ///
+    /// The clipboard has no such problem: it carries text, not keystrokes. This
+    /// takes the CLIPBOARD selection, puts the string on it, and presses the
+    /// paste chord. Plane keys — Enter, Tab — are pressed directly, because
+    /// pasting them would insert a character rather than press a key.
+    pub fn type_text(&mut self, text: &str) -> Result<(), ScreenError> {
+        if self.display.is_null() {
+            return Err(ScreenError::Gone);
+        }
+        let mut plain = String::new();
+        for character in text.chars() {
+            match character {
+                '\n' | '\r' => {
+                    // Whatever is before the newline goes on the clipboard
+                    // first, or the paste and the Enter land out of order.
+                    self.paste(&std::mem::take(&mut plain));
+                    self.key("Return", &[]);
+                }
+                '\t' => {
+                    self.paste(&std::mem::take(&mut plain));
+                    self.key("Tab", &[]);
+                }
+                other => plain.push(other),
+            }
+        }
+        self.paste(&plain);
+        Ok(())
+    }
+
+    /// Puts `text` on the clipboard and pastes it.
+    fn paste(&mut self, text: &str) {
+        if text.is_empty() || self.display.is_null() {
+            return;
+        }
+        self.own_clipboard(text);
+        self.key("v", &[String::from("ctrl")]);
+    }
+
+    /// Becomes the CLIPBOARD owner and answers requests for it.
+    ///
+    /// An X client asks for the clipboard with an event and waits for a reply,
+    /// so the owner has to be present to answer. The engine has no event loop of
+    /// its own to lend, so this opens one connection of its own, takes the
+    /// selection on it, and answers on it — leaving the capture connection free
+    /// for pixels. The connection is kept alive as long as it owns the selection:
+    /// an owner that disconnects takes the clipboard with it, and a paste that
+    /// arrives a moment later would find nothing.
+    fn own_clipboard(&mut self, text: &str) {
+        let display = self.display;
+        unsafe {
+            let _ = xlib::XFlush(display);
+        }
+        // The serving connection is made once and reused; the text it holds is
+        // replaced each time.
+        if self.clipboard.is_none() {
+            self.clipboard = ClipboardServer::start(text);
+        } else if let Some(server) = self.clipboard.as_mut() {
+            server.set(text);
+        }
+    }
+
     /// Presses or releases a button at the current pointer position.
     pub fn button(&self, button: Button, pressed: bool) {
         if self.display.is_null() {
@@ -551,5 +626,172 @@ mod tests {
         X_FAILED.store(true, Ordering::SeqCst);
         assert!(take_error(), "the mark is visible");
         assert!(!take_error(), "and cleared by reading it");
+    }
+}
+
+/// Holds the X clipboard and answers requests for it.
+///
+/// A selection owner must be present to reply: the requesting client sends an
+/// event and waits. That needs a connection with an event loop, which the
+/// capture connection does not have — it is busy reading pixels — so this opens
+/// its own on a thread of its own and leaves it there for as long as the engine
+/// lives. The text is replaced from the outside under a mutex, and a condvar
+/// wakes the loop so a new string is served immediately rather than at the next
+/// poll.
+struct ClipboardServer {
+    shared: Arc<(Mutex<Option<String>>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ClipboardServer {
+    /// Starts a server already holding `text`.
+    fn start(text: &str) -> Option<Self> {
+        let shared = Arc::new((Mutex::new(Some(text.to_string())), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let ready = Arc::new((Mutex::new(false), Condvar::new()));
+        let thread_shared = Arc::clone(&shared);
+        let thread_stop = Arc::clone(&stop);
+        let thread_ready = Arc::clone(&ready);
+
+        let handle = std::thread::Builder::new()
+            .name("aixodia-clipboard".to_string())
+            .spawn(move || serve_selection(thread_shared, thread_stop, thread_ready))
+            .ok()?;
+
+        // Wait for the owner to be established, or the paste would be pressed
+        // before there is anything to paste.
+        let (lock, condvar) = &*ready;
+        let started = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = condvar.wait_timeout_while(started, std::time::Duration::from_millis(500), |ready| !*ready);
+
+        Some(Self {
+            shared,
+            stop,
+            thread: Some(handle),
+        })
+    }
+
+    /// Replaces the text the clipboard serves.
+    fn set(&mut self, text: &str) {
+        let (lock, condvar) = &*self.shared;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.to_string());
+        condvar.notify_all();
+    }
+}
+
+impl Drop for ClipboardServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let (_, condvar) = &*self.shared;
+        condvar.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The selection loop: owns CLIPBOARD and answers requests until told to stop.
+fn serve_selection(
+    shared: Arc<(Mutex<Option<String>>, Condvar)>,
+    stop: Arc<AtomicBool>,
+    ready: Arc<(Mutex<bool>, Condvar)>,
+) {
+    let display = unsafe { xlib::XOpenDisplay(std::ptr::null()) };
+    if display.is_null() {
+        return;
+    }
+    unsafe {
+        xlib::XSetErrorHandler(Some(note_error));
+    }
+
+    // A small window to own the selection against: the owner must be a window,
+    // and it need never be mapped.
+    let window = unsafe { xlib::XCreateSimpleWindow(display, xlib::XDefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0) };
+    let clipboard = unsafe { xlib::XInternAtom(display, b"CLIPBOARD\0".as_ptr() as *const i8, xlib::False) };
+    let utf8 = unsafe { xlib::XInternAtom(display, b"UTF8_STRING\0".as_ptr() as *const i8, xlib::False) };
+    let targets = unsafe { xlib::XInternAtom(display, b"TARGETS\0".as_ptr() as *const i8, xlib::False) };
+
+    unsafe {
+        xlib::XSetSelectionOwner(display, clipboard, window, xlib::CurrentTime);
+        xlib::XFlush(display);
+    }
+    {
+        let (lock, condvar) = &*ready;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        condvar.notify_all();
+    }
+
+    while !stop.load(Ordering::SeqCst) {
+        // Wait for a request, giving up often enough to notice `stop`.
+        let pending = unsafe { xlib::XPending(display) };
+        if pending == 0 {
+            // Nothing to answer. The selection stays held — taking it again on
+            // every pass would fight nobody but would make clients that cache
+            // the owner re-ask on every tick, which is worse than waiting.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+
+        let mut event: xlib::XEvent = unsafe { std::mem::zeroed() };
+        unsafe { xlib::XNextEvent(display, &mut event) };
+        if unsafe { event.type_ } != SEL_NOTIFY {
+            continue;
+        }
+        let request = unsafe { event.selection_request };
+        let text = {
+            let (lock, _) = &*shared;
+            lock.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+        };
+
+        let mut reply: xlib::XSelectionEvent = unsafe { std::mem::zeroed() };
+        reply.type_ = SEL_NOTIFY;
+        reply.display = display;
+        reply.requestor = request.requestor;
+        reply.selection = request.selection;
+        reply.target = request.target;
+        reply.time = request.time;
+
+        if unsafe { request.target } == targets {
+            // A client asking what formats are on offer.
+            let offered = [utf8];
+            unsafe {
+                xlib::XChangeProperty(
+                    display,
+                    request.requestor,
+                    request.property,
+                    xlib::XA_ATOM,
+                    32,
+                    xlib::PropModeReplace,
+                    offered.as_ptr() as *const u8,
+                    1,
+                );
+            }
+            reply.property = request.property;
+        } else if unsafe { request.property } != 0 {
+            let bytes = text.as_bytes();
+            unsafe {
+                xlib::XChangeProperty(
+                    display,
+                    request.requestor,
+                    request.property,
+                    utf8,
+                    8,
+                    xlib::PropModeReplace,
+                    bytes.as_ptr(),
+                    bytes.len() as i32,
+                );
+            }
+            reply.property = request.property;
+        }
+        unsafe {
+            xlib::XSendEvent(display, request.requestor, 0, 0, &mut reply as *mut _ as *mut xlib::XEvent);
+            xlib::XFlush(display);
+        }
+    }
+
+    unsafe {
+        xlib::XCloseDisplay(display);
     }
 }
