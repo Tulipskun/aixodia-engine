@@ -984,12 +984,27 @@ fn serve_selection(
             0,
         )
     };
-    let clipboard =
-        unsafe { xlib::XInternAtom(display, b"CLIPBOARD\0".as_ptr() as *const i8, xlib::False) };
-    let utf8 =
-        unsafe { xlib::XInternAtom(display, b"UTF8_STRING\0".as_ptr() as *const i8, xlib::False) };
-    let targets =
-        unsafe { xlib::XInternAtom(display, b"TARGETS\0".as_ptr() as *const i8, xlib::False) };
+    let clipboard = unsafe {
+        xlib::XInternAtom(
+            display,
+            b"CLIPBOARD\0".as_ptr() as *const std::ffi::c_char,
+            xlib::False,
+        )
+    };
+    let utf8 = unsafe {
+        xlib::XInternAtom(
+            display,
+            b"UTF8_STRING\0".as_ptr() as *const std::ffi::c_char,
+            xlib::False,
+        )
+    };
+    let targets = unsafe {
+        xlib::XInternAtom(
+            display,
+            b"TARGETS\0".as_ptr() as *const std::ffi::c_char,
+            xlib::False,
+        )
+    };
 
     unsafe {
         xlib::XSetSelectionOwner(display, clipboard, window, xlib::CurrentTime);
