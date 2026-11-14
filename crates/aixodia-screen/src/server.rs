@@ -277,11 +277,44 @@ impl ScreenHub {
         if updates.is_empty() {
             return Ok(0);
         }
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as u64;
-
         // One message per frame: a header, the tile count, then each tile's
         // geometry and JPEG. Lengths are fixed-width so the client can walk the
         // buffer without a parser.
+        let _ = self
+            .frames
+            .send(Arc::new(Message::Binary(self.pack(width, height, &updates).into())));
+        Ok(updates.len())
+    }
+
+    /// The whole screen, for a client that has just connected.
+    ///
+    /// The shared stream only carries what changed since the previous frame, so
+    /// a client that joins mid-stream would be handed the differences against a
+    /// picture it never received — which on screen is a half-drawn, or blank,
+    /// display. A newcomer therefore gets one complete frame first, and the
+    /// diffs make sense from there.
+    fn full_frame(&self) -> Result<Message, String> {
+        let (frame, width, height) = {
+            let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+            let screen = guard.as_mut().ok_or("display is not open")?;
+            let captured = screen.frame().map_err(|e| e.to_string())?;
+            (captured.pixels, captured.width, captured.height)
+        };
+        let settings = self.settings_now();
+        let updates = encoder::diff_and_encode(
+            &frame,
+            width,
+            height,
+            &mut vec![0u8; frame.len()],
+            true,
+            settings.encode,
+        );
+        Ok(Message::Binary(self.pack(width, height, &updates).into()))
+    }
+
+    /// Packs tiles into one message: a header, a count, then each tile.
+    fn pack(&self, width: u32, height: u32, updates: &[encoder::TileUpdate]) -> Vec<u8> {
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as u64;
         let mut buffer = Vec::with_capacity(64 + updates.iter().map(|t| t.jpeg.len() + 16).sum::<usize>());
         let header = serde_json::to_vec(&FrameHeader {
             kind: "frame",
@@ -289,11 +322,11 @@ impl ScreenHub {
             height,
             seq,
         })
-        .map_err(|e| e.to_string())?;
+        .unwrap_or_else(|_| b"{\"type\":\"frame\"}".to_vec());
         buffer.extend_from_slice(&(header.len() as u32).to_le_bytes());
         buffer.extend_from_slice(&header);
         buffer.extend_from_slice(&(updates.len() as u32).to_le_bytes());
-        for update in &updates {
+        for update in updates {
             buffer.extend_from_slice(&(update.col as u16).to_le_bytes());
             buffer.extend_from_slice(&(update.row as u16).to_le_bytes());
             buffer.extend_from_slice(&(update.width as u16).to_le_bytes());
@@ -301,11 +334,7 @@ impl ScreenHub {
             buffer.extend_from_slice(&(update.jpeg.len() as u32).to_le_bytes());
             buffer.extend_from_slice(&update.jpeg);
         }
-
-        // Nobody listening is not an error: the capture loop keeps the baseline
-        // fresh so the next client's first frame is a diff, not a full repaint.
-        let _ = self.frames.send(Arc::new(Message::Binary(buffer.into())));
-        Ok(updates.len())
+        buffer
     }
 
     /// Applies one client message to the display.
@@ -480,6 +509,14 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
         .is_err()
     {
         return;
+    }
+
+    // Before joining the shared stream, the whole screen once: everything after
+    // this is a diff, and a diff means nothing to a client with no picture yet.
+    if let Ok(first) = hub.full_frame() {
+        if socket.send(first).await.is_err() {
+            return;
+        }
     }
 
     let mut frames = hub.frames.subscribe();
