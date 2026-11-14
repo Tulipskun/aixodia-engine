@@ -103,6 +103,11 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         // print "CF_TOKEN is invalid", which sent operators to the wrong place.
         anyhow::bail!("CF_TOKEN could not be verified: {reason}");
     }
+    if let Err(err) = db.verify_kv().await {
+        tracing::warn!("provider kv: {err}");
+    }
+    db.verify_config_kv().await?;
+
     // GitHub bearer allowlist is operator configuration in AIXODIA_CONFIG.
     // Missing/empty fails closed; KV read errors abort startup rather than silently
     // turning a configuration failure into an authorization failure.
@@ -111,10 +116,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .await?
         .unwrap_or_default();
     let github_auth = std::sync::Arc::new(aixodia_io::GitHubAuth::new(&github_users));
-    if let Err(err) = db.verify_kv().await {
-        tracing::warn!("provider kv: {err}");
-    }
-    db.verify_config_kv().await?;
 
     // Browser clients no longer go through the dashboard Worker: the engine
     // issues its own short-lived token and answers CORS preflights itself.
@@ -179,15 +180,23 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let hub = Arc::new(Hub::new());
     let chat = chat_func(gateway.clone());
     let mut terminal_server = TerminalServer::new(token.clone());
-    terminal_server.tmux =
-        aixodia_terminal::tmux_available() && std::env::var("AIXODIA_TMUX").as_deref() != Ok("0");
+    let tmux_enabled = db
+        .config_kv_get("runtime/tmux_enabled")
+        .await?
+        .map(|value| value.trim() != "0" && value.trim().to_ascii_lowercase() != "false")
+        .unwrap_or(true);
+    terminal_server.tmux = aixodia_terminal::tmux_available() && tmux_enabled;
     if terminal_server.tmux {
         aixodia_terminal::tmux::hide_status_bars();
         aixodia_terminal::tmux::disable_mouse();
     }
     // The screen is a hub per process, like the terminal server: one display,
     // one capture, however many phones are looking at it.
-    let screen = aixodia_screen::ScreenHub::new(std::env::var("DISPLAY").unwrap_or_default(), token.clone());
+    let display = db
+        .config_kv_get("runtime/display")
+        .await?
+        .unwrap_or_default();
+    let screen = aixodia_screen::ScreenHub::new(display, token.clone());
     let terminal = Arc::new(terminal_server);
     terminal.set_logf(Arc::new(|message| {
         d1log::info(message.clone());
@@ -639,12 +648,9 @@ fn spawn_config_reloader(cancel: CancellationToken, db: DbClient) {
 /// The engine's local state directory. The keeper records only its child
 /// cloudflared pid here so an in-place executable update can reap an old tunnel.
 fn home_dir() -> std::path::PathBuf {
-    match std::env::var_os("AIXODIA_HOME").filter(|home| !home.is_empty()) {
-        Some(home) => std::path::PathBuf::from(home),
-        None => match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-            Some(home) => std::path::PathBuf::from(home).join(".aixodia"),
-            None => std::path::PathBuf::from("."),
-        },
+    match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => std::path::PathBuf::from(home).join(".aixodia"),
+        None => std::path::PathBuf::from("."),
     }
 }
 
