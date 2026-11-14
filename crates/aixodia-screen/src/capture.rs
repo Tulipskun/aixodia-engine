@@ -168,7 +168,7 @@ impl Screen {
         let height = if height == 0 { screen_height } else { height.min(screen_height) };
 
         let (shm, image, using_shm) = Self::attach_shm(display, depth, width, height)
-            .or_else(|_| Self::attach_plain(display, depth, width, height).map(|(i)| (ptr::null_mut(), i, false)))?;
+            .or_else(|_| Self::attach_plain(display, depth, width, height).map(|i| (ptr::null_mut(), i, false)))?;
 
         Ok(Self {
             display,
