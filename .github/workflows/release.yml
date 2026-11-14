@@ -32,11 +32,17 @@ jobs:
         # flaky: a DNS blip on archive.ubuntu.com fails the whole release even
         # though nothing is wrong with the code being released.
         run: |
+          . /etc/os-release
+          sudo dpkg --add-architecture arm64
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s main universe\n' "$VERSION_CODENAME" | sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-updates main universe\n' "$VERSION_CODENAME" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list >/dev/null
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-backports main universe\n' "$VERSION_CODENAME" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list >/dev/null
           for attempt in 1 2 3; do
             if sudo apt-get update && sudo apt-get install -y \
                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
                 cmake ninja-build clang libclang-dev \
-                libx11-dev libxext-dev libxtst-dev; then
+                libx11-dev libxext-dev libxtst-dev \
+                libx11-dev:arm64 libxext-dev:arm64 libxtst-dev:arm64; then
               exit 0
             fi
             echo "apt attempt $attempt failed; retrying in 15s" >&2
