@@ -174,9 +174,9 @@ async fn resolve_scalar(kv_key: &str, db: &DbClient) -> anyhow::Result<String> {
 }
 
 impl ClientAuth {
-    /// `ACCESS_TEAM_DOMAIN` / `ACCESS_APP_AUD` come from env, else Workers KV
-    /// `AIXODIA_CONFIG` (`access/*`). When either is missing the Access path
-    /// fails closed and only the master token works.
+    /// Access team and audience are read from Workers KV `AIXODIA_CONFIG`
+    /// (`access/team_domain` and `access/app_aud`). When either is missing,
+    /// the Access path fails closed and only the master token works.
     pub async fn from_kv(cf_token: String, db: &DbClient) -> anyhow::Result<Arc<Self>> {
         let team_domain = resolve_scalar("access/team_domain", db)
             .await?
@@ -198,13 +198,13 @@ impl ClientAuth {
         .await?;
         if team_domain.is_empty() || app_aud.is_empty() {
             tracing::warn!(
-                "ACCESS_TEAM_DOMAIN/ACCESS_APP_AUD unset: Cloudflare Access sign-in is disabled; only the master token works"
+                "Workers KV keys access/team_domain or access/app_aud are missing: Cloudflare Access sign-in is disabled; only the master token works"
             );
         }
         let auth_worker = resolve_scalar("auth/worker_url", db).await?;
         if auth_worker.is_empty() {
             tracing::warn!(
-                "AUTH_WORKER_URL unset: no token can be verified, so only the master token will work"
+                "Workers KV key auth/worker_url is missing: no user token can be verified; only the master token will work"
             );
         }
         Ok(Arc::new(Self {
