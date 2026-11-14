@@ -41,7 +41,7 @@ jobs:
 
 
       - name: Clippy
-        run: cargo clippy -p aixodia-engine --bin aixodia-engine -- -D warnings
+        run: cargo clippy -p aixodia-engine --bin aixodia-engine --no-deps -- -D warnings
 
       - name: Launcher and installer tests
         run: |
