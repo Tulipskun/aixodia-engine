@@ -73,6 +73,11 @@ struct FrameHeader {
     height: u32,
     /// Monotonic counter, so a client can notice a frame it never saw.
     seq: u64,
+    /// Where the machine's pointer is, so the client can draw it. The pointer
+    /// is not part of the captured pixels — X takes it out of the framebuffer —
+    /// so a client that wants to show it has to be told where it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<(i32, i32)>,
 }
 
 /// What the client is told when it connects.
@@ -315,12 +320,33 @@ impl ScreenHub {
     /// Packs tiles into one message: a header, a count, then each tile.
     fn pack(&self, width: u32, height: u32, updates: &[encoder::TileUpdate]) -> Vec<u8> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as u64;
+        // The pointer is reported in the display's own pixels; the frame has
+        // been scaled to the size the client asked for, so it is scaled the same
+        // way. Without this the arrow lands somewhere the pointer never was on
+        // any display that is not exactly the capture size.
+        let cursor = {
+            let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_mut().and_then(|screen| {
+                let (x, y) = screen.pointer_position()?;
+                let (full_w, full_h) = screen.display_size();
+                if full_w == 0 || full_h == 0 {
+                    return Some((x, y));
+                }
+                let sx = width as f64 / full_w as f64;
+                let sy = height as f64 / full_h as f64;
+                Some((
+                    (x as f64 * sx).round() as i32,
+                    (y as f64 * sy).round() as i32,
+                ))
+            })
+        };
         let mut buffer = Vec::with_capacity(64 + updates.iter().map(|t| t.jpeg.len() + 16).sum::<usize>());
         let header = serde_json::to_vec(&FrameHeader {
             kind: "frame",
             width,
             height,
             seq,
+            cursor,
         })
         .unwrap_or_else(|_| b"{\"type\":\"frame\"}".to_vec());
         buffer.extend_from_slice(&(header.len() as u32).to_le_bytes());

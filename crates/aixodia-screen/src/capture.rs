@@ -272,6 +272,23 @@ impl Screen {
         self.height
     }
 
+    /// The size of the display itself, before any scaling for a client.
+    ///
+    /// The pointer is reported in these pixels, so anything that has to line a
+    /// pointer up with a scaled frame needs both sizes.
+    pub fn display_size(&self) -> (u32, u32) {
+        if self.display.is_null() {
+            return (self.width, self.height);
+        }
+        unsafe {
+            let screen = xlib::XDefaultScreen(self.display);
+            (
+                xlib::XDisplayWidth(self.display, screen) as u32,
+                xlib::XDisplayHeight(self.display, screen) as u32,
+            )
+        }
+    }
+
     pub fn using_shm(&self) -> bool {
         self.using_shm
     }
@@ -338,6 +355,38 @@ impl Screen {
             xtest::XTestFakeMotionEvent(self.display, xlib::XDefaultScreen(self.display), x, y, 0);
             xlib::XFlush(self.display);
         }
+    }
+
+    /// Where the pointer is, in screen pixels.
+    ///
+    /// The client draws its own pointer, so it needs to know where the real one
+    /// is — both to show it after a move it did not make, and to keep it in the
+    /// right place while the picture is zoomed and panned.
+    pub fn pointer_position(&self) -> Option<(i32, i32)> {
+        if self.display.is_null() {
+            return None;
+        }
+        let mut root = 0u64;
+        let mut child = 0u64;
+        let mut root_x = 0;
+        let mut root_y = 0;
+        let mut win_x = 0;
+        let mut win_y = 0;
+        let mut mask = 0u32;
+        let found = unsafe {
+            xlib::XQueryPointer(
+                self.display,
+                xlib::XDefaultRootWindow(self.display),
+                &mut root,
+                &mut child,
+                &mut root_x,
+                &mut root_y,
+                &mut win_x,
+                &mut win_y,
+                &mut mask,
+            )
+        };
+        (found != 0).then_some((root_x, root_y))
     }
 
     /// Presses or releases a button at the current pointer position.
