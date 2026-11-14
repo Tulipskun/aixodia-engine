@@ -143,7 +143,11 @@ cmd_start() {
       state_dir="$AIXODIA_HOME"
       printf "%s\n" "$$" > "$pid_file"
       cd "$state_dir" || exit 1
-      unset AIXODIA_HOME AIXODIA_PID_FILE AIXODIA_LAUNCH_ENGINE
+      while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable AIXODIA_)
+      unset HF_TOKEN AUTH_WORKER_URL AUTH_SYNC_SECRET ACCESS_TEAM_DOMAIN ACCESS_APP_AUD \
+        ALLOWED_ORIGINS ALLOWED_GITHUB_USERS AIXODIA_MCP_UPSTREAM \
+        AIXODIA_DEVICE_TUNNELS AIXODIA_TMUX GITHUB_CLIENT_ID \
+        GITHUB_CLIENT_SECRET GITHUB_REDIRECT_URI
       exec "$engine"
     ' >> "$(log_path)" 2>&1 < /dev/null &
 

@@ -31,10 +31,7 @@ fi
 printf '%s\n' "$$" > "$ENGINE_PID_FILE"
 printf '%s\n' "$PWD" > "$ENGINE_CWD_FILE"
 printf '%s\n' "$PWD" > "$ENGINE_HOME_FILE"
-printf '%s\n' \
-  "AIXODIA_HOME=${AIXODIA_HOME-unset}" \
-  "AIXODIA_PID_FILE=${AIXODIA_PID_FILE-unset}" \
-  "AIXODIA_LAUNCH_ENGINE=${AIXODIA_LAUNCH_ENGINE-unset}" > "$ENGINE_ENV_FILE"
+env | grep -E '^(AIXODIA_|HF_TOKEN=|AUTH_WORKER_URL=|AUTH_SYNC_SECRET=|ACCESS_TEAM_DOMAIN=|ACCESS_APP_AUD=|ALLOWED_ORIGINS=|ALLOWED_GITHUB_USERS=|GITHUB_CLIENT_ID=|GITHUB_CLIENT_SECRET=|GITHUB_REDIRECT_URI=)' > "$ENGINE_ENV_FILE" || true
 echo "engine stdout: redirected"
 echo "engine stderr: redirected" >&2
 exit 37
@@ -51,10 +48,7 @@ mkdir -p "$(dirname "$ENGINE_HEALTH_FILE")"
 printf '%s\n' "$$" > "$ENGINE_PID_FILE"
 printf '%s\n' "$PWD" > "$ENGINE_CWD_FILE"
 printf '%s\n' "$PWD" > "$ENGINE_HOME_FILE"
-printf '%s\n' \
-  "AIXODIA_HOME=${AIXODIA_HOME-unset}" \
-  "AIXODIA_PID_FILE=${AIXODIA_PID_FILE-unset}" \
-  "AIXODIA_LAUNCH_ENGINE=${AIXODIA_LAUNCH_ENGINE-unset}" > "$ENGINE_ENV_FILE"
+env | grep -E '^(AIXODIA_|HF_TOKEN=|AUTH_WORKER_URL=|AUTH_SYNC_SECRET=|ACCESS_TEAM_DOMAIN=|ACCESS_APP_AUD=|ALLOWED_ORIGINS=|ALLOWED_GITHUB_USERS=|GITHUB_CLIENT_ID=|GITHUB_CLIENT_SECRET=|GITHUB_REDIRECT_URI=)' > "$ENGINE_ENV_FILE" || true
 printf '{"pid":%s,"status":"ok"}\n' "$$" > "$ENGINE_HEALTH_FILE"
 echo "engine boot: detached"
 trap 'rm -f "$ENGINE_HEALTH_FILE"; echo "engine stopped cleanly" > "$ENGINE_STOP_FILE"; exit 0' TERM
@@ -91,7 +85,8 @@ wait_gone() {
 }
 
 run_launcher() {
-  CF_TOKEN=test-token AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
+  CF_TOKEN=test-token HF_TOKEN=test-backup-token \
+    AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
     AIXODIA_LOCAL_URL="${TEST_URL:-$DEAD_URL}" AIXODIA_START_WAIT="${START_WAIT:-3}" \
     PATH="$fakebin:$PATH" \
     ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" \
@@ -172,12 +167,10 @@ if wait_for_file "$home/pid"; then
   else
     fail "engine working directory/state path mismatch (cwd=$(cat "$home/cwd" 2>/dev/null))"
   fi
-  if grep -qx 'AIXODIA_HOME=unset' "$home/engine-env" &&
-     grep -qx 'AIXODIA_PID_FILE=unset' "$home/engine-env" &&
-     grep -qx 'AIXODIA_LAUNCH_ENGINE=unset' "$home/engine-env"; then
-    pass "launcher-only variables are not inherited by the engine"
+  if [ ! -s "$home/engine-env" ]; then
+    pass "application configuration environment variables are not inherited by the engine"
   else
-    fail "launcher-only variables leaked into the engine (env=$(cat "$home/engine-env" 2>/dev/null))"
+    fail "application configuration variables leaked into the engine (env=$(cat "$home/engine-env" 2>/dev/null))"
   fi
   if grep -q "engine boot: detached" "$home/state/engine.log" 2>/dev/null; then
     pass "engine output is redirected to AIXODIA_HOME/engine.log"
