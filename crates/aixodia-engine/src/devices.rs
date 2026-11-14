@@ -210,7 +210,17 @@ impl Devices {
 }
 
 async fn list_devices(State(devices): State<Arc<Devices>>) -> Response {
-    let (names, source) = devices.registered().await;
+    let names = match devices.registered().await {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::error!("device registry KV read failed: {err}");
+            return device_error(
+                StatusCode::BAD_GATEWAY,
+                "DEVICE_REGISTRY_UNAVAILABLE",
+                "Workers KV DEVICE_TUNNELS could not be read",
+            );
+        }
+    };
     if names.is_empty() {
         return (
             StatusCode::OK,
@@ -219,8 +229,8 @@ async fn list_devices(State(devices): State<Arc<Devices>>) -> Response {
                 "items": [],
                 "checkedAt": now_iso(),
                 "ephemeral": true,
-                "source": source,
-                "note": "No devices registered: Workers KV DEVICE_TUNNELS (and AIXODIA_DEVICE_TUNNELS) are empty, so the device list is intentionally empty rather than a 500.",
+                "source": "kv:DEVICE_TUNNELS",
+                "note": "No devices registered in Workers KV DEVICE_TUNNELS.",
             })),
         )
             .into_response();
@@ -250,7 +260,7 @@ async fn list_devices(State(devices): State<Arc<Devices>>) -> Response {
             "items": items,
             "checkedAt": now_iso(),
             "ephemeral": true,
-            "source": source,
+            "source": "kv:DEVICE_TUNNELS",
         })),
     )
         .into_response()
