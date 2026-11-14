@@ -20,6 +20,6 @@ pub mod capture;
 pub mod encoder;
 pub mod server;
 
-pub use capture::{Button, Frame, Screen, ScreenError};
+pub use capture::{Button, Frame, Input, Screen, ScreenError};
 pub use encoder::{diff_and_encode, TileUpdate};
 pub use server::{router, ScreenHub, Settings};

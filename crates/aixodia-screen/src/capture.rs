@@ -629,6 +629,205 @@ mod tests {
     }
 }
 
+/// A second connection to the same display, used only to send input.
+///
+/// Input and capture shared one handle and one lock, which made every event wait
+/// for the frame being read: a grab takes about thirteen milliseconds, so a drag
+/// arrived in jerks of up to a tenth of a second. They are separate conversations
+/// with the X server — one that waits for pixels and one that never does — so
+/// they get their own handles and their own locks.
+pub struct Input {
+    display: *mut xlib::Display,
+    /// The thread that holds the clipboard, once text has been typed.
+    clipboard: Option<ClipboardServer>,
+}
+
+// The connection is used from one thread at a time, guarded by the hub's lock.
+unsafe impl Send for Input {}
+
+impl Input {
+    /// Opens a connection for input alone.
+    pub fn open(display_name: &str) -> Result<Self, ScreenError> {
+        let name = std::ffi::CString::new(display_name).map_err(|_| ScreenError::Gone)?;
+        let display = unsafe { xlib::XOpenDisplay(name.as_ptr()) };
+        if display.is_null() {
+            return Err(ScreenError::Gone);
+        }
+        unsafe {
+            xlib::XSetErrorHandler(Some(note_error));
+        }
+        Ok(Self { display, clipboard: None })
+    }
+
+    /// Where the pointer is, in screen pixels.
+    pub fn pointer_position(&self) -> Option<(i32, i32)> {
+        if self.display.is_null() {
+            return None;
+        }
+        let mut root = 0u64;
+        let mut child = 0u64;
+        let (mut root_x, mut root_y) = (0, 0);
+        let (mut win_x, mut win_y) = (0, 0);
+        let mut mask = 0u32;
+        let found = unsafe {
+            xlib::XQueryPointer(
+                self.display,
+                xlib::XDefaultRootWindow(self.display),
+                &mut root,
+                &mut child,
+                &mut root_x,
+                &mut root_y,
+                &mut win_x,
+                &mut win_y,
+                &mut mask,
+            )
+        };
+        (found != 0).then_some((root_x, root_y))
+    }
+
+    /// The display's own size, which the client's coordinates are scaled from.
+    pub fn display_size(&self) -> (u32, u32) {
+        if self.display.is_null() {
+            return (0, 0);
+        }
+        unsafe {
+            let screen = xlib::XDefaultScreen(self.display);
+            (
+                xlib::XDisplayWidth(self.display, screen) as u32,
+                xlib::XDisplayHeight(self.display, screen) as u32,
+            )
+        }
+    }
+
+    /// Hands the display back when the hub is dropped.
+    pub fn close(&mut self) {
+        if !self.display.is_null() {
+            unsafe { xlib::XCloseDisplay(self.display) };
+            self.display = std::ptr::null_mut();
+        }
+    }
+}
+
+
+impl Input {
+    /// Moves the pointer to an absolute position on the root window.
+    pub fn move_pointer(&self, x: i32, y: i32) {
+        if self.display.is_null() {
+            return;
+        }
+        unsafe {
+            xtest::XTestFakeMotionEvent(self.display, xlib::XDefaultScreen(self.display), x, y, 0);
+            xlib::XFlush(self.display);
+        }
+    }
+
+    /// Presses or releases a button at the pointer's current place.
+    pub fn button(&self, button: Button, pressed: bool) {
+        if self.display.is_null() {
+            return;
+        }
+        let code = match button {
+            Button::Left => 1,
+            Button::Middle => 2,
+            Button::Right => 3,
+            Button::WheelUp => 4,
+            Button::WheelDown => 5,
+        };
+        unsafe {
+            xtest::XTestFakeButtonEvent(self.display, code, i32::from(pressed), 0);
+            xlib::XFlush(self.display);
+        }
+    }
+
+    /// Presses a key whose name X knows, with any modifiers held.
+    ///
+    /// A keycode is what X presses, not a keysym, and which number it is depends
+    /// on the keyboard — XKeysymToKeycode asks the server, so a name is enough.
+    pub fn key(&self, keysym_name: &str, mods: &[String]) {
+        if self.display.is_null() {
+            return;
+        }
+        let Ok(name) = std::ffi::CString::new(keysym_name) else { return };
+        let keysym = unsafe { xlib::XStringToKeysym(name.as_ptr()) };
+        if keysym == 0 {
+            return;
+        }
+        let code = unsafe { xlib::XKeysymToKeycode(self.display, keysym) };
+        if code == 0 {
+            return;
+        }
+        // Held for the press and let go in reverse, so a chord reads as it would
+        // on the machine itself.
+        let mut held = Vec::new();
+        for modifier in mods {
+            let Ok(cname) = std::ffi::CString::new(modifier.as_str()) else { continue };
+            let sym = unsafe { xlib::XStringToKeysym(cname.as_ptr()) };
+            if sym == 0 {
+                continue;
+            }
+            let mcode = unsafe { xlib::XKeysymToKeycode(self.display, sym) };
+            if mcode == 0 {
+                continue;
+            }
+            unsafe { xtest::XTestFakeKeyEvent(self.display, mcode as u32, xlib::True, 0) };
+            held.push(mcode);
+        }
+        unsafe {
+            xtest::XTestFakeKeyEvent(self.display, code as u32, xlib::True, 0);
+            xtest::XTestFakeKeyEvent(self.display, code as u32, xlib::False, 0);
+        }
+        for mcode in held.into_iter().rev() {
+            unsafe { xtest::XTestFakeKeyEvent(self.display, mcode as u32, xlib::False, 0) };
+        }
+        unsafe { xlib::XFlush(self.display) };
+    }
+
+    /// Types a string, in whatever language it is written in.
+    ///
+    /// Same reasoning as `Screen::type_text`: the clipboard carries text, and a
+    /// remapped keycode does not reach clients that read the keyboard once.
+    pub fn type_text(&mut self, text: &str) -> Result<(), ScreenError> {
+        if self.display.is_null() {
+            return Err(ScreenError::Gone);
+        }
+        let mut plain = String::new();
+        for character in text.chars() {
+            match character {
+                '\n' | '\r' => {
+                    self.paste(&std::mem::take(&mut plain));
+                    self.key("Return", &[]);
+                }
+                '\t' => {
+                    self.paste(&std::mem::take(&mut plain));
+                    self.key("Tab", &[]);
+                }
+                other => plain.push(other),
+            }
+        }
+        self.paste(&plain);
+        Ok(())
+    }
+
+    /// Puts `text` on the clipboard and pastes it.
+    fn paste(&mut self, text: &str) {
+        if text.is_empty() || self.display.is_null() {
+            return;
+        }
+        if self.clipboard.is_none() {
+            self.clipboard = ClipboardServer::start(text);
+        } else if let Some(server) = self.clipboard.as_mut() {
+            server.set(text);
+        }
+        self.key("v", &[String::from("ctrl")]);
+    }
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Holds the X clipboard and answers requests for it.
 ///
 /// A selection owner must be present to reply: the requesting client sends an

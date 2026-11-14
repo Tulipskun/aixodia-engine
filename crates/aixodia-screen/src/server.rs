@@ -23,7 +23,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::capture::{Button, Screen};
+use crate::capture::{Button, Input, Screen};
 use crate::encoder::{self, EncodeSettings, H264Encoder};
 
 /// How the picture is produced. Every field can change while the engine runs.
@@ -149,6 +149,14 @@ struct FrameHeader {
     height: u32,
     /// Monotonic counter, so a client can notice a frame it never saw.
     seq: u64,
+    /// The grid the tiles sit on, in picture pixels.
+    ///
+    /// A tile at the right or bottom edge is clipped to what is left of the
+    /// picture, so its bitmap is smaller than the grid cell it belongs to.
+    /// Placing it by its bitmap size would pull it toward the origin and leave a
+    /// gap at the edge, so the grid size travels with every frame rather than
+    /// being remembered from connect: `settings` can change it mid-stream.
+    tile: u32,
     /// Where the machine's pointer is, so the client can draw it. The pointer
     /// is not part of the captured pixels — X takes it out of the framebuffer —
     /// so a client that wants to show it has to be told where it is.
@@ -252,6 +260,11 @@ pub struct ScreenHub {
     tickets: aixodia_wsock::Tickets,
     settings: Mutex<Settings>,
     screen: Mutex<Option<Screen>>,
+    /// A separate connection, used only for input.
+    ///
+    /// Never held while a frame is being read, which is the whole point: an
+    /// event that had to wait behind a grab arrived in jerks.
+    input: Arc<Mutex<Option<Input>>>,
     /// How many clients are watching.
     ///
     /// The capture loop must run exactly while somebody is looking and stop
@@ -280,6 +293,7 @@ impl ScreenHub {
             tickets: aixodia_wsock::Tickets::new(),
             settings: Mutex::new(Settings::default()),
             screen: Mutex::new(None),
+            input: Arc::new(Mutex::new(None)),
             viewers: AtomicUsize::new(0),
             keyframe_wanted: AtomicBool::new(false),
             frames,
@@ -296,6 +310,11 @@ impl ScreenHub {
             Some(s) => (s.width(), s.height(), s.using_shm()),
             None => (settings.width, settings.height, false),
         }
+    }
+
+    /// The grid the tiles sit on, as the encoder is using it now.
+    fn tile(&self) -> u32 {
+        self.settings.lock().unwrap_or_else(|e| e.into_inner()).encode.tile
     }
 
     /// Applies a client's request, keeping what it did not mention.
@@ -348,6 +367,14 @@ impl ScreenHub {
 
     /// Opens the display if it is not open yet, at the current settings.
     fn ensure_screen(&self) -> Result<(), String> {
+        // The input connection is opened alongside the capture one, on its own
+        // handle, so an event never has to wait for a frame to be read.
+        {
+            let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            if input.is_none() {
+                *input = Input::open(&self.display).ok();
+            }
+        }
         let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             return Ok(());
@@ -357,6 +384,15 @@ impl ScreenHub {
             .map_err(|e| e.to_string())?;
         *guard = Some(screen);
         Ok(())
+    }
+
+    /// The display's real size, without waiting for a frame that is being read.
+    fn display_size(&self) -> (u32, u32) {
+        let guard = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(input) => input.display_size(),
+            None => (0, 0),
+        }
     }
 
     /// Runs one frame: capture, diff, encode, publish. Returns how many tiles
@@ -507,10 +543,13 @@ impl ScreenHub {
     /// Without this the arrow lands somewhere the pointer never was on any
     /// display that is not exactly the capture size.
     fn cursor_in(&self, width: u32, height: u32) -> Option<(i32, i32)> {
-        let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
-        let screen = guard.as_mut()?;
-        let (x, y) = screen.pointer_position()?;
-        let (full_w, full_h) = screen.display_size();
+        // Read through the input handle, not the capture one. The capture handle
+        // is held for the whole of a grab, so asking it where the pointer is on
+        // every frame made the frame wait for the previous frame.
+        let guard = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        let input = guard.as_ref()?;
+        let (x, y) = input.pointer_position()?;
+        let (full_w, full_h) = input.display_size();
         if full_w == 0 || full_h == 0 {
             return Some((x, y));
         }
@@ -534,6 +573,7 @@ impl ScreenHub {
             kind: "frame",
             width,
             height,
+            tile: self.tile(),
             seq,
             cursor,
         })
@@ -564,73 +604,98 @@ impl ScreenHub {
             self.keyframe_wanted.store(true, Ordering::SeqCst);
             return;
         }
-        if let Err(err) = self.ensure_screen() {
-            tracing::warn!(%err, "screen input dropped: no display");
+        // The size the client's coordinates are in, read from the input handle
+        // so a grab already in progress cannot hold this event up.
+        let (captured_w, captured_h) = match self.input.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(input) => input.display_size(),
+                None => (0, 0),
+            },
+            Err(_) => (0, 0),
+        };
+        if captured_w == 0 || captured_h == 0 {
+            tracing::warn!("screen input dropped: no display");
             return;
         }
-        // Mutable: typing holds the clipboard, which is state on the screen.
-        let mut screen = self.screen.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(screen) = screen.as_mut() else { return };
-
-        // The client works in the captured coordinate space; the display is
-        // whatever size it actually is. One multiply per event is cheaper than
-        // making every client know the real size.
-        let (captured_w, captured_h) = (screen.width(), screen.height());
         let settings = self.settings_now();
         let scale_x = if settings.width == 0 { 1.0 } else { captured_w as f64 / settings.width as f64 };
         let scale_y = if settings.height == 0 { 1.0 } else { captured_h as f64 / settings.height as f64 };
         let to_x = |x: i32| (x as f64 * scale_x).round() as i32;
         let to_y = |y: i32| (y as f64 * scale_y).round() as i32;
 
-        match message {
-            ClientMessage::Move { x, y } => screen.move_pointer(to_x(x), to_y(y)),
-            ClientMessage::Down { x, y, button } => {
-                screen.move_pointer(to_x(x), to_y(y));
-                screen.button(button_from(&button), true);
-            }
-            ClientMessage::Up { x, y, button } => {
-                screen.move_pointer(to_x(x), to_y(y));
-                screen.button(button_from(&button), false);
-            }
-            ClientMessage::Drag {
-                from_x,
-                from_y,
-                to_x: dest_x,
-                to_y: dest_y,
-                button,
-                duration_ms,
-            } => {
-                let button = button_from(&button);
-                screen.move_pointer(to_x(from_x), to_y(from_y));
-                screen.button(button, true);
-                // A drag the machine can follow: the pointer walks to the target
-                // so hover states and drop targets see it pass over them.
-                let steps = (duration_ms / 16).clamp(1, 60);
-                for step in 1..=steps {
+        // A drag is the one message that takes time, because it walks the
+        // pointer so hover states and drop targets see it pass over them.
+        // Sleeping here would hold the socket task and stall every later event
+        // behind it, so it gets a thread of its own and returns at once.
+        if let ClientMessage::Drag {
+            from_x,
+            from_y,
+            to_x: dest_x,
+            to_y: dest_y,
+            button,
+            duration_ms,
+        } = message
+        {
+            let input = Arc::clone(&self.input);
+            let button = button_from(&button);
+            let steps = (duration_ms / 16).clamp(1, 60);
+            let (sx, sy) = (to_x(from_x), to_y(from_y));
+            let (dx, dy) = (to_x(dest_x), to_y(dest_y));
+            let planned: Vec<(i32, i32)> = (1..=steps)
+                .map(|step| {
                     let ratio = step as f64 / steps as f64;
-                    let x = from_x as f64 + (dest_x - from_x) as f64 * ratio;
-                    let y = from_y as f64 + (dest_y - from_y) as f64 * ratio;
-                    screen.move_pointer(to_x(x.round() as i32), to_y(y.round() as i32));
+                    (
+                        sx + ((dx - sx) as f64 * ratio).round() as i32,
+                        sy + ((dy - sy) as f64 * ratio).round() as i32,
+                    )
+                })
+                .collect();
+            // Off the async runtime entirely: a blocking walk belongs on a
+            // blocking thread, not one of the few that serve every socket.
+            tokio::task::spawn_blocking(move || {
+                let guard = input.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(input) = guard.as_ref() else { return };
+                input.move_pointer(sx, sy);
+                input.button(button, true);
+                for (x, y) in planned {
+                    input.move_pointer(x, y);
                     std::thread::sleep(Duration::from_millis(16));
                 }
-                screen.button(button, false);
+                input.button(button, false);
+            });
+            return;
+        }
+
+        // Mutable because typing holds the clipboard, which is state here.
+        let mut guard = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(input) = guard.as_mut() else { return };
+        match message {
+            ClientMessage::Move { x, y } => input.move_pointer(to_x(x), to_y(y)),
+            ClientMessage::Down { x, y, button } => {
+                input.move_pointer(to_x(x), to_y(y));
+                input.button(button_from(&button), true);
+            }
+            ClientMessage::Up { x, y, button } => {
+                input.move_pointer(to_x(x), to_y(y));
+                input.button(button_from(&button), false);
             }
             ClientMessage::Wheel { x, y, delta } => {
-                screen.move_pointer(to_x(x), to_y(y));
+                input.move_pointer(to_x(x), to_y(y));
                 let button = if delta > 0 { Button::WheelDown } else { Button::WheelUp };
                 for _ in 0..delta.unsigned_abs().min(10) {
-                    screen.button(button, true);
-                    screen.button(button, false);
+                    input.button(button, true);
+                    input.button(button, false);
                 }
             }
-            ClientMessage::Key { keysym, mods } => screen.key(&keysym, &mods),
+            ClientMessage::Key { keysym, mods } => input.key(&keysym, &mods),
             ClientMessage::Text { text } => {
                 // A screen of text is not a keystroke race: the whole string is
                 // typed here, and a failure is logged rather than dropped.
-                if let Err(err) = screen.type_text(&text) {
+                if let Err(err) = input.type_text(&text) {
                     tracing::warn!(%err, "screen: could not type the text");
                 }
             }
+            ClientMessage::Drag { .. } => unreachable!("handled above, on its own thread"),
             // Nothing to do to the display; the loop picks the request up.
             ClientMessage::Settings { .. } | ClientMessage::RequestKeyframe => {}
         }
