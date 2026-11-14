@@ -183,7 +183,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let tmux_enabled = db
         .config_kv_get("runtime/tmux_enabled")
         .await?
-        .map(|value| value.trim() != "0" && value.trim().to_ascii_lowercase() != "false")
+        .map(|value| value.trim() != "0" && !value.trim().eq_ignore_ascii_case("false"))
         .unwrap_or(true);
     terminal_server.tmux = aixodia_terminal::tmux_available() && tmux_enabled;
     if terminal_server.tmux {
