@@ -18,7 +18,6 @@
 //! it as a bearer over loopback.
 
 use std::collections::HashMap;
-use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -158,83 +157,57 @@ fn parse_csv(value: &str) -> Vec<String> {
 }
 
 async fn resolve_allowed(
-    env_name: &str,
     kv_key: &str,
     db: &DbClient,
     default: Option<&str>,
-) -> Vec<String> {
-    if let Ok(value) = env::var(env_name) {
-        let parsed = parse_csv(&value);
-        if !parsed.is_empty() {
-            return parsed;
-        }
+) -> anyhow::Result<Vec<String>> {
+    match db.config_kv_get(kv_key).await? {
+        Some(value) if !value.trim().is_empty() => Ok(parse_csv(&value)),
+        _ => Ok(default.map(parse_csv).unwrap_or_default()),
     }
-    match db.config_kv_get(kv_key).await {
-        Ok(Some(value)) => {
-            let parsed = parse_csv(&value);
-            if !parsed.is_empty() {
-                return parsed;
-            }
-        }
-        Ok(None) => {}
-        Err(err) => tracing::warn!("config KV {kv_key}: {err}"),
-    }
-    default.map(parse_csv).unwrap_or_default()
 }
 
-/// Env first, then Workers KV `AIXODIA_CONFIG`.
-async fn resolve_scalar(env_name: &str, kv_key: &str, db: &DbClient) -> String {
-    if let Ok(value) = env::var(env_name) {
-        let trimmed = value.trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    db.config_kv_get(kv_key)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+/// All runtime configuration is read from Workers KV `AIXODIA_CONFIG`.
+/// KV API errors are fatal; they must never be mistaken for missing keys.
+async fn resolve_scalar(kv_key: &str, db: &DbClient) -> anyhow::Result<String> {
+    Ok(db.config_kv_get(kv_key).await?.unwrap_or_default().trim().to_string())
 }
 
 impl ClientAuth {
     /// `ACCESS_TEAM_DOMAIN` / `ACCESS_APP_AUD` come from env, else Workers KV
     /// `AIXODIA_CONFIG` (`access/*`). When either is missing the Access path
     /// fails closed and only the master token works.
-    pub async fn from_env(cf_token: String, db: &DbClient) -> Arc<Self> {
-        let team_domain = resolve_scalar("ACCESS_TEAM_DOMAIN", "access/team_domain", db)
-            .await
+    pub async fn from_kv(cf_token: String, db: &DbClient) -> anyhow::Result<Arc<Self>> {
+        let team_domain = resolve_scalar("access/team_domain", db)
+            .await?
             .trim_start_matches("https://")
             .trim_end_matches('/')
             .to_string();
-        let app_aud = resolve_scalar("ACCESS_APP_AUD", "access/app_aud", db)
-            .await
+        let app_aud = resolve_scalar("access/app_aud", db)
+            .await?
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
         let allowed_origins = resolve_allowed(
-            "ALLOWED_ORIGINS",
             "client/allowed_origins",
             db,
             Some(DEFAULT_ALLOWED_ORIGINS),
         )
-        .await;
+        .await?;
         if team_domain.is_empty() || app_aud.is_empty() {
             tracing::warn!(
                 "ACCESS_TEAM_DOMAIN/ACCESS_APP_AUD unset: Cloudflare Access sign-in is disabled; only the master token works"
             );
         }
-        let auth_worker = resolve_scalar("AUTH_WORKER_URL", "auth/worker_url", db).await;
+        let auth_worker = resolve_scalar("auth/worker_url", db).await?;
         if auth_worker.is_empty() {
             tracing::warn!(
                 "AUTH_WORKER_URL unset: no token can be verified, so only the master token will work"
             );
         }
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             team_domain,
             app_aud,
             cf_token,
@@ -244,9 +217,9 @@ impl ClientAuth {
             auth_worker,
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
-            sync_secret: resolve_scalar("AUTH_SYNC_SECRET", "auth/sync_secret", db).await,
+            sync_secret: resolve_scalar("auth/sync_secret", db).await?,
             synced: std::sync::atomic::AtomicBool::new(false),
-        })
+        }))
     }
 
     /// The browser address of the console, for redirecting a human who has just
