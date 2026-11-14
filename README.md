@@ -93,9 +93,10 @@ API keys are in Workers KV.
 
 ## Configuration
 
-`CF_TOKEN` is required. `AIXODIA_HOME` can override the local state directory;
-`AIXODIA_LOCAL_URL` can override the local control API address.
-
+`CF_TOKEN` is the only application configuration environment variable.
+The operating system's `HOME` and `PATH` are used only for the local state
+directory and executable discovery. Runtime settings are read from Cloudflare
+Workers KV; relational and durable application data lives in D1.
 
 Chat history, settings, run logs and handover state live in **D1**
 (`chat_sessions`, `chat_turns`, `system_state`, `runs`, `run_events`). Provider
@@ -109,9 +110,19 @@ namespace `AIXODIA_CONFIG`:
 | `tunnel_url` | Stable public HTTPS hostname | Operator-managed |
 | `daemon/url` | Engine endpoint discovered by the phone | Only when changed |
 | `daemon/version` | Engine start/boot metadata used for uptime | Only when changed |
+| `auth/worker_url` | Auth Worker HTTPS base URL used to verify user tokens | Operator-managed |
+| `auth/sync_secret` | Shared secret for Engine/Auth Worker token synchronization | Operator-managed, secret |
+| `access/team_domain` | Cloudflare Access team domain | Operator-managed |
+| `access/app_aud` | Cloudflare Access application audience tag(s), comma-separated | Operator-managed |
+| `client/allowed_origins` | Browser CORS origins, comma-separated | Operator-managed |
+| `github/allowed_users` | Allowed GitHub login names, comma-separated | Operator-managed |
+| `mcp/upstream` | MCP upstream HTTPS URL; defaults to the built-in upstream when absent | Operator-managed |
+| `runtime/tmux_enabled` | Enable tmux terminal sessions (`true`/ `false`); defaults to enabled | Operator-managed |
+| `runtime/display` | X11 display name for screen capture; defaults to empty | Operator-managed |
 
 Create `AIXODIA_CONFIG` in Cloudflare Workers KV before starting the engine,
-then add `tunnel_token` and `tunnel_url`. The engine never creates this
+then add `tunnel_token`, `tunnel_url`, and the authentication keys required by
+the sign-in flow. The engine never creates this
 sensitive namespace or overwrites those operator-managed values. It reads both
 at startup, starts `cloudflared tunnel run`, waits for an edge registration,
 and only then publishes `daemon/url`. There is no `daemon/heartbeat` key or
@@ -153,7 +164,7 @@ Terminals use a dedicated WebSocket at `/terminal`, not the old shared relay
 socket. The phone asks `POST /v1/terminals/ticket` for a single-use, 90-second
 ticket, then the WebView's xterm.js opens `/terminal?ticket=...&id=...`. Output
 is replayed from a 4 MiB ring and the shell is kept in tmux (`aix-<id>`, private
-`socket aixodia`) when tmux is installed and `AIXODIA_TMUX` is not `0`.
+`socket aixodia`) when tmux is installed and `runtime/tmux_enabled` is not `false`.
 `GET /v1/terminals` lists live and surviving sessions; `DELETE
 /v1/terminals/{id}` ends one. The old `/ws` relay remains for compatibility with
 the previous app build; this build's chat and terminal no longer use it.
