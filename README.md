@@ -115,7 +115,7 @@ namespace `AIXODIA_CONFIG`:
 | `access/team_domain` | Cloudflare Access team domain | Operator-managed |
 | `access/app_aud` | Cloudflare Access application audience tag(s), comma-separated | Operator-managed |
 | `client/allowed_origins` | Browser CORS origins, comma-separated | Operator-managed |
-| `github/allowed_users` | Allowed GitHub login names, comma-separated | Operator-managed |
+| `client/allowed_users` | Allowed GitHub login names, comma-separated | Operator-managed |
 | `mcp/upstream` | MCP upstream HTTPS URL; defaults to the built-in upstream when absent | Operator-managed |
 | `runtime/tmux_enabled` | Enable tmux terminal sessions (`true`/ `false`); defaults to enabled | Operator-managed |
 | `runtime/display` | X11 display name for screen capture; defaults to empty | Operator-managed |

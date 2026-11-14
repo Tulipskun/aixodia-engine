@@ -112,7 +112,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // Missing/empty fails closed; KV read errors abort startup rather than silently
     // turning a configuration failure into an authorization failure.
     let github_users = db
-        .config_kv_get("github/allowed_users")
+        .config_kv_get("client/allowed_users")
         .await?
         .unwrap_or_default();
     let github_auth = std::sync::Arc::new(aixodia_io::GitHubAuth::new(&github_users));
