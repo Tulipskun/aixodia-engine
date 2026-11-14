@@ -449,7 +449,7 @@ async fn run_shell(ctx: &ToolContext, args: &str) -> Result<String> {
     };
 
     let mut command = tokio::process::Command::new("sh");
-    command.arg("-c").arg(&input.command);
+    command.env_remove("CF_TOKEN").arg("-c").arg(&input.command);
     if let Some(workdir) = workdir {
         command.current_dir(workdir);
     } else if let Some(home) = home_dir() {

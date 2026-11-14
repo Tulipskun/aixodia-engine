@@ -1690,7 +1690,13 @@ async fn rejects_an_invalid_utf8_body() {
     bad.extend_from_slice(&[0xe0, 0xb8]); // a truncated Thai character
     bad.extend_from_slice(br#""}]}"#);
 
-    let (status, _) = send(&gateway.router(), Method::POST, "/api/chat/completions", bad).await;
+    let (status, _) = send(
+        &gateway.router(),
+        Method::POST,
+        "/api/chat/completions",
+        bad,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -2523,8 +2529,12 @@ async fn a_keyless_turn_retries_after_a_throttle_answer() {
         "messages": [{"role": "user", "content": "hi"}],
     });
     let started = Instant::now();
-    let (status, body) =
-        post_json(&gateway.router(), "/api/chat/completions", &body.to_string()).await;
+    let (status, body) = post_json(
+        &gateway.router(),
+        "/api/chat/completions",
+        &body.to_string(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     assert!(body.contains("after wait"), "body = {body}");
     assert_eq!(*hits.lock().unwrap(), 2);
@@ -2560,8 +2570,12 @@ async fn a_new_session_without_a_route_uses_the_saved_main() {
         "session_id": id,
         "messages": [{"role": "user", "content": "hi"}],
     });
-    let (status, body) =
-        post_json(&gateway.router(), "/api/chat/completions", &body.to_string()).await;
+    let (status, body) = post_json(
+        &gateway.router(),
+        "/api/chat/completions",
+        &body.to_string(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body = {body}");
     assert!(body.contains("done"), "body = {body}");
 }

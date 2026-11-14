@@ -18,7 +18,6 @@
 //! it as a bearer over loopback.
 
 use std::collections::HashMap;
-use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +32,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::json;
 
-/// Always-usable default for `ALLOWED_ORIGINS` when neither env nor KV set it.
+/// Safe built-in browser origins used only when the optional KV key is absent.
 ///
 /// The console lives at the bare hostname and the engine at `engine.`: they are
 /// separate Cloudflare Apps now, so the engine's own origin is no longer the one
@@ -158,83 +157,67 @@ fn parse_csv(value: &str) -> Vec<String> {
 }
 
 async fn resolve_allowed(
-    env_name: &str,
     kv_key: &str,
     db: &DbClient,
     default: Option<&str>,
-) -> Vec<String> {
-    if let Ok(value) = env::var(env_name) {
-        let parsed = parse_csv(&value);
-        if !parsed.is_empty() {
-            return parsed;
-        }
+) -> anyhow::Result<Vec<String>> {
+    match db.config_kv_get(kv_key).await? {
+        Some(value) if !value.trim().is_empty() => Ok(parse_csv(&value)),
+        _ => Ok(default.map(parse_csv).unwrap_or_default()),
     }
-    match db.config_kv_get(kv_key).await {
-        Ok(Some(value)) => {
-            let parsed = parse_csv(&value);
-            if !parsed.is_empty() {
-                return parsed;
-            }
-        }
-        Ok(None) => {}
-        Err(err) => tracing::warn!("config KV {kv_key}: {err}"),
-    }
-    default.map(parse_csv).unwrap_or_default()
 }
 
-/// Env first, then Workers KV `AIXODIA_CONFIG`.
-async fn resolve_scalar(env_name: &str, kv_key: &str, db: &DbClient) -> String {
-    if let Ok(value) = env::var(env_name) {
-        let trimmed = value.trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    db.config_kv_get(kv_key)
-        .await
-        .ok()
-        .flatten()
+/// All runtime configuration is read from Workers KV `AIXODIA_CONFIG`.
+/// KV API errors are fatal; they must never be mistaken for missing keys.
+async fn resolve_scalar(kv_key: &str, db: &DbClient) -> anyhow::Result<String> {
+    Ok(db
+        .config_kv_get(kv_key)
+        .await?
         .unwrap_or_default()
         .trim()
-        .to_string()
+        .to_string())
 }
 
 impl ClientAuth {
-    /// `ACCESS_TEAM_DOMAIN` / `ACCESS_APP_AUD` come from env, else Workers KV
-    /// `AIXODIA_CONFIG` (`access/*`). When either is missing the Access path
-    /// fails closed and only the master token works.
-    pub async fn from_env(cf_token: String, db: &DbClient) -> Arc<Self> {
-        let team_domain = resolve_scalar("ACCESS_TEAM_DOMAIN", "access/team_domain", db)
-            .await
+    /// Access team and audience are read from Workers KV `AIXODIA_CONFIG`
+    /// (`access/team_domain` and `access/app_aud`). When either is missing,
+    /// the Access path fails closed and only the master token works.
+    pub async fn from_kv(cf_token: String, db: &DbClient) -> anyhow::Result<Arc<Self>> {
+        let team_domain = resolve_scalar("access/team_domain", db)
+            .await?
             .trim_start_matches("https://")
             .trim_end_matches('/')
             .to_string();
-        let app_aud = resolve_scalar("ACCESS_APP_AUD", "access/app_aud", db)
-            .await
+        let app_aud = resolve_scalar("access/app_aud", db)
+            .await?
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let allowed_origins = resolve_allowed(
-            "ALLOWED_ORIGINS",
-            "client/allowed_origins",
-            db,
-            Some(DEFAULT_ALLOWED_ORIGINS),
-        )
-        .await;
+        let allowed_origins =
+            resolve_allowed("client/allowed_origins", db, Some(DEFAULT_ALLOWED_ORIGINS)).await?;
         if team_domain.is_empty() || app_aud.is_empty() {
             tracing::warn!(
-                "ACCESS_TEAM_DOMAIN/ACCESS_APP_AUD unset: Cloudflare Access sign-in is disabled; only the master token works"
+                "Workers KV keys access/team_domain or access/app_aud are missing: Cloudflare Access sign-in is disabled; only the master token works"
             );
         }
-        let auth_worker = resolve_scalar("AUTH_WORKER_URL", "auth/worker_url", db).await;
+        let auth_worker = resolve_scalar("auth/worker_url", db).await?;
         if auth_worker.is_empty() {
-            tracing::warn!(
-                "AUTH_WORKER_URL unset: no token can be verified, so only the master token will work"
+            anyhow::bail!(
+                "required Workers KV key auth/worker_url is missing; set it to the Auth Worker HTTPS base URL"
             );
         }
-        Arc::new(Self {
+        let auth_worker_url = reqwest::Url::parse(&auth_worker)
+            .map_err(|err| anyhow::anyhow!("Workers KV key auth/worker_url is invalid: {err}"))?;
+        if auth_worker_url.scheme() != "https" || auth_worker_url.host_str().is_none() {
+            anyhow::bail!("Workers KV key auth/worker_url must be an https:// URL");
+        }
+        let sync_secret = resolve_scalar("auth/sync_secret", db).await?;
+        if sync_secret.is_empty() {
+            anyhow::bail!("required Workers KV key auth/sync_secret is missing");
+        }
+        Ok(Arc::new(Self {
             team_domain,
             app_aud,
             cf_token,
@@ -244,9 +227,9 @@ impl ClientAuth {
             auth_worker,
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
-            sync_secret: resolve_scalar("AUTH_SYNC_SECRET", "auth/sync_secret", db).await,
+            sync_secret,
             synced: std::sync::atomic::AtomicBool::new(false),
-        })
+        }))
     }
 
     /// The browser address of the console, for redirecting a human who has just
@@ -405,12 +388,18 @@ impl ClientAuth {
     /// True when the given bearer token is in the locally held set.
     pub fn token_is_active(&self, token: &str) -> bool {
         let hash = sha256_hex(token);
-        self.active_tokens.read().map(|set| set.contains(&hash)).unwrap_or(false)
+        self.active_tokens
+            .read()
+            .map(|set| set.contains(&hash))
+            .unwrap_or(false)
     }
 
     /// Replace the local set from the Worker's answer.
     pub async fn sync_tokens_from_worker(&self) -> bool {
-        let url = format!("{}/auth/sessions/active", self.auth_worker.trim_end_matches('/'));
+        let url = format!(
+            "{}/auth/sessions/active",
+            self.auth_worker.trim_end_matches('/')
+        );
         let secret = self.sync_secret.clone();
         let Ok(response) = reqwest::Client::new()
             .get(&url)
@@ -421,11 +410,11 @@ impl ClientAuth {
             .await
             .map_err(|err| tracing::warn!("token sync pull failed: {err}"))
         else {
-            return false
+            return false;
         };
         let Ok(payload) = response.json::<serde_json::Value>().await else {
             tracing::warn!("token sync pull: non-JSON answer");
-            return false
+            return false;
         };
         let mut set = std::collections::HashSet::new();
         if let Some(hashes) = payload.get("hashes").and_then(|v| v.as_array()) {
@@ -437,17 +426,24 @@ impl ClientAuth {
                 }
             }
         }
-        *self.active_tokens.write().unwrap_or_else(|err| err.into_inner()) = set;
-        self.synced.store(true, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .active_tokens
+            .write()
+            .unwrap_or_else(|err| err.into_inner()) = set;
+        self.synced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
     /// Apply a push from the Worker. Returns true when the secret matched.
     pub fn apply_sync_push(&self, secret: &str, activate: &[String], revoke: &[String]) -> bool {
         if secret.is_empty() || secret != self.sync_secret {
-            return false
+            return false;
         }
-        let mut set = self.active_tokens.write().unwrap_or_else(|err| err.into_inner());
+        let mut set = self
+            .active_tokens
+            .write()
+            .unwrap_or_else(|err| err.into_inner());
         for hash in activate {
             if is_hex_64(hash) {
                 set.insert(hash.clone());
@@ -466,7 +462,7 @@ impl ClientAuth {
         tokio::spawn(async move {
             for attempt in 1.. {
                 if this.sync_tokens_from_worker().await || attempt >= 3 {
-                    break
+                    break;
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -768,9 +764,7 @@ pub async fn client_guard(
     // Anything arriving from outside is untrusted, so a caller cannot promote
     // itself by sending the stamp the handlers below trust. Only this function
     // sets it, and only after verifying.
-    request
-        .headers_mut()
-        .remove(VERIFIED_HEADER);
+    request.headers_mut().remove(VERIFIED_HEADER);
     let origin = request
         .headers()
         .get(header::ORIGIN)
@@ -1062,9 +1056,7 @@ mod vouched_header_tests {
     /// answers 401 for a bad one.
     #[test]
     fn a_socket_dial_with_a_ticket_is_let_through() {
-        let allowed = |uri: &str| {
-            uri.starts_with("/terminal") && uri.contains("ticket=")
-        };
+        let allowed = |uri: &str| uri.starts_with("/terminal") && uri.contains("ticket=");
         assert!(allowed("/terminal?ticket=abc"));
         assert!(allowed("/terminal?ticket=abc&id=t-1&cols=80&rows=24"));
         // Without a ticket the guard still decides, so a bare dial is not opened.

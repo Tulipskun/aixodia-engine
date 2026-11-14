@@ -53,11 +53,9 @@ fn main() {
 }
 
 async fn async_main() {
+    // Log verbosity is a built-in default, not an environment configuration.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
         .try_init();
 
     tunnel::set_started_at(now_unix());
@@ -103,21 +101,24 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         // print "CF_TOKEN is invalid", which sent operators to the wrong place.
         anyhow::bail!("CF_TOKEN could not be verified: {reason}");
     }
-    // GitHub bearer verification for the relay API surface. The allowlist comes
-    // from ALLOWED_GITHUB_USERS; unset or empty fails closed — every bearer is
-    // rejected and the static-token comparison is gone.
-    let github_auth = std::sync::Arc::new(aixodia_io::GitHubAuth::new(
-        &std::env::var("ALLOWED_GITHUB_USERS").unwrap_or_default(),
-    ));
     if let Err(err) = db.verify_kv().await {
         tracing::warn!("provider kv: {err}");
     }
     db.verify_config_kv().await?;
 
+    // GitHub bearer allowlist is operator configuration in AIXODIA_CONFIG.
+    // Missing/empty fails closed; KV read errors abort startup rather than silently
+    // turning a configuration failure into an authorization failure.
+    let github_users = db
+        .config_kv_get("client/allowed_users")
+        .await?
+        .unwrap_or_default();
+    let github_auth = std::sync::Arc::new(aixodia_io::GitHubAuth::new(&github_users));
+
     // Browser clients no longer go through the dashboard Worker: the engine
     // issues its own short-lived token and answers CORS preflights itself.
     // ALLOWED_* fall back to Workers KV AIXODIA_CONFIG, so verify the db first.
-    let client_auth = client_auth::ClientAuth::from_env(token.clone(), &db).await;
+    let client_auth = client_auth::ClientAuth::from_kv(token.clone(), &db).await?;
     // Pulls the Worker's live token set before answering requests, then keeps it
     // current every minute so a token issued while this process was down still
     // works (see auth_system.md's sync rules).
@@ -177,15 +178,23 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let hub = Arc::new(Hub::new());
     let chat = chat_func(gateway.clone());
     let mut terminal_server = TerminalServer::new(token.clone());
-    terminal_server.tmux =
-        aixodia_terminal::tmux_available() && std::env::var("AIXODIA_TMUX").as_deref() != Ok("0");
+    let tmux_enabled = db
+        .config_kv_get("runtime/tmux_enabled")
+        .await?
+        .map(|value| value.trim() != "0" && !value.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    terminal_server.tmux = aixodia_terminal::tmux_available() && tmux_enabled;
     if terminal_server.tmux {
         aixodia_terminal::tmux::hide_status_bars();
         aixodia_terminal::tmux::disable_mouse();
     }
     // The screen is a hub per process, like the terminal server: one display,
     // one capture, however many phones are looking at it.
-    let screen = aixodia_screen::ScreenHub::new(std::env::var("DISPLAY").unwrap_or_default(), token.clone());
+    let display = db
+        .config_kv_get("runtime/display")
+        .await?
+        .unwrap_or_default();
+    let screen = aixodia_screen::ScreenHub::new(display, token.clone());
     let terminal = Arc::new(terminal_server);
     terminal.set_logf(Arc::new(|message| {
         d1log::info(message.clone());
@@ -221,7 +230,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .merge(terminal.router())
         .merge(aixodia_relay::router(relay_cfg))
         .merge(client_auth.router())
-        .merge(devices::Devices::new(db.clone()).router())
+        .merge(devices::Devices::new(db.clone()).await?.router())
         .route(
             "/ws",
             get(move |request: axum::extract::Request| {
@@ -637,12 +646,9 @@ fn spawn_config_reloader(cancel: CancellationToken, db: DbClient) {
 /// The engine's local state directory. The keeper records only its child
 /// cloudflared pid here so an in-place executable update can reap an old tunnel.
 fn home_dir() -> std::path::PathBuf {
-    match std::env::var_os("AIXODIA_HOME").filter(|home| !home.is_empty()) {
-        Some(home) => std::path::PathBuf::from(home),
-        None => match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-            Some(home) => std::path::PathBuf::from(home).join(".aixodia"),
-            None => std::path::PathBuf::from("."),
-        },
+    match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => std::path::PathBuf::from(home).join(".aixodia"),
+        None => std::path::PathBuf::from("."),
     }
 }
 

@@ -9,7 +9,8 @@
 //! * [`install`] downloads the published asset, verifies it by sha256 against
 //!   the running copy, and swaps it into place.
 //! * [`apply`] installs and, when the binary changed, replaces this process
-//!   with it: same pid, same arguments, same environment.
+//!   with it: same pid and arguments, with application configuration variables
+//!   removed from the inherited environment.
 //! * [`notify_update`] makes `kill -USR1 <pid>` mean "install the published build
 //!   and continue as it"; the signal is the whole handshake, so no inbound port
 //!   has to be this engine's.
@@ -364,7 +365,8 @@ pub(crate) fn write_executable(path: &str, payload: &[u8]) -> io::Result<()> {
 }
 
 /// Installs `release` and, when the binary changed, replaces this process with
-/// it: same pid, same arguments, same environment.
+/// it: same pid and arguments, while removing application configuration variables
+/// from the inherited environment.
 ///
 /// This does not return on success; the new binary takes over with this pid.
 pub async fn apply(release: Release, target: &str) -> Result<()> {
@@ -389,8 +391,37 @@ pub fn target_path() -> String {
         .unwrap_or_else(|| TARGET_PATH.to_string())
 }
 
-/// Replaces this process with the binary at `target`. Same pid, same arguments,
-/// same environment.
+/// Whether an inherited variable is application configuration rather than an
+/// operating-system setting or the Engine's one credential.
+fn is_application_config_env(key: &std::ffi::OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    key.starts_with("AIXODIA_")
+        || matches!(
+            key,
+            "ACCESS_TEAM_DOMAIN"
+                | "ACCESS_APP_AUD"
+                | "ACCESS_ACCEPTED_AUDIENCES"
+                | "ALLOWED_ORIGINS"
+                | "ALLOWED_GITHUB_USERS"
+                | "AUTH_WORKER_URL"
+                | "AUTH_SYNC_SECRET"
+                | "AUTH_ALLOWED_EMAILS"
+                | "CF_API_TOKEN"
+                | "CLOUDFLARE_API_TOKEN"
+                | "GITHUB_CLIENT_ID"
+                | "GITHUB_CLIENT_SECRET"
+                | "GITHUB_REDIRECT_URI"
+                | "HF_TOKEN"
+                | "RUST_LOG"
+                | "TUNNEL_TOKEN"
+        )
+}
+
+/// Replaces this process with the binary at `target`. The pid and arguments
+/// remain stable; CF_TOKEN and standard OS environment are preserved, while
+/// application configuration variables are reloaded from KV/D1 by the new image.
 #[cfg(unix)]
 pub fn exec_in_place(target: &str) -> Result<()> {
     use std::os::unix::ffi::OsStringExt;
@@ -399,6 +430,7 @@ pub fn exec_in_place(target: &str) -> Result<()> {
         .map(|arg| CString::new(arg.into_vec()).unwrap_or_default())
         .collect();
     let env: Vec<CString> = std::env::vars_os()
+        .filter(|(key, _)| !is_application_config_env(key))
         .map(|(key, value)| {
             let mut raw = key.into_vec();
             raw.push(b'=');
@@ -692,6 +724,35 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn in_place_update_keeps_only_non_application_environment_settings() {
+        for key in [
+            "AIXODIA_HOME",
+            "AUTH_WORKER_URL",
+            "AUTH_SYNC_SECRET",
+            "ACCESS_TEAM_DOMAIN",
+            "ACCESS_APP_AUD",
+            "ALLOWED_ORIGINS",
+            "ALLOWED_GITHUB_USERS",
+            "GITHUB_CLIENT_SECRET",
+            "GITHUB_REDIRECT_URI",
+            "HF_TOKEN",
+            "RUST_LOG",
+            "TUNNEL_TOKEN",
+        ] {
+            assert!(
+                is_application_config_env(std::ffi::OsStr::new(key)),
+                "{key} must not survive an in-place Engine update"
+            );
+        }
+        for key in ["CF_TOKEN", "HOME", "PATH", "LANG", "DISPLAY", "XAUTHORITY"] {
+            assert!(
+                !is_application_config_env(std::ffi::OsStr::new(key)),
+                "{key} is a credential or OS setting and must be preserved"
+            );
+        }
+    }
 
     /// The self-update tests share the process-wide HOME and SIGUSR1 handler,
     /// so they must run one at a time: a guard dropped by one test would leave

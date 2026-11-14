@@ -34,6 +34,7 @@ impl Pty {
         let mut command = Command::new(program);
         command
             .args(args)
+            .env_remove("CF_TOKEN")
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave));

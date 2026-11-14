@@ -215,10 +215,8 @@ impl H264Encoder {
         // The X frame is four bytes a pixel, blue first. That is exactly what
         // the library's BGRA source reads, so the pixels go in as they are and
         // the unused pad byte is ignored — no per-pixel copy at all.
-        let source = openh264::formats::BgraSliceU8::new(
-            bgrx,
-            (self.width as usize, self.height as usize),
-        );
+        let source =
+            openh264::formats::BgraSliceU8::new(bgrx, (self.width as usize, self.height as usize));
         // Colour conversion is one call; doing it by hand would duplicate the
         // library's own and gain nothing.
         self.yuv.read_rgb(source);
@@ -267,8 +265,18 @@ mod tests {
         let height = 128;
         let frame = solid(width, height, 0x40);
         let mut previous = frame.clone();
-        let updates = diff_and_encode(&frame, width, height, &mut previous, false, EncodeSettings::default());
-        assert!(updates.is_empty(), "nothing changed, so nothing should travel");
+        let updates = diff_and_encode(
+            &frame,
+            width,
+            height,
+            &mut previous,
+            false,
+            EncodeSettings::default(),
+        );
+        assert!(
+            updates.is_empty(),
+            "nothing changed, so nothing should travel"
+        );
     }
 
     #[test]
@@ -286,7 +294,14 @@ mod tests {
             }
         }
 
-        let updates = diff_and_encode(&frame, width, height, &mut previous, false, EncodeSettings::default());
+        let updates = diff_and_encode(
+            &frame,
+            width,
+            height,
+            &mut previous,
+            false,
+            EncodeSettings::default(),
+        );
         assert_eq!(updates.len(), 1, "one tile changed");
         assert_eq!((updates[0].col, updates[0].row), (1, 0));
         assert!(!updates[0].jpeg.is_empty());
@@ -299,11 +314,26 @@ mod tests {
         let height = 70;
         let frame = solid(width, height, 0x20);
         let mut previous = frame.clone();
-        let updates = diff_and_encode(&frame, width, height, &mut previous, true, EncodeSettings::default());
+        let updates = diff_and_encode(
+            &frame,
+            width,
+            height,
+            &mut previous,
+            true,
+            EncodeSettings::default(),
+        );
 
-        let last_column = updates.iter().filter(|t| t.col == 1).next().expect("edge column");
+        let last_column = updates
+            .iter()
+            .filter(|t| t.col == 1)
+            .next()
+            .expect("edge column");
         assert_eq!(last_column.width, 36);
-        let last_row = updates.iter().filter(|t| t.row == 1).next().expect("edge row");
+        let last_row = updates
+            .iter()
+            .filter(|t| t.row == 1)
+            .next()
+            .expect("edge row");
         assert_eq!(last_row.height, 6);
     }
 
@@ -313,7 +343,14 @@ mod tests {
         let height = 128;
         let frame = solid(width, height, 0x10);
         let mut previous = frame.clone();
-        let updates = diff_and_encode(&frame, width, height, &mut previous, true, EncodeSettings::default());
+        let updates = diff_and_encode(
+            &frame,
+            width,
+            height,
+            &mut previous,
+            true,
+            EncodeSettings::default(),
+        );
         // 128 / 64 = 2 columns and 2 rows.
         assert_eq!(updates.len(), 4);
     }
@@ -324,7 +361,11 @@ mod tests {
         let height = 128;
         let frame = solid(width, height, 0x30);
         let mut previous = frame.clone();
-        let settings = EncodeSettings { tile: 32, quality: 50 }.sanitized();
+        let settings = EncodeSettings {
+            tile: 32,
+            quality: 50,
+        }
+        .sanitized();
         let updates = diff_and_encode(&frame, width, height, &mut previous, true, settings);
         // 128 / 32 = 4 columns by 4 rows.
         assert_eq!(updates.len(), 16);
@@ -332,7 +373,11 @@ mod tests {
 
     #[test]
     fn a_quality_outside_the_range_is_clamped() {
-        let wild = EncodeSettings { tile: 5, quality: 250 }.sanitized();
+        let wild = EncodeSettings {
+            tile: 5,
+            quality: 250,
+        }
+        .sanitized();
         assert_eq!(wild.tile, 16);
         assert_eq!(wild.quality, 95);
     }
@@ -350,7 +395,11 @@ mod tests {
         }
         let jpeg = encode_tile(&pixels, width, height, QUALITY).expect("a tile encodes");
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "JPEG start-of-image marker");
-        assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "JPEG end-of-image marker");
+        assert_eq!(
+            &jpeg[jpeg.len() - 2..],
+            &[0xFF, 0xD9],
+            "JPEG end-of-image marker"
+        );
     }
 }
 
@@ -579,11 +628,25 @@ mod codec_comparison {
         let h264_scroll_time = started.elapsed();
 
         println!("JPEG  first: {:>7} B in {:?}", jpeg_first_bytes, jpeg_first);
-        println!("JPEG  scroll:{:>7} B in {:?}", jpeg_scroll_bytes, jpeg_scroll);
-        println!("H.264 first: {:>7} B in {:?}", h264_first.len(), h264_first_time);
-        println!("H.264 scroll:{:>7} B in {:?}", h264_scroll.len(), h264_scroll_time);
+        println!(
+            "JPEG  scroll:{:>7} B in {:?}",
+            jpeg_scroll_bytes, jpeg_scroll
+        );
+        println!(
+            "H.264 first: {:>7} B in {:?}",
+            h264_first.len(),
+            h264_first_time
+        );
+        println!(
+            "H.264 scroll:{:>7} B in {:?}",
+            h264_scroll.len(),
+            h264_scroll_time
+        );
 
-        assert!(!h264_first.is_empty(), "the first frame must carry a picture");
+        assert!(
+            !h264_first.is_empty(),
+            "the first frame must carry a picture"
+        );
         assert!(
             !h264_scroll.is_empty(),
             "a scrolled frame must carry its changes"

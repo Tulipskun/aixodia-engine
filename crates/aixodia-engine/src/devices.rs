@@ -7,7 +7,6 @@
 //! like every other `/v1/*` route, so a browser uses its short-lived token (or
 //! a caller uses `CF_TOKEN`); `CF_TOKEN` is never forwarded upstream.
 
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,7 +52,6 @@ pub struct Devices {
     db: DbClient,
     http: reqwest::Client,
     upstream: String,
-    static_devices: Vec<String>,
 }
 
 struct McpError {
@@ -74,30 +72,25 @@ fn device_error(status: StatusCode, code: &str, message: impl Into<String>) -> R
 }
 
 impl Devices {
-    pub fn new(db: DbClient) -> Arc<Self> {
+    pub async fn new(db: DbClient) -> anyhow::Result<Arc<Self>> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(25))
-            .build()
-            .expect("reqwest client");
-        let upstream = env::var("AIXODIA_MCP_UPSTREAM")
-            .unwrap_or_else(|_| DEFAULT_UPSTREAM.to_string())
+            .build()?;
+        let upstream = db
+            .config_kv_get("mcp/upstream")
+            .await?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string())
             .trim()
             .trim_end_matches('/')
             .to_string();
-        let static_devices = env::var("AIXODIA_DEVICE_TUNNELS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|name| valid_device_name(name))
-            .map(str::to_string)
-            .collect();
-        Arc::new(Self {
-            db,
-            http,
-            upstream,
-            static_devices,
-        })
+        let parsed = url::Url::parse(&upstream)
+            .map_err(|_| anyhow::anyhow!("Workers KV key mcp/upstream is not a valid URL"))?;
+        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+            anyhow::bail!("Workers KV key mcp/upstream must be an https:// URL");
+        }
+        Ok(Arc::new(Self { db, http, upstream }))
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -108,20 +101,10 @@ impl Devices {
             .with_state(self.clone())
     }
 
-    /// Registered device names: Workers KV `DEVICE_TUNNELS` first (via
-    /// `DbClient::device_names`), then the `AIXODIA_DEVICE_TUNNELS` env
-    /// fallback. An empty KV namespace is not an error — the caller answers
-    /// `{devices: []}` with an explanatory note.
-    async fn registered(&self) -> (Vec<String>, &'static str) {
-        match self.db.device_names().await {
-            Ok(names) if !names.is_empty() => return (names, "kv:DEVICE_TUNNELS"),
-            Ok(_) => {}
-            Err(err) => tracing::warn!("device registry KV: {err}"),
-        }
-        if !self.static_devices.is_empty() {
-            return (self.static_devices.clone(), "env:AIXODIA_DEVICE_TUNNELS");
-        }
-        (Vec::new(), "none")
+    /// Registered device names come exclusively from Workers KV DEVICE_TUNNELS.
+    /// A missing/empty registry returns an empty list; API errors are surfaced.
+    async fn registered(&self) -> Result<Vec<String>, aixodia_db::Error> {
+        self.db.device_names().await
     }
 
     /// One JSON-RPC call to the device's MCP endpoint, with a per-request
@@ -227,7 +210,17 @@ impl Devices {
 }
 
 async fn list_devices(State(devices): State<Arc<Devices>>) -> Response {
-    let (names, source) = devices.registered().await;
+    let names = match devices.registered().await {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::error!("device registry KV read failed: {err}");
+            return device_error(
+                StatusCode::BAD_GATEWAY,
+                "DEVICE_REGISTRY_UNAVAILABLE",
+                "Workers KV DEVICE_TUNNELS could not be read",
+            );
+        }
+    };
     if names.is_empty() {
         return (
             StatusCode::OK,
@@ -236,8 +229,8 @@ async fn list_devices(State(devices): State<Arc<Devices>>) -> Response {
                 "items": [],
                 "checkedAt": now_iso(),
                 "ephemeral": true,
-                "source": source,
-                "note": "No devices registered: Workers KV DEVICE_TUNNELS (and AIXODIA_DEVICE_TUNNELS) are empty, so the device list is intentionally empty rather than a 500.",
+                "source": "kv:DEVICE_TUNNELS",
+                "note": "No devices registered in Workers KV DEVICE_TUNNELS.",
             })),
         )
             .into_response();
@@ -267,7 +260,7 @@ async fn list_devices(State(devices): State<Arc<Devices>>) -> Response {
             "items": items,
             "checkedAt": now_iso(),
             "ephemeral": true,
-            "source": source,
+            "source": "kv:DEVICE_TUNNELS",
         })),
     )
         .into_response()

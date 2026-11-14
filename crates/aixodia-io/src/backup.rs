@@ -78,8 +78,8 @@ pub(crate) struct Stored {
     pub(crate) auto_cooldown_secs: Option<u64>,
 }
 
-/// The configuration, with the stored state layered over the defaults. The
-/// environment may supply the token, for a machine that keeps it out of D1.
+/// The configuration, with the stored D1 state layered over the defaults.
+/// Credentials are stored in D1 and are never sourced from environment variables.
 pub(crate) fn resolve(stored: Option<&str>) -> aixodia_backup::Config {
     let parsed: Stored = stored
         .and_then(|raw| serde_json::from_str(raw).ok())
@@ -88,11 +88,6 @@ pub(crate) fn resolve(stored: Option<&str>) -> aixodia_backup::Config {
     let token = parsed
         .token
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("HF_TOKEN")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
         .unwrap_or(defaults.token);
     let bucket = parsed
         .bucket
@@ -955,10 +950,9 @@ mod tests {
         let cfg = resolve(Some(&serde_json::to_string(&merged).unwrap()));
         assert_eq!(cfg.bucket, "me/other");
         assert_eq!(cfg.prefix, "p");
-        // A read-only test cannot claim the env token is absent, so it asserts
-        // the one thing the merge decides: a write that never mentions the
-        // token does not clear it.
-        assert!(!cfg.token.is_empty() || std::env::var("HF_TOKEN").is_err());
+        // A write that never mentions the token does not clear the D1-stored
+        // credential; no environment fallback participates in resolution.
+        assert_eq!(cfg.token, "hf_stored");
     }
 
     /// An omitted `excludes` is the phone saying nothing about the scope, which
