@@ -9,6 +9,54 @@ use crate::pty::Pty;
 
 pub const TMUX_SOCKET: &str = "aixodia";
 
+/// Never give the Cloudflare account token to the persistent tmux server or
+/// to tmux client processes. A user shell must not be able to read the Engine's
+/// Cloudflare credential from its inherited environment.
+fn tmux_command() -> Command {
+    let mut command = Command::new("tmux");
+    command.env_remove("CF_TOKEN");
+    command
+}
+
+/// Remove a token inherited by a tmux server from an older Engine process,
+/// including per-session copies, before adopting its existing sessions.
+fn scrub_master_token() {
+    let _ = tmux_command()
+        .args(["-L", TMUX_SOCKET, "set-environment", "-gu", "CF_TOKEN"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let Ok(output) = tmux_command()
+        .args(["-L", TMUX_SOCKET, "list-sessions", "-F", "#{session_name}"])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    for name in String::from_utf8_lossy(&output.stdout).lines() {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let _ = tmux_command()
+            .args([
+                "-L",
+                TMUX_SOCKET,
+                "set-environment",
+                "-u",
+                "-t",
+                name,
+                "CF_TOKEN",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 pub fn available() -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
@@ -35,7 +83,7 @@ pub fn tmux_name(id: &str) -> String {
 /// Ends a shell for good. Closing the pty only detaches the client, so the tmux
 /// session must be killed or the phone reattaches to a tab it closed.
 pub fn kill(id: &str) {
-    let _ = Command::new("tmux")
+    let _ = tmux_command()
         .args(["-L", TMUX_SOCKET, "kill-session", "-t", &tmux_name(id)])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -68,7 +116,7 @@ pub fn pane_pid(id: &str) -> Option<i32> {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .args([
                 "-L",
                 TMUX_SOCKET,
@@ -113,7 +161,7 @@ const HISTORY_BYTES: usize = 512 << 10;
 /// client's screen into a state no program asked for.
 pub fn capture_history(id: &str) -> Option<Vec<u8>> {
     let start = format!("-{}", HISTORY_LINES);
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args([
             "-L",
             TMUX_SOCKET,
@@ -156,7 +204,7 @@ pub fn capture_history(id: &str) -> Option<Vec<u8>> {
 /// title, so it survives a detached client, and `#{pane_title}` may carry the
 /// padding tmux adds up to `set-titles-string`'s width.
 pub fn pane_title(id: &str) -> Option<String> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args([
             "-L",
             TMUX_SOCKET,
@@ -181,7 +229,7 @@ pub fn pane_title(id: &str) -> Option<String> {
 
 /// Sessions that survived an engine restart.
 pub fn list() -> Vec<TmuxSession> {
-    let output = Command::new("tmux")
+    let output = tmux_command()
         .args([
             "-L",
             TMUX_SOCKET,
@@ -274,7 +322,7 @@ pub fn start(
 /// This is a global option, and panes outlive an engine restart, so the server
 /// this boot merely adopted may still carry it on from a build that turned it on.
 pub fn disable_mouse() {
-    let _ = Command::new("tmux")
+    let _ = tmux_command()
         .args(["-L", TMUX_SOCKET, "set-option", "-g", "mouse", "off"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -285,7 +333,8 @@ pub fn disable_mouse() {
 /// outlive an engine restart, so the sessions this boot merely adopts are the
 /// ones a previous build may have left with the bar showing.
 pub fn hide_status_bars() {
-    let Ok(output) = Command::new("tmux")
+    scrub_master_token();
+    let Ok(output) = tmux_command()
         .args(["-L", TMUX_SOCKET, "list-sessions", "-F", "#{session_name}"])
         .output()
     else {
@@ -299,7 +348,7 @@ pub fn hide_status_bars() {
         if name.is_empty() {
             continue;
         }
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["-L", TMUX_SOCKET, "set-option", "-t", name, "status", "off"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

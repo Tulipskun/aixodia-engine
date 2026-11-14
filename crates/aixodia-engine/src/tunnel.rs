@@ -94,6 +94,7 @@ pub async fn start_cloudflared(
             "127.0.0.1:0",
             "run",
         ])
+        .env_remove("CF_TOKEN")
         .env("TUNNEL_TOKEN", token)
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
