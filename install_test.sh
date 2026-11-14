@@ -9,6 +9,19 @@ fails=0
 pass() { echo "ok   - $1"; }
 fail() { echo "FAIL - $1"; fails=$((fails + 1)); }
 
+# Isolate PATH from programs installed on the host (especially cloudflared), so
+# the fresh-install test always exercises the download path deterministically.
+test_path() {
+  local fakecurl="$1" path cmd source
+  path="$(mktemp -d)"
+  for cmd in bash uname id dirname mkdir mktemp chmod mv rm basename; do
+    source="$(command -v "$cmd")"
+    ln -s "$source" "$path/$cmd"
+  done
+  ln -s "$fakecurl/curl" "$path/curl"
+  printf '%s\n' "$path"
+}
+
 # --- fresh install drops the binaries and the tunnel helper in the prefix ----
 prefix=$(mktemp -d)
 fakecurl=$(mktemp -d)
@@ -26,7 +39,8 @@ done
 [ -n "$out" ] && printf 'x\n' > "$out"
 FAKE
 chmod +x "$fakecurl/curl"
-out=$(PATH="$fakecurl:/usr/bin:/bin" bash "$HERE/install.sh" "$prefix" 2>&1); rc=$?
+testbin="$(test_path "$fakecurl")"
+out=$(PATH="$testbin" bash "$HERE/install.sh" "$prefix" 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then
   pass "install exits 0"
 else
@@ -50,7 +64,8 @@ die() { printf 'curl: %s\n' "$*" >&2; exit 1; }
 die "simulated failure"
 FAKE
 chmod +x "$fakecurl/curl"
-out=$(PATH="$fakecurl:/usr/bin:/bin" bash "$HERE/install.sh" "$prefix" 2>&1); rc=$?
+testbin="$(test_path "$fakecurl")"
+out=$(PATH="$testbin" bash "$HERE/install.sh" "$prefix" 2>&1); rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "cannot download"; then
   pass "a failed download fails loudly"
 else
@@ -75,10 +90,11 @@ printf '%s\n' "$url" >> "${RECORD:?}"
 [ -n "$out" ] && printf 'x\n' > "$out"
 FAKE
 chmod +x "$fakecurl/curl"
+testbin="$(test_path "$fakecurl")"
 want=amd64
 case "$(uname -m)" in aarch64|arm64) want=arm64 ;; esac
 prefix=$(mktemp -d)
-PATH="$fakecurl:/usr/bin:/bin" RECORD="$record" bash "$HERE/install.sh" "$prefix" >/dev/null 2>&1
+PATH="$testbin" RECORD="$record" bash "$HERE/install.sh" "$prefix" >/dev/null 2>&1
 if grep -q "aixodia-engine-linux-$want" "$record"; then
   pass "engine download matches the host arch ($want)"
 else
