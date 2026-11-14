@@ -14,11 +14,13 @@
 //! of frames (the mask bit, unmasking, extended lengths) and the Go tests assert
 //! exactly those.
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
+use axum::extract::Request;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
@@ -428,3 +430,110 @@ impl<W: AsyncWrite + Unpin + Send> MessageWriter<W> {
 pub mod client;
 
 pub use client::Client;
+
+/// Short-lived, single-use tickets for socket dials.
+///
+/// A WebSocket upgrade from a phone cannot carry an `Authorization` header — the
+/// platform's client does not let one be set on the handshake. So a client asks
+/// over an ordinary authenticated POST for a ticket and puts it in the query
+/// string instead. The ticket is good once and for a few seconds: enough to
+/// dial, useless to anyone who reads it later out of a log.
+///
+/// Both the terminal and the screen use one of these, which is why it lives
+/// here rather than in either of them.
+#[derive(Default)]
+pub struct Tickets {
+    live: StdMutex<HashMap<String, Instant>>,
+}
+
+impl Tickets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mints a ticket. The returned second value is when it stops being good,
+    /// as a Unix timestamp, so a client can log it.
+    pub fn issue(&self) -> (String, i64) {
+        let ticket = uuid::Uuid::new_v4().simple().to_string();
+        let now = Instant::now();
+        let expires = now + TICKET_TTL;
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        // Spent entries are dropped as we go: a long-lived engine would
+        // otherwise keep every ticket ever issued.
+        live.retain(|_, at| *at > now);
+        live.insert(ticket.clone(), expires);
+        (ticket, now_unix() + TICKET_TTL.as_secs() as i64)
+    }
+
+    /// Spends a ticket. True only the first time, for a ticket that has not
+    /// expired.
+    pub fn consume(&self, value: &str) -> bool {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        match live.remove(value) {
+            Some(expires) => Instant::now() < expires,
+            None => false,
+        }
+    }
+
+    /// Whether a request should be let in: a bearer token, or a ticket in the
+    /// query string that this store accepts.
+    pub fn admits(&self, request: &Request, token: &str) -> bool {
+        if bearer_ok(request.headers(), token) {
+            return true;
+        }
+        self.consume(&ticket_of(request))
+    }
+}
+
+/// The `ticket` query parameter of a request, decoded, or an empty string.
+pub fn ticket_of<B>(request: &Request<B>) -> String {
+    request
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("ticket="))
+        .map(|value| {
+            let mut out = String::with_capacity(value.len());
+            let bytes = value.as_bytes();
+            let mut at = 0;
+            while at < bytes.len() {
+                match bytes[at] {
+                    b'%' if at + 2 < bytes.len() => {
+                        let hex = &value[at + 1..at + 3];
+                        if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                            out.push(byte as char);
+                            at += 3;
+                            continue;
+                        }
+                        out.push('%');
+                        at += 1;
+                    }
+                    b'+' => {
+                        out.push(' ');
+                        at += 1;
+                    }
+                    other => {
+                        out.push(other as char);
+                        at += 1;
+                    }
+                }
+            }
+            out
+        })
+        .unwrap_or_default()
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long a ticket stays good. One dial is all it is for.
+pub const TICKET_TTL: Duration = Duration::from_secs(45);

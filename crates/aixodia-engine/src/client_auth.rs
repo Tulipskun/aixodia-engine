@@ -790,13 +790,15 @@ pub async fn client_guard(
         return with_cors(next.run(request).await, &cors);
     }
 
-    // A terminal socket carries a single-use ticket instead of a bearer: the
-    // browser-shaped clients cannot set a header on a WebSocket, so the engine
-    // mints a short-lived ticket over an authenticated POST and the dial carries
-    // it in the query. Only the terminal handler can consume one — this layer has
-    // no ticket store — so it is let through and the handler refuses a bad or
-    // spent ticket itself.
-    if path == "/terminal" && request.uri().query().is_some_and(|q| q.contains("ticket=")) {
+    // A terminal or screen socket carries a single-use ticket instead of a
+    // bearer: the browser-shaped clients cannot set a header on a WebSocket, so
+    // the engine mints a short-lived ticket over an authenticated POST and the
+    // dial carries it in the query. Only the handler that owns the ticket store
+    // can consume one — this layer has none — so it is let through and the
+    // handler refuses a bad or spent ticket itself.
+    if (path == "/terminal" || path == "/api/screen")
+        && request.uri().query().is_some_and(|q| q.contains("ticket="))
+    {
         return with_cors(next.run(request).await, &cors);
     }
 

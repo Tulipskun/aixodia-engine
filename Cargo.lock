@@ -98,6 +98,7 @@ dependencies = [
  "aixodia-provider",
  "aixodia-relay",
  "aixodia-run",
+ "aixodia-screen",
  "aixodia-selfupdate",
  "aixodia-session",
  "aixodia-terminal",
@@ -259,6 +260,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aixodia-screen"
+version = "0.1.0"
+dependencies = [
+ "aixodia-wsock",
+ "axum",
+ "base64 0.22.1",
+ "image",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "x11",
+]
+
+[[package]]
 name = "aixodia-selfupdate"
 version = "0.1.0"
 dependencies = [
@@ -348,6 +364,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4146,6 +4163,16 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "x11"
+version = "2.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "502da5464ccd04011667b11c435cb992822c2c0dbde1770c988480d312a0db2e"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "xet-client"

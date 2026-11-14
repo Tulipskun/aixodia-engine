@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+uuid = { version = "1", features = ["v4"] }
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true

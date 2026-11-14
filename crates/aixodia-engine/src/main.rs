@@ -183,6 +183,9 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         aixodia_terminal::tmux::hide_status_bars();
         aixodia_terminal::tmux::disable_mouse();
     }
+    // The screen is a hub per process, like the terminal server: one display,
+    // one capture, however many phones are looking at it.
+    let screen = aixodia_screen::ScreenHub::new(std::env::var("DISPLAY").unwrap_or_default(), token.clone());
     let terminal = Arc::new(terminal_server);
     terminal.set_logf(Arc::new(|message| {
         d1log::info(message.clone());
@@ -194,6 +197,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let rpc = gateway
         .router()
         .merge(aixodia_run::router(runs.clone()))
+        .merge(aixodia_screen::router(screen.clone()))
         .merge(terminal.router());
     let relay_cfg = Arc::new(aixodia_relay::Config {
         token: token.clone(),
@@ -213,6 +217,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let mut mux = gateway
         .router()
         .merge(aixodia_run::router(runs.clone()))
+        .merge(aixodia_screen::router(screen.clone()))
         .merge(terminal.router())
         .merge(aixodia_relay::router(relay_cfg))
         .merge(client_auth.router())

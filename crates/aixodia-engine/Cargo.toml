@@ -21,6 +21,7 @@ aixodia-relay = { path = "../aixodia-relay" }
 aixodia-run = { path = "../aixodia-run" }
 aixodia-selfupdate = { path = "../aixodia-selfupdate" }
 aixodia-session = { path = "../aixodia-session" }
+aixodia-screen = { path = "../aixodia-screen" }
 aixodia-terminal = { path = "../aixodia-terminal" }
 aixodia-tools = { path = "../aixodia-tools" }
 anyhow.workspace = true
