@@ -1028,7 +1028,7 @@ async fn public_client(target: &url::Url) -> Result<reqwest::Client> {
         }
     }
     let first = addrs[0];
-    reqwest::Client::builder()
+    aixodia_net::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .resolve(&host, first)

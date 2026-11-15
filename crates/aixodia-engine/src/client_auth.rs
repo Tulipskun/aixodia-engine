@@ -288,7 +288,9 @@ impl ClientAuth {
         }
 
         let url = format!("{}/auth/verify", self.auth_worker.trim_end_matches('/'));
-        let response = match reqwest::Client::new()
+        let response = match aixodia_net::client_builder()
+            .build()
+            .expect("http client")
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .timeout(std::time::Duration::from_secs(5))
@@ -401,7 +403,9 @@ impl ClientAuth {
             self.auth_worker.trim_end_matches('/')
         );
         let secret = self.sync_secret.clone();
-        let Ok(response) = reqwest::Client::new()
+        let Ok(response) = aixodia_net::client_builder()
+            .build()
+            .expect("http client")
             .get(&url)
             .header("x-auth-sync", &secret)
             .header(header::ACCEPT, "application/json")
@@ -519,7 +523,9 @@ impl ClientAuth {
 
         let url = format!("https://{}/cdn-cgi/access/certs", self.team_domain);
         let fetched = async {
-            let response = reqwest::Client::new()
+            let response = aixodia_net::client_builder()
+                .build()
+                .expect("http client")
                 .get(&url)
                 .timeout(Duration::from_secs(10))
                 .send()

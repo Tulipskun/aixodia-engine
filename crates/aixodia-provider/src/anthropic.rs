@@ -26,7 +26,7 @@ fn shared_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
+            aixodia_net::client_builder()
                 .build()
                 .expect("provider HTTP client")
         })

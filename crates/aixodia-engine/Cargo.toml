@@ -11,6 +11,7 @@ name = "aixodia-engine"
 path = "src/main.rs"
 
 [dependencies]
+aixodia-net = { path = "../aixodia-net" }
 aixodia-config = { path = "../aixodia-config" }
 aixodia-db = { path = "../aixodia-db" }
 aixodia-goals = { path = "../aixodia-goals" }

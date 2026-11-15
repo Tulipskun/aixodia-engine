@@ -20,7 +20,7 @@ pub const MODEL_CACHE_TTL: Duration = Duration::from_secs(60);
 /// One shared client, like the Go package's `provider.HTTP`.
 pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| aixodia_net::client_builder().build().expect("http client"))
 }
 
 #[derive(Debug, Default, Deserialize)]

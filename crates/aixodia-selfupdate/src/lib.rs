@@ -14,13 +14,17 @@
 //! * [`notify_update`] makes `kill -USR1 <pid>` mean "install the published build
 //!   and continue as it"; the signal is the whole handshake, so no inbound port
 //!   has to be this engine's.
-//! * [`run_loop`] checks the published build every ten minutes and applies a
-//!   queued request as soon as the engine is idle.
+//!
+//! Nothing checks the release page on its own. An engine installs a new build
+//! when an operator asks for one, because the swap replaces the running process
+//! and anything talking to it at that moment — a terminal asking for its
+//! ticket, a chat mid-turn — sees the engine disappear. The signal is the only
+//! trigger.
 //!
 //! Every install is gated on the engine being idle: a chat in flight never gets
 //! its process replaced underneath it. A request that arrives mid-chat is
-//! queued with [`mark_pending`] and applied by [`run_loop`] when the chat ends,
-//! so one `aixodia update` is enough.
+//! queued with [`mark_pending`] and applied as soon as the engine goes idle, so
+//! one `aixodia update` is enough.
 //!
 //! On Linux the running bytes are always read from `/proc/self/exe`, which
 //! stays bound to the inode that was loaded even after `install.sh` renames a
@@ -34,11 +38,9 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio_util::sync::CancellationToken;
 
 /// The published release this engine tracks.
 pub const RELEASE_URL: &str =
@@ -49,13 +51,6 @@ pub const TARGET_PATH: &str = "/usr/local/bin/aixodia-engine";
 
 /// `User-Agent` sent to GitHub and to the asset host.
 pub const USER_AGENT: &str = "aixodia-engine/1.0";
-
-/// How long [`run_loop`] waits after start before its first check, so a fresh
-/// boot is not immediately interrupted by a download.
-pub const START_GRACE: Duration = Duration::from_secs(2 * 60);
-
-/// How often [`run_loop`] checks the published build.
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Errors from the self-update path.
 #[derive(Debug, thiserror::Error)]
@@ -126,7 +121,9 @@ pub fn asset_name() -> String {
 
 /// Finds the published release asset for this host.
 pub async fn latest() -> Result<Release> {
-    let response = reqwest::Client::new()
+    let response = aixodia_net::client_builder()
+        .build()
+        .expect("http client")
         .get(RELEASE_URL)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -257,6 +254,40 @@ pub fn is_pending() -> bool {
     PENDING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Applies an update that was queued while a chat was in flight.
+///
+/// The caller decides when to ask: this is not a poll of the release page, it
+/// only spends a request that was already made. It returns false when nothing
+/// was queued, so a caller can call it cheaply on every idle transition.
+pub async fn apply_pending() -> bool {
+    if !take_pending() {
+        return false;
+    }
+    match need_update().await {
+        Ok((true, release)) => {
+            tracing::info!(published = %release.updated_at, "selfupdate: installing the queued build");
+            match apply(release, &target_path()).await {
+                Ok(()) => true,
+                Err(err) => {
+                    // Put the request back so a later idle moment retries it.
+                    mark_pending();
+                    tracing::warn!(%err, "selfupdate:");
+                    false
+                }
+            }
+        }
+        Ok((false, _)) => {
+            tracing::info!("selfupdate: the queued update is already installed");
+            false
+        }
+        Err(err) => {
+            mark_pending();
+            tracing::warn!(%err, "selfupdate:");
+            false
+        }
+    }
+}
+
 fn default_need() -> NeedFn {
     Arc::new(|| Box::pin(async { need_update().await }))
 }
@@ -312,7 +343,9 @@ fn verify_payload(release: &Release, payload: &[u8]) -> Result<()> {
 /// published bytes are the running executable's. Returns whether `target` now
 /// holds a different binary.
 pub async fn install(release: &Release, target: &str) -> Result<bool> {
-    let response = reqwest::Client::new()
+    let response = aixodia_net::client_builder()
+        .build()
+        .expect("http client")
         .get(&release.url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
@@ -479,8 +512,8 @@ pub const UPDATE_SIGNAL: i32 = 0;
 
 /// Makes `kill -USR1 <pid>` mean "install the published build and continue as
 /// it". `idle` reports whether a chat is in flight; when it is, the request is
-/// queued with [`mark_pending`] and applied by [`run_loop`] as soon as the
-/// engine goes idle, so the operator never has to send the signal twice.
+/// queued with [`mark_pending`] and applied as soon as the engine goes idle, so
+/// the operator never has to send the signal twice.
 ///
 /// The returned guard stops the handler when dropped.
 #[cfg(unix)]
@@ -636,85 +669,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Checks the published build every [`CHECK_INTERVAL`] after [`START_GRACE`],
-/// and installs it only while no chat is in flight.
-///
-/// Two things trigger an install:
-///
-/// * a queued request from `kill -USR1` (see [`take_pending`]), which is honoured
-///   on the first tick that finds the engine idle, and
-/// * the scheduled check, which only queues a build it finds when idle and
-///   leaves it queued otherwise, so a chat in progress defers the swap instead
-///   of cancelling it.
-///
-/// The swap itself is an in-place exec: the pid, session, working directory and
-/// open log file all survive, so nothing outside the process has to be restarted.
-pub async fn run_loop<F>(cancel: CancellationToken, idle: F)
-where
-    F: Fn() -> bool + Send + Sync + 'static,
-{
-    let mut last_err = String::new();
-
-    tokio::select! {
-        _ = cancel.cancelled() => return,
-        _ = tokio::time::sleep(START_GRACE) => {}
-    }
-    loop {
-        if idle() {
-            match need_update().await {
-                Ok((true, release)) => {
-                    tracing::info!(published = %release.updated_at, "selfupdate: installing the build");
-                    // On success this does not return: the new binary takes
-                    // over with this pid.
-                    match apply(release, &target_path()).await {
-                        Ok(()) => note(&mut last_err, None),
-                        Err(err) => {
-                            // Keep the request so the next tick retries it.
-                            mark_pending();
-                            note(&mut last_err, Some(&err));
-                        }
-                    }
-                }
-                Ok((false, _)) => {
-                    // The queued request is satisfied: the running image is
-                    // already the published build.
-                    if take_pending() {
-                        tracing::info!("selfupdate: queued update is already installed");
-                    }
-                    note(&mut last_err, None);
-                }
-                Err(err) => {
-                    mark_pending();
-                    note(&mut last_err, Some(&err));
-                }
-            }
-        }
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(CHECK_INTERVAL) => {}
-        }
-    }
-}
-
-/// Logs a failed check when the message changes, not on every attempt.
-fn note(last_err: &mut String, err: Option<&Error>) {
-    match err {
-        None => {
-            if !last_err.is_empty() {
-                tracing::info!("selfupdate: the release is reachable again");
-                last_err.clear();
-            }
-        }
-        Some(err) => {
-            let message = err.to_string();
-            if message != *last_err {
-                tracing::warn!(%message, "selfupdate:");
-                *last_err = message;
-            }
-        }
-    }
-}
-
 // --- tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -724,6 +678,7 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
 
     #[test]
     fn in_place_update_keeps_only_non_application_environment_settings() {

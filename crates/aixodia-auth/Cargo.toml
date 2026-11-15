@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aixodia-net = { path = "../aixodia-net" }
 reqwest.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["full"] }

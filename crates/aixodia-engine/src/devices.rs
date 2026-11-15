@@ -73,7 +73,7 @@ fn device_error(status: StatusCode, code: &str, message: impl Into<String>) -> R
 
 impl Devices {
     pub async fn new(db: DbClient) -> anyhow::Result<Arc<Self>> {
-        let http = reqwest::Client::builder()
+        let http = aixodia_net::client_builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(25))
             .build()?;

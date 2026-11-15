@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/aixodia-auth",
+    "crates/aixodia-net",
     "crates/aixodia-db",
     "crates/aixodia-config",
     "crates/aixodia-provider",

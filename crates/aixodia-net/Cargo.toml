@@ -1,0 +1,12 @@
+[package]
+name = "aixodia-net"
+description = "The HTTP client every other crate builds: refuses an address family this host cannot reach"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+tokio.workspace = true

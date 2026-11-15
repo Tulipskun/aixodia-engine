@@ -184,7 +184,7 @@ impl Default for Client {
 impl Client {
     /// Builds a client with a 15s request timeout, as the Go engine uses.
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
+        let http = aixodia_net::client_builder()
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client");

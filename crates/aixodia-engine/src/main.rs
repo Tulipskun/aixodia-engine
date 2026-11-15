@@ -312,13 +312,11 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         }
     };
     // Updates install only while no chat is in flight, and always as an
-    // in-place exec, so the pid never changes. A request that arrives during a
-    // chat is queued and applied by the loop once the engine goes idle.
-    let update_idle = idle.clone();
-    let update_cancel = cancel.clone();
-    tokio::spawn(async move {
-        selfupdate::run_loop(update_cancel, update_idle).await;
-    });
+    // in-place exec, so the pid never changes. Nothing polls the release page:
+    // an install happens when `aixodia update` signals this process, and not
+    // otherwise. A scheduled check replaced the running binary underneath
+    // whoever was connected — a terminal asking for a ticket during the swap
+    // got no answer and the screen read that as the engine being gone.
     let _update = selfupdate::notify_update(idle);
 
     let shutdown = cancel.clone();
@@ -359,6 +357,10 @@ fn chat_func(gateway: Arc<Gateway>) -> aixodia_mobile::ChatFunc {
             ACTIVE_CHATS.fetch_add(1, Ordering::SeqCst);
             let result = chat_once(gateway, call).await;
             ACTIVE_CHATS.fetch_sub(1, Ordering::SeqCst);
+            // A turn that ends is the only moment a queued update can run, now
+            // that nothing polls the release page. It costs one HTTP request
+            // when the queue is empty, and is skipped entirely when it is not.
+            let _ = selfupdate::apply_pending().await;
             result
         })
     })

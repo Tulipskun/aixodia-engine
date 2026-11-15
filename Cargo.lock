@@ -33,6 +33,7 @@ dependencies = [
 name = "aixodia-auth"
 version = "0.1.0"
 dependencies = [
+ "aixodia-net",
  "reqwest 0.12.28",
  "serde",
  "tokio",
@@ -75,6 +76,7 @@ dependencies = [
 name = "aixodia-db"
 version = "0.1.0"
 dependencies = [
+ "aixodia-net",
  "anyhow",
  "async-trait",
  "percent-encoding",
@@ -95,6 +97,7 @@ dependencies = [
  "aixodia-goals",
  "aixodia-io",
  "aixodia-mobile",
+ "aixodia-net",
  "aixodia-provider",
  "aixodia-relay",
  "aixodia-run",
@@ -158,6 +161,7 @@ dependencies = [
  "aixodia-db",
  "aixodia-goals",
  "aixodia-imageprep",
+ "aixodia-net",
  "aixodia-provider",
  "aixodia-session",
  "aixodia-tools",
@@ -197,9 +201,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aixodia-net"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "tokio",
+]
+
+[[package]]
 name = "aixodia-provider"
 version = "0.1.0"
 dependencies = [
+ "aixodia-net",
  "anyhow",
  "async-trait",
  "axum",
@@ -280,6 +293,7 @@ dependencies = [
 name = "aixodia-selfupdate"
 version = "0.1.0"
 dependencies = [
+ "aixodia-net",
  "anyhow",
  "axum",
  "hex",
@@ -334,6 +348,7 @@ version = "0.1.0"
 dependencies = [
  "aixodia-goals",
  "aixodia-imageprep",
+ "aixodia-net",
  "aixodia-provider",
  "anyhow",
  "base64 0.22.1",

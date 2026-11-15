@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aixodia-net = { path = "../aixodia-net" }
 aixodia-goals = { path = "../aixodia-goals" }
 aixodia-imageprep = { path = "../aixodia-imageprep" }
 aixodia-provider = { path = "../aixodia-provider" }

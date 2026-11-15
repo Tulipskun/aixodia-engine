@@ -83,7 +83,7 @@ impl GitHubAuth {
         Self {
             allowed,
             api_url: GITHUB_USER_API.to_string(),
-            client: reqwest::Client::builder()
+            client: aixodia_net::client_builder()
                 .user_agent(USER_AGENT)
                 .timeout(Duration::from_secs(10))
                 .build()

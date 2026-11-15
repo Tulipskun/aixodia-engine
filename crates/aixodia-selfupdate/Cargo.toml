@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aixodia-net = { path = "../aixodia-net" }
 anyhow.workspace = true
 hex.workspace = true
 libc.workspace = true
