@@ -295,6 +295,18 @@ pub fn start(
         args.push("-c".to_string());
         args.push(dir.to_string());
     }
+    // A pane inherits the environment of the tmux *server*, which started from
+    // whatever shell first opened this socket and keeps that environment for as
+    // long as it lives. A server booted without a locale gives every pane after
+    // it the `C` locale, where text is measured in bytes: `printf '%-10s'` pads
+    // Thai by byte length so the columns land wrong, and `wc -L` answers 0. The
+    // locale is therefore set on the session itself rather than left to the
+    // server, and only on this socket's sessions.
+    let locale = crate::pty::utf8_locale();
+    args.push("-e".to_string());
+    args.push(format!("LANG={locale}"));
+    args.push("-e".to_string());
+    args.push(format!("LC_CTYPE={locale}"));
     args.push(shell.to_string());
     args.push("-l".to_string());
     // The status bar spends a phone row on a session name and a clock, so it is

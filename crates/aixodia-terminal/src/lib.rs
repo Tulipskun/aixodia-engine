@@ -640,7 +640,9 @@ impl Server {
             match reader.read_message().await {
                 Ok((OP_BINARY, payload)) => {
                     if !session.dead.load(Ordering::SeqCst) {
-                        let _ = session.pty.write(&payload);
+                        if let Err(err) = session.pty.write(&payload) {
+                            self.logf(format!("terminal {id}: {err} bytes dropped"));
+                        }
                     }
                 }
                 Ok((OP_TEXT, payload)) => {

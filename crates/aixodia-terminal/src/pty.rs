@@ -42,6 +42,14 @@ impl Pty {
             command.current_dir(dir);
         }
         command.env("TERM", "xterm-256color");
+        // A shell started without a UTF-8 locale counts columns in bytes, so
+        // `printf '%-10s'` pads Thai by its byte length and the text lands one
+        // cell off; `wc -L` reports 0 for the same reason. The engine is often
+        // started by a supervisor whose environment sets no locale at all, so
+        // the shell is given one here instead of inheriting it.
+        let utf8 = utf8_locale();
+        command.env("LANG", &utf8);
+        command.env("LC_CTYPE", &utf8);
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(|| {
@@ -117,12 +125,56 @@ impl Pty {
         file.read(buf)
     }
 
+    /// Writes every byte, waiting for the pty to accept the rest.
+    ///
+    /// The master is non-blocking because the reader polls it, so a burst of
+    /// typing can arrive faster than the shell drains it. `write_all` stops at
+    /// the first `WouldBlock` with the remainder of the buffer lost — a long
+    /// line arrived with characters missing — so the tail is handed over again
+    /// once the pty has room.
     pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
         let mut file = &*self.master;
-        match file.write_all(data) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(()),
-            Err(err) => Err(err),
+        let mut sent = 0;
+        while sent < data.len() {
+            match file.write(&data[sent..]) {
+                Ok(0) => {
+                    return Err(IoError::new(
+                        ErrorKind::WriteZero,
+                        "the pty accepted no bytes",
+                    ));
+                }
+                Ok(n) => sent += n,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    if !self.wait_writable()? {
+                        return Err(IoError::new(ErrorKind::WouldBlock, "the pty stayed full"));
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits until the master can take more input, or gives up after a second.
+    fn wait_writable(&self) -> std::io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd: self.master.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 1_000) };
+            if ready > 0 {
+                return Ok(true);
+            }
+            if ready == 0 {
+                return Ok(false);
+            }
+            let err = IoError::last_os_error();
+            if err.kind() != ErrorKind::Interrupted {
+                return Err(err);
+            }
         }
     }
 
@@ -262,4 +314,30 @@ pub fn process_alive(pid: i32, start: u64) -> bool {
 /// The master file as a raw fd, for the reader's poll loop.
 pub fn raw_fd(file: &File) -> i32 {
     file.as_raw_fd()
+}
+
+/// The locale a shell is started with: the engine's own if it is a UTF-8 one,
+/// and `C.UTF-8` otherwise.
+///
+/// A shell with the `C` locale counts text in bytes, so `printf '%-10s'` pads
+/// Thai by byte length and the columns land wrong, and `wc -L` reports 0.
+pub fn utf8_locale() -> String {
+    std::env::var("LANG")
+        .ok()
+        .filter(|v| v.to_ascii_uppercase().contains("UTF-8"))
+        .unwrap_or_else(|| "C.UTF-8".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf8_locale;
+
+    #[test]
+    fn a_shell_never_starts_without_a_utf8_locale() {
+        let locale = utf8_locale();
+        assert!(
+            locale.to_ascii_uppercase().contains("UTF-8"),
+            "{locale} is not a UTF-8 locale, so Thai columns will be counted in bytes"
+        );
+    }
 }
