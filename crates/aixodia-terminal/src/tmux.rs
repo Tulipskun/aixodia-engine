@@ -235,7 +235,11 @@ pub fn list() -> Vec<TmuxSession> {
             TMUX_SOCKET,
             "list-sessions",
             "-F",
-            "#{session_name}\u{1f}#{pane_pid}\u{1f}#{pane_current_path}\u{1f}#{session_created}\u{1f}#{pane_title}",
+            // Fields are separated by a real tab. A `\u{1f}` here does not travel:
+            // tmux prints control characters in a format string as the four
+            // character escape `\037`, so the separator never matched, every
+            // line was one field, and the session list came back empty.
+            "#{session_name}\t#{pane_pid}\t#{pane_current_path}\t#{session_created}\t#{pane_title}",
         ])
         .output();
     let Ok(output) = output else {
@@ -245,9 +249,19 @@ pub fn list() -> Vec<TmuxSession> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    parse_list(&text)
+}
+
+/// Reads the output of `list-sessions -F` into sessions.
+///
+/// tmux escapes control characters in a format string, so a separator that is
+/// not printable never arrives as itself and every line reads as one field. The
+/// separator here is a tab, which does travel, and a line without the expected
+/// number of fields is skipped rather than guessed at.
+fn parse_list(text: &str) -> Vec<TmuxSession> {
     let mut out = Vec::new();
     for line in text.trim().split('\n') {
-        let fields: Vec<&str> = line.splitn(5, '\u{1f}').collect();
+        let fields: Vec<&str> = line.splitn(5, '\t').collect();
         if fields.len() < 4 {
             continue;
         }
@@ -365,5 +379,46 @@ pub fn hide_status_bars() {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_session_on_a_tab_separated_line_is_read() {
+        // The shape tmux actually prints: fields joined by tabs.
+        let text = "aix-first\t111\t/root\t1700000000\tpi - root\naix-second\t222\t/home/pi\t1700000001\t\n";
+        let sessions = parse_list(text);
+        assert_eq!(sessions.len(), 2, "both sessions should be listed");
+        assert_eq!(sessions[0].id, "first");
+        assert_eq!(sessions[0].pid, 111);
+        assert_eq!(sessions[0].cwd, "/root");
+        assert_eq!(sessions[0].created_at, 1700000000);
+        assert_eq!(sessions[0].title, "pi - root");
+        assert_eq!(sessions[1].id, "second");
+        assert_eq!(sessions[1].title, "");
+    }
+
+    #[test]
+    fn an_escaped_separator_is_not_a_separator() {
+        // tmux prints a control character in a format string as the four
+        // characters `\037`. Treating that as the separator made every line one
+        // field, so this test proves the mistake stays visible: such a line has
+        // no tab and is skipped instead of producing a bogus session.
+        let text = "aix-thing\\037111\\037/root\\0371700000000\\037\n";
+        assert!(
+            parse_list(text).is_empty(),
+            "a line with no real separator must not be read as a session"
+        );
+    }
+
+    #[test]
+    fn a_session_name_without_the_prefix_is_skipped() {
+        let text = "someone-elses\t111\t/root\t1700000000\t\naix-mine\t222\t/root\t1700000001\t\n";
+        let sessions = parse_list(text);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "mine");
     }
 }
