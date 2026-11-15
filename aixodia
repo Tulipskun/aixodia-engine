@@ -10,6 +10,23 @@ PID_FILE="${AIXODIA_PID_FILE:-aixodia.pid}"
 LOG_FILE="${AIXODIA_LOG_FILE:-engine.log}"
 LOG_MAX_KB="${AIXODIA_LOG_MAX_KB:-8192}"
 START_WAIT="${AIXODIA_START_WAIT:-30}"
+# The token and nothing else. Written with mode 600 by `autostart on` so the
+# engine can be started by something that did not inherit an exported CF_TOKEN.
+ENV_FILE="${AIXODIA_ENV_FILE:-$AIXODIA_HOME/cf.env}"
+AUTOSTART_DIR="${AIXODIA_AUTOSTART_DIR:-/etc/profile.d}"
+
+load_env() {
+  # Only CF_TOKEN is read: the file may hold more for other tools, and sourcing
+  # it would let a typo in somebody else's value reach the engine.
+  [ -r "$ENV_FILE" ] || return 0
+  [ -n "${CF_TOKEN:-}" ] && return 0
+  local line value
+  line="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\{0,1\}CF_TOKEN=//p' "$ENV_FILE" | tail -n 1)"
+  [ -n "$line" ] || return 0
+  value="${line%\"}"; value="${value#\"}"
+  value="${value%\'}"; value="${value#\'}"
+  export CF_TOKEN="$value"
+}
 
 die() {
   echo "aixodia: $*" >&2
@@ -105,7 +122,8 @@ rotate_log() {
 }
 
 require_prerequisites() {
-  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
+  load_env
+  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set — export it, or run 'aixodia autostart on' while it is"
   ENGINE_RESOLVED="$(engine_path)"
   command -v cloudflared >/dev/null 2>&1 || die "cloudflared not found in PATH — reinstall with the install script"
   mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
@@ -256,6 +274,115 @@ cmd_update() {
   "$resolved" update
 }
 
+# Foreground mode, for a supervisor that wants to own the process. It execs the
+# engine so the supervisor's pid is the engine's, which is what makes a restart
+# policy meaningful.
+cmd_serve() {
+  load_env
+  [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set"
+  local engine
+  engine="$(engine_path)"
+  mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
+  cd "$AIXODIA_HOME" || die "cannot enter $AIXODIA_HOME"
+  printf '%s\n' "$$" > "$(pid_path)" 2>/dev/null || true
+  exec "$engine"
+}
+
+# The hook a login shell runs. It lives in profile.d because that is the one
+# directory every shell on a Debian-derived image already reads, whether or not
+# there is an init system — and neither this chroot nor Termux has one.
+autostart_hook() { printf '%s/aixodia-autostart.sh' "$AUTOSTART_DIR"; }
+
+autostart_installed() { [ -r "$(autostart_hook)" ]; }
+
+cmd_autostart() {
+  local action="$1" hook
+  hook="$(autostart_hook)"
+
+  case "$action" in
+    '')
+      if autostart_installed; then
+        echo "aixodia: autostart is on ($hook)"
+      else
+        echo "aixodia: autostart is off"
+      fi
+      [ -r "$ENV_FILE" ] && echo "aixodia: token is remembered in $ENV_FILE"
+      return 0
+      ;;
+    on) ;;
+    off) ;;
+    *) die "usage: aixodia autostart on|off" ;;
+  esac
+
+  if [ "$action" = "off" ]; then
+    if [ -n "${AIXODIA_SV_DIR:-}" ] && [ -d "$AIXODIA_SV_DIR/service/aixodia" ]; then
+      sv down aixodia >/dev/null 2>&1 || true
+      rm -rf "${AIXODIA_SV_DIR:?}/service/aixodia" "${AIXODIA_SV_DIR:?}/aixodia" 2>/dev/null || true
+      echo "aixodia: runit service removed"
+    fi
+    rm -f "$hook" || die "cannot remove $hook"
+    echo "aixodia: autostart is off"
+    echo "aixodia: the engine keeps running; 'aixodia stop' ends it"
+    return 0
+  fi
+
+  # Remembering the token is the part that makes an unattended start possible:
+  # a login shell has no exported CF_TOKEN, so without this the hook would run
+  # and fail every time.
+  if [ -n "${CF_TOKEN:-}" ]; then
+    mkdir -p "$(dirname "$ENV_FILE")" || die "cannot create $(dirname "$ENV_FILE")"
+    umask 077
+    printf 'CF_TOKEN=%s\n' "$CF_TOKEN" > "$ENV_FILE" || die "cannot write $ENV_FILE"
+    chmod 600 "$ENV_FILE" || die "cannot protect $ENV_FILE"
+    echo "aixodia: token saved to $ENV_FILE (mode 600)"
+  elif [ -r "$ENV_FILE" ]; then
+    echo "aixodia: keeping the token already in $ENV_FILE"
+  else
+    die "CF_TOKEN is not set and $ENV_FILE does not exist — export CF_TOKEN first"
+  fi
+
+  # runit, when it is there, is the better supervisor: it restarts an engine
+  # that exits and does not depend on a shell ever opening. It is used when
+  # present and skipped otherwise, since installing a supervisor is not the
+  # launcher's decision to make.
+  if [ -n "${AIXODIA_SV_DIR:-}" ] && [ -d "${AIXODIA_SV_DIR}" ] && command -v sv >/dev/null 2>&1; then
+    install_runit_service
+  fi
+
+  mkdir -p "$AUTOSTART_DIR" || die "cannot create $AUTOSTART_DIR"
+  cat > "$hook" <<EOF
+# Written by 'aixodia autostart on'. Starts the engine if it is not already up.
+# Silent on purpose: a login should never wait on a dead tunnel, and a shell
+# that opens while the engine is still booting is not made to wait twice.
+if [ -x "$(command -v aixodia 2>/dev/null || echo /usr/local/bin/aixodia)" ]; then
+  if ! aixodia status >/dev/null 2>&1; then
+    aixodia start >/dev/null 2>&1 || true
+  fi
+fi
+EOF
+  chmod 644 "$hook" || die "cannot install $hook"
+  echo "aixodia: autostart is on ($hook)"
+  echo "aixodia: the next shell that opens starts the engine if it is not running"
+}
+
+# A runit service, for hosts that run one. The run script calls the launcher
+# rather than execing the engine, so the pid file and health checks stay the
+# same as everywhere else.
+install_runit_service() {
+  local dir="$AIXODIA_SV_DIR/aixodia" link="$AIXODIA_SV_DIR/service/aixodia"
+  mkdir -p "$dir" || die "cannot create $dir"
+  cat > "$dir/run" <<EOF
+#!/bin/sh
+exec 2>&1
+exec $(command -v aixodia) serve
+EOF
+  chmod +x "$dir/run" || die "cannot write $dir/run"
+  [ -d "$AIXODIA_SV_DIR/service" ] || mkdir -p "$AIXODIA_SV_DIR/service"
+  ln -sfn "$dir" "$link" || die "cannot link $link"
+  sv up aixodia >/dev/null 2>&1 || true
+  echo "aixodia: runit service installed at $dir"
+}
+
 usage() {
   cat <<'USAGE'
 usage: aixodia <command>
@@ -266,6 +393,10 @@ usage: aixodia <command>
                  engine log file when the engine is not answering
   stop           send SIGTERM to the running engine and clear the pid file
   update         update the running engine in place, or install when stopped
+  autostart on   remember CF_TOKEN and start the engine whenever a shell opens
+  autostart off  forget it and remove that hook
+  autostart      report whether the hook is installed
+  serve          run the engine in this process, for a supervisor to own
 
 CF_TOKEN must be set before start. Named Tunnel credentials and URL are read from Cloudflare Workers KV.
 State, pid file (aixodia.pid) and log (engine.log) live in AIXODIA_HOME, by default ~/.aixodia.
@@ -278,6 +409,8 @@ case "${1:-start}" in
   logs) cmd_logs "${2:-40}" ;;
   stop) cmd_stop ;;
   update) cmd_update ;;
+  autostart) cmd_autostart "${2:-}" ;;
+  serve) cmd_serve ;;
   help|-h|--help) usage ;;
   *)
     echo "aixodia: unknown command '$1'" >&2

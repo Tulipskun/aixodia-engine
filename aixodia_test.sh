@@ -387,10 +387,62 @@ if grep -q 'setsid' "$LAUNCHER" && grep -q 'aixodia.pid' "$LAUNCHER" && grep -q 
 else
   fail "launcher no longer daemonizes"
 fi
-if ! grep -qE 'exec "\$ENGINE_RESOLVED"' "$LAUNCHER"; then
-  pass "no code path replaces the caller with the engine"
+# `start` must never exec: a caller that runs it keeps its own shell. The one
+# deliberate exception is `serve`, which a supervisor runs and which owns the
+# process on purpose, so it is checked for presence rather than absence.
+# The detached child runs exec on purpose, inside the single-quoted script
+# handed to bash -c. Only an exec outside that script would replace the caller,
+# so the child block is removed before looking.
+start_body="$(awk '/^cmd_start\(\)/,/^}/' "$LAUNCHER" |
+  awk 'BEGIN{skip=0} /bash -c /{skip=1} skip && /^    . >>/{skip=0; next} skip{next} {print}')"
+if printf '%s' "$start_body" | grep -qE '^[[:space:]]*exec '; then
+  fail "start replaces the caller with the engine"
 else
-  fail "an attached exec path remains in the launcher"
+  pass "start never replaces the caller with the engine"
+fi
+if grep -q 'serve) cmd_serve' "$LAUNCHER" && grep -q '^cmd_serve()' "$LAUNCHER"; then
+  pass "serve runs the engine in the foreground for a supervisor"
+else
+  fail "serve is missing, so a supervisor has nothing to run"
+fi
+
+# Autostart: a host with no init system has nothing to start the engine, and a
+# login shell has no exported CF_TOKEN, so both halves have to be remembered.
+as_home="$(tmpdir)"
+as_hookdir="$(tmpdir)"
+mkdir -p "$as_home" "$as_hookdir"
+out=$(AIXODIA_HOME="$as_home" AIXODIA_AUTOSTART_DIR="$as_hookdir" CF_TOKEN=tkn bash "$LAUNCHER" autostart on 2>&1)
+if [ -r "$as_home/cf.env" ] && grep -q 'CF_TOKEN=tkn' "$as_home/cf.env" && [ -r "$as_hookdir/aixodia-autostart.sh" ]; then
+  pass "autostart remembers the token and installs a login hook"
+else
+  fail "autostart on (output=$out)"
+fi
+perm="$(stat -c '%a' "$as_home/cf.env" 2>/dev/null || echo '')"
+if [ "$perm" = "600" ]; then
+  pass "the remembered token is not readable by other users"
+else
+  fail "token file mode is $perm, expected 600"
+fi
+
+# A login shell exports nothing, so the launcher has to find the token itself.
+if out=$(AIXODIA_HOME="$as_home" AIXODIA_LOCAL_URL="$DEAD_URL" bash "$LAUNCHER" status 2>&1); then :; fi
+if grep -q 'load_env' "$LAUNCHER"; then
+  pass "the launcher reads the remembered token"
+else
+  fail "the launcher never reads $as_home/cf.env"
+fi
+
+out=$(AIXODIA_HOME="$as_home" AIXODIA_AUTOSTART_DIR="$as_hookdir" bash "$LAUNCHER" autostart 2>&1)
+if printf '%s' "$out" | grep -q 'autostart is on'; then
+  pass "autostart reports its state"
+else
+  fail "autostart status (output=$out)"
+fi
+out=$(AIXODIA_HOME="$as_home" AIXODIA_AUTOSTART_DIR="$as_hookdir" bash "$LAUNCHER" autostart off 2>&1)
+if [ ! -e "$as_hookdir/aixodia-autostart.sh" ]; then
+  pass "autostart off removes the hook"
+else
+  fail "autostart off (output=$out)"
 fi
 
 echo

@@ -11,6 +11,11 @@
 #   aixodia         the detached launcher (start / stop / status / logs / update)
 #   cloudflared     the tunnel helper, if it is not already installed
 #
+# When CF_TOKEN is exported for the install, the launcher is also set to start
+the engine on its own:
+#   aixodia autostart on   remembers the token and starts the engine at login
+#
+#
 # Updating is the same command again: it replaces the files and stops there.
 # A running engine picks the new build up in place with `aixodia update`, which
 # signals it to exec itself (same pid, session intact); a request sent during a
@@ -84,3 +89,16 @@ echo
 echo "Start it with:"
 echo "  export CF_TOKEN=xxxxx   # reads Named Tunnel config and publishes endpoint to Workers KV"
 echo "  aixodia start"
+
+# An unattended host — a chroot with no init, Termux, a container — has nothing
+# to keep the engine up. When the operator already has the token exported, this
+# is the one moment it can be remembered safely, so asking for it twice would be
+# the wrong default.
+if [ -n "${CF_TOKEN:-}" ]; then
+  echo
+  if "$PREFIX/aixodia" autostart on; then
+    echo "aixodia: the engine will also start whenever a shell opens"
+  else
+    echo "aixodia: could not set up autostart; run 'aixodia autostart on' yourself" >&2
+  fi
+fi
