@@ -14,15 +14,21 @@ permissions:
   contents: read
 
 jobs:
+  # Shell only: no compiler, no X11 headers, so it finishes long before the
+  # Rust jobs and reports the launcher problems first.
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Launcher and installer tests
+        run: |
+          bash aixodia_test.sh
+          bash install_test.sh
+
   verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install X11 development libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libx11-dev libxext-dev libxtst-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -31,20 +37,28 @@ jobs:
           toolchain: '1.99.1'
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install X11 development libraries
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y \
+                libx11-dev libxext-dev libxtst-dev cmake clang libclang-dev; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed; retrying in 15s" >&2
+            sleep 15
+          done
+          echo "apt failed after 3 attempts" >&2
+          exit 1
+
       - name: Format validation
         run: cargo fmt --all -- --check
 
-      - name: Build
-        run: cargo build --workspace
-
+      # The build step is redundant: `cargo test` compiles the same crates, and
+      # `cargo clippy` reuses them. Running it separately paid for a third pass.
       - name: Test
         run: cargo test --workspace
 
-
       - name: Clippy
         run: cargo clippy -p aixodia-engine --bin aixodia-engine --no-deps -- -D warnings
-
-      - name: Launcher and installer tests
-        run: |
-          bash aixodia_test.sh
-          bash install_test.sh

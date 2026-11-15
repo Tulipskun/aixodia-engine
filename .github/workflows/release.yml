@@ -14,8 +14,32 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  # The launcher and installer are shell; they need no compiler and no
+  # cross toolchain, so they are checked here while the builds run elsewhere.
+  shell:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Launcher and installer tests
+        run: |
+          bash aixodia_test.sh
+          bash install_test.sh
+
+  # Each architecture is built on a runner of that architecture. Cross-compiling
+  # arm64 from an x86 runner meant a second full C build of BoringSSL through an
+  # emulated-aarch64 sysroot, which was the largest single cost of a release.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -24,25 +48,20 @@ jobs:
           # rust-toolchain.toml pins 1.99.1; installing it here (with rustfmt)
           # stops rustup's silent auto-install, which ships no components.
           toolchain: '1.99.1'
-          components: rustfmt
-          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 
-      - name: Install cross linker (arm64) and BoringSSL build deps
-        # apt is retried because the runner's mirror resolution has been
-        # flaky: a DNS blip on archive.ubuntu.com fails the whole release even
-        # though nothing is wrong with the code being released.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate keys per target, or one architecture's artifacts evict the
+          # other's from the same cache entry.
+          key: ${{ matrix.suffix }}
+          # The release profile is a distinct artifact set from the test profile.
+          cache-on-failure: false
+
+      - name: Install X11 development libraries
         run: |
-          . /etc/os-release
-          sudo dpkg --add-architecture arm64
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s main universe\n' "$VERSION_CODENAME" | sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-updates main universe\n' "$VERSION_CODENAME" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list >/dev/null
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-backports main universe\n' "$VERSION_CODENAME" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list >/dev/null
           for attempt in 1 2 3; do
             if sudo apt-get update && sudo apt-get install -y \
-                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-                cmake ninja-build clang libclang-dev \
-                libx11-dev libxext-dev libxtst-dev \
-                libx11-dev:arm64 libxext-dev:arm64 libxtst-dev:arm64; then
+                libx11-dev libxext-dev libxtst-dev cmake clang libclang-dev; then
               exit 0
             fi
             echo "apt attempt $attempt failed; retrying in 15s" >&2
@@ -51,35 +70,46 @@ jobs:
           echo "apt failed after 3 attempts" >&2
           exit 1
 
-      - name: Test foreground engine and launcher
+      - name: Format and test
         run: |
-          cargo fmt  --all
-          cargo fmt  --all -- --check
-          cargo test  -p aixodia-engine
-          bash aixodia_test.sh
+          cargo fmt --all -- --check
+          cargo test -p aixodia-engine
 
-      - name: Build amd64
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc
+      - name: Build
         run: |
-          cargo build --release --target x86_64-unknown-linux-gnu -p aixodia-engine
-          cp target/x86_64-unknown-linux-gnu/release/aixodia-engine aixodia-engine-linux-amd64
+          cargo build --release --target ${{ matrix.target }} -p aixodia-engine
+          cp target/${{ matrix.target }}/release/aixodia-engine aixodia-engine-linux-${{ matrix.suffix }}
 
-      - name: Build arm64
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-        run: |
-          cargo build --release --target aarch64-unknown-linux-gnu -p aixodia-engine
-          cp target/aarch64-unknown-linux-gnu/release/aixodia-engine aixodia-engine-linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.suffix }}
+          path: aixodia-engine-linux-${{ matrix.suffix }}
+          if-no-files-found: error
+
+  publish:
+    needs: [shell, build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish rolling release
-        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view engine-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||             gh release create engine-latest --repo "$GITHUB_REPOSITORY"               --title "engine-latest" --notes "Rolling build of main"
-          gh release upload engine-latest aixodia-engine-linux-amd64 aixodia-engine-linux-arm64             --repo "$GITHUB_REPOSITORY" --clobber
-          cp aixodia-engine-linux-amd64 aixodia-engine
+          ls -l dist
+          gh release view engine-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create engine-latest --repo "$GITHUB_REPOSITORY" \
+              --title "engine-latest" --notes "Rolling build of main"
+          gh release upload engine-latest \
+            dist/aixodia-engine-linux-amd64 dist/aixodia-engine-linux-arm64 \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          # The installer fetches the plain name on the architecture it runs on,
+          # so the amd64 build is also published under it.
+          cp dist/aixodia-engine-linux-amd64 aixodia-engine
           gh release upload engine-latest aixodia-engine --repo "$GITHUB_REPOSITORY" --clobber
