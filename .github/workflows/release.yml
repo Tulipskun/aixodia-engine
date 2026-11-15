@@ -48,6 +48,7 @@ jobs:
           # rust-toolchain.toml pins 1.99.1; installing it here (with rustfmt)
           # stops rustup's silent auto-install, which ships no components.
           toolchain: '1.99.1'
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
