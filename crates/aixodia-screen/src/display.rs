@@ -13,7 +13,8 @@
 //! nothing else knows about still runs every X client unchanged.
 
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Display numbers tried, in order. High enough to stay clear of the `:0` and
@@ -30,6 +31,11 @@ static OWNED: Mutex<Option<Owned>> = Mutex::new(None);
 struct Owned {
     number: u32,
     child: Child,
+    /// Told to stop when the display goes. The window manager runs in its own
+    /// thread on its own X connection, so it is stopped through this rather than
+    /// through a process handle.
+    wm_stop: Arc<AtomicBool>,
+    wm_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Why the display could not be brought up, in the words the app shows.
@@ -77,8 +83,39 @@ pub fn owned_display() -> Option<String> {
 pub fn shutdown() {
     let mut guard = OWNED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut owned) = guard.take() {
+        // The window manager first: it holds an X connection, and killing the
+        // server under it leaves it retrying a display that is gone.
+        owned.wm_stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = owned.wm_thread.take() {
+            let _ = thread.join();
+        }
         let _ = owned.child.kill();
         let _ = owned.child.wait();
+        // Xvfb removes these itself when it exits cleanly, but it is killed
+        // here, and a leftover socket is worse than untidy: the next start sees
+        // it, believes a display is up on that number, adopts it, and finds the
+        // number taken — so no window manager is possible and every restart
+        // leaves another dead display behind.
+        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{}", owned.number));
+        let _ = std::fs::remove_file(format!("/tmp/.X{}-lock", owned.number));
+    }
+}
+
+/// Removes the socket and lock of a display number whose server is gone.
+///
+/// A number is only treated this way when nothing is listening on it: a socket
+/// with a live server behind it belongs to somebody else and is left alone.
+pub fn clear_if_dead(display: &str) {
+    if !socket_exists(display) {
+        return;
+    }
+    // A connect that works means a server is there; the display is not ours.
+    if working_display_is(display) {
+        return;
+    }
+    if let Some(number) = display.strip_prefix(':') {
+        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{number}"));
+        let _ = std::fs::remove_file(format!("/tmp/.X{number}-lock"));
     }
 }
 
@@ -93,11 +130,31 @@ fn name(number: u32) -> String {
 }
 
 /// An X server that already answers, if there is one.
+/** Whether an X server answers on this display name. */
+fn working_display_is(display: &str) -> bool {
+    use std::os::raw::c_char;
+    let Ok(name) = std::ffi::CString::new(display) else {
+        return false;
+    };
+    unsafe {
+        extern "C" {
+            fn XOpenDisplay(name: *const c_char) -> *mut std::ffi::c_void;
+            fn XCloseDisplay(display: *mut std::ffi::c_void) -> std::os::raw::c_int;
+        }
+        let connection = XOpenDisplay(name.as_ptr());
+        if connection.is_null() {
+            return false;
+        }
+        XCloseDisplay(connection);
+    }
+    true
+}
+
 fn working_display() -> Option<String> {
     let current = std::env::var("DISPLAY")
         .ok()
         .filter(|d| !d.trim().is_empty())?;
-    if socket_exists(&current) {
+    if socket_exists(&current) && working_display_is(&current) {
         Some(current)
     } else {
         None
@@ -131,7 +188,12 @@ fn start() -> Result<Owned, DisplayError> {
     for number in FIRST_DISPLAY..=LAST_DISPLAY {
         let display = name(number);
         if socket_exists(&display) {
-            continue;
+            // A socket with no server behind it is a display that died and left
+            // its name claimed; the number is free and the leftovers are not.
+            clear_if_dead(&display);
+            if socket_exists(&display) {
+                continue;
+            }
         }
         let child = Command::new(&binary)
             .arg(&display)
@@ -151,7 +213,13 @@ fn start() -> Result<Owned, DisplayError> {
         let deadline = Instant::now() + START_TIMEOUT;
         while Instant::now() < deadline {
             if socket_exists(&display) {
-                return Ok(Owned { number, child });
+                let (wm_stop, wm_thread) = start_window_manager(&display);
+                return Ok(Owned {
+                    number,
+                    child,
+                    wm_stop,
+                    wm_thread,
+                });
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -172,6 +240,27 @@ fn start() -> Result<Owned, DisplayError> {
         }
     }
     Err(DisplayError(last))
+}
+
+/// Starts the engine's own window manager on a display it started.
+///
+/// Only a display the engine owns gets one: a display the operator set through
+/// `$DISPLAY` already has whatever session they run, and a second window manager
+/// would fight it for the root window and for every mapped window.
+///
+/// The manager is a thread, not a program, because it needs no dependency. The
+/// crate already links Xlib for capture, and the work is a frame, a bar and three
+/// drags. A display that cannot take one still streams — the windows just carry
+/// no title bar.
+fn start_window_manager(display: &str) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let theirs = Arc::clone(&stop);
+    let name = display.to_string();
+    let thread = std::thread::Builder::new()
+        .name("aixodia-wm".to_string())
+        .spawn(move || crate::wm::run(&name, theirs))
+        .ok();
+    (stop, thread)
 }
 
 fn which(program: &str) -> Option<String> {
@@ -209,5 +298,17 @@ mod tests {
         if let Some(saved) = saved {
             std::env::set_var("DISPLAY", saved);
         }
+    }
+
+    #[test]
+    fn the_window_manager_is_a_thread_not_a_program() {
+        // It needs no package: the crate links Xlib already, and this is what
+        // keeps an engine install from requiring a desktop environment.
+        let (stop, thread) = start_window_manager(":0");
+        stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+        assert!(stop.load(Ordering::SeqCst));
     }
 }

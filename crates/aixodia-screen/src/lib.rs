@@ -20,6 +20,7 @@ pub mod capture;
 pub mod display;
 pub mod encoder;
 pub mod server;
+pub mod wm;
 
 pub use capture::{Button, Frame, Input, Screen, ScreenError};
 pub use encoder::{diff_and_encode, TileUpdate};

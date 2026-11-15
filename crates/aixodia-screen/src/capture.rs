@@ -191,8 +191,12 @@ impl Screen {
             height.min(screen_height)
         };
 
-        let (shm, image, using_shm) =
-            Self::attach_shm(display, depth, width, height).or_else(|_| {
+        let (shm, image, using_shm) = Self::attach_shm(display, depth, width, height)
+            .map_err(|e| {
+                eprintln!("aixodia-screen: shared memory refused ({e}); copying pixels instead");
+                e
+            })
+            .or_else(|_| {
                 Self::attach_plain(display, depth, width, height)
                     .map(|i| (ptr::null_mut(), i, false))
             })?;

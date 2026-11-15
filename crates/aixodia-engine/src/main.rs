@@ -340,6 +340,12 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // A turn can answer while its rows are still on their way to D1, and those
     // writes belong to this process: an exit must not take the catch-up with it.
     let _ = tokio::time::timeout(Duration::from_secs(5), gateway.await_all_backups()).await;
+    // The display and the window manager the screen feature brought up belong to
+    // this process. Without this the Xvfb outlives the engine, keeps its socket
+    // on the display number, and the next start adopts a server whose window
+    // manager is gone — a picture with no way to move a window. It also stacks a
+    // server per restart.
+    aixodia_screen::display::shutdown();
     Ok(())
 }
 

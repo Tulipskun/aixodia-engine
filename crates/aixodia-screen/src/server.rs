@@ -45,6 +45,13 @@ pub struct Settings {
     pub codec: Codec,
 }
 
+/// How many encoded frames may pass before a keyframe is forced.
+///
+/// Half a second at the common frame rate: short enough that a viewer joining
+/// mid-stream starts seeing a picture almost at once, long enough that the cost
+/// of a keyframe does not dominate the bitrate.
+const KEYFRAME_EVERY: u32 = 30;
+
 /// How the picture is compressed on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
@@ -113,6 +120,13 @@ struct FrameState {
     h264: Option<H264Encoder>,
     /// True when the next video frame must be decodable on its own.
     h264_keyframe_due: bool,
+    /// Frames encoded since the last keyframe.
+    ///
+    /// A client that joins mid-stream has no earlier frame to predict from, and
+    /// a client that dropped one has the same problem, so a keyframe has to
+    /// arrive on a clock of its own rather than only when asked. Without this a
+    /// viewer waited for the next change big enough to force one.
+    since_keyframe: u32,
 }
 
 impl FrameState {
@@ -122,6 +136,7 @@ impl FrameState {
             previous: Vec::new(),
             h264: None,
             h264_keyframe_due: true,
+            since_keyframe: 0,
         }
     }
 }
@@ -439,6 +454,20 @@ impl ScreenHub {
         // sending happen without it so a slow client cannot stall the capture.
         let (frame, width, height) = {
             let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+            // A size change drops the captured image so it is rebuilt at the new
+            // size. Nothing else would rebuild it: the capture loop only used to
+            // start on a viewer arriving, so the first frame after a Settings
+            // change ended the loop with "display is not open" and the picture
+            // froze while the client kept watching. Reopening here keeps the
+            // stream running across the change.
+            if guard.is_none() {
+                let settings = self.settings_now();
+                let display = crate::display::ensure().map_err(|e| e.0)?;
+                *guard = Some(
+                    Screen::open(&display, settings.width, settings.height)
+                        .map_err(|e| e.to_string())?,
+                );
+            }
             let screen = guard.as_mut().ok_or("display is not open")?;
             let frame = screen.frame().map_err(|e| e.to_string())?;
             (frame.pixels, frame.width, frame.height)
@@ -487,9 +516,18 @@ impl ScreenHub {
 
         // Keyframe detection: an access unit that cannot be decoded without
         // earlier ones must be asked for again by a client that joins, and a
-        // new client is told so it knows this one is whole.
+        // new client is told so it knows this one is whole. One is also forced
+        // on a clock, so a viewer never waits longer than KEYFRAME_EVERY frames
+        // for a picture it can start from.
+        state.since_keyframe = state.since_keyframe.saturating_add(1);
+        if state.since_keyframe >= KEYFRAME_EVERY {
+            state.h264_keyframe_due = true;
+        }
         let keyframe = state.h264_keyframe_due;
         state.h264_keyframe_due = false;
+        if keyframe {
+            state.since_keyframe = 0;
+        }
 
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as u64;
         let cursor = self.cursor_in(width, height);
@@ -817,7 +855,32 @@ async fn socket(
     if !hub.tickets.admits(&request, &hub.token) {
         return (axum::http::StatusCode::UNAUTHORIZED, "token rejected").into_response();
     }
+    // The size and rate a client asks for on the dial. The app puts them in the
+    // query string, and until now nothing read them: choosing a lower quality
+    // changed the client's request and not the stream, so a phone on a bad link
+    // kept receiving full-rate frames. They are applied through the same clamped
+    // path a Settings message takes, so a value out of range cannot resize the
+    // capture to something absurd.
+    let query = request.uri().query().unwrap_or_default();
+    let asked = ClientMessage::Settings {
+        width: query_param(query, "width"),
+        height: query_param(query, "height"),
+        fps: query_param(query, "fps"),
+        tile: query_param(query, "tile"),
+        quality: query_param(query, "quality").map(|v| v as u8),
+        codec: query_param(query, "codec").map(|v| v.to_string()),
+    };
+    hub.update(&asked);
     ws.on_upgrade(move |socket| connection(socket, hub))
+}
+
+/// One numeric query parameter, or `None` when it is missing or not a number.
+fn query_param(query: &str, name: &str) -> Option<u32> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .and_then(|(_, value)| value.parse().ok())
 }
 
 async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
@@ -851,8 +914,19 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
         return;
     }
 
-    // Before joining the shared stream, the whole screen once: everything after
-    // this is a diff, and a diff means nothing to a client with no picture yet.
+    // Subscribe before the first frame, not after it.
+    //
+    // The capture loop publishes a diff against the previous frame and moves its
+    // baseline on in the same step. A diff published between the full frame and
+    // the subscribe would never reach this client, while the loop had already
+    // moved on — so that tile stayed stale until it happened to change again,
+    // which is a ghost of an old window on the phone. Joined first, every diff
+    // is either in this receiver or already covered by the full frame that
+    // follows it.
+    let mut frames = hub.frames.subscribe();
+
+    // The whole screen once: everything after this is a diff, and a diff means
+    // nothing to a client with no picture yet.
     //
     // In video mode there is nothing to send: a tile frame is not a frame that
     // client can read, and the encoder's next keyframe carries the whole picture
@@ -863,9 +937,13 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
                 return;
             }
         }
+    } else {
+        // A video viewer that joins mid-stream has nothing to predict from, so
+        // the next access unit is forced to stand on its own. This is what makes
+        // a second viewer see a picture instead of waiting for a keyframe the
+        // encoder had no reason to send.
+        hub.keyframe_wanted.store(true, Ordering::SeqCst);
     }
-
-    let mut frames = hub.frames.subscribe();
 
     // The loop runs while anybody is watching and stops when the last viewer
     // goes, so an idle engine is not encoding a screen nobody sees. Counting
