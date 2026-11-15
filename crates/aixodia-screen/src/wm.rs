@@ -81,6 +81,13 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
         // SubstructureRedirect is what makes this the window manager: every
         // window a client maps is offered here first, so it can be adopted into
         // a frame instead of appearing bare and then jumping into one.
+        //
+        // The flag the error trap writes is per process and this display is a
+        // new connection, so it is cleared *before* the request: a value left
+        // from a previous run would make this manager skip a display that is
+        // genuinely free, and clearing it after the sync would erase the very
+        // refusal the sync produced.
+        MAIN.store(1, Ordering::SeqCst);
         xlib::XSelectInput(
             display,
             root,
@@ -202,10 +209,15 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
 /// Swallows an X protocol error, which is routine for a window manager.
 /// Set once the root selection has been accepted, and set back to 0 by a
 /// refusal. Read after `XSync` so the verdict is known before the loop starts.
-static MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-
 /// `BadAccess`: the selection this manager needs is already somebody else's.
 const BAD_ACCESS: i32 = 10;
+
+/// Whether this process already answered a `BadAccess` on this display.
+///
+/// It is one flag for the process, so it has to be cleared by the manager that
+/// sets up a *new* display connection: an engine that restarts keeps the flag
+/// from the previous run and would sit out a display nobody else manages.
+static MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 unsafe extern "C" fn ignore_x_error(
     _display: *mut xlib::Display,

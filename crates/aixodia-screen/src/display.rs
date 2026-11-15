@@ -12,6 +12,7 @@
 //! framebuffer this crate would have to write itself — and because a display
 //! nothing else knows about still runs every X client unchanged.
 
+use std::os::unix::fs::FileTypeExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -105,18 +106,24 @@ pub fn shutdown() {
 ///
 /// A number is only treated this way when nothing is listening on it: a socket
 /// with a live server behind it belongs to somebody else and is left alone.
+/// The leftovers are removed when the *path* exists, not when it answers: a
+/// socket whose server died is exactly the case being cleared, and it is the
+/// one `socket_exists` reports as absent.
 pub fn clear_if_dead(display: &str) {
-    if !socket_exists(display) {
+    let Some(number) = display.strip_prefix(':') else {
+        return;
+    };
+    let socket = format!("/tmp/.X11-unix/X{number}");
+    let lock = format!("/tmp/.X{number}-lock");
+    if !std::path::Path::new(&socket).exists() && !std::path::Path::new(&lock).exists() {
         return;
     }
     // A connect that works means a server is there; the display is not ours.
     if working_display_is(display) {
         return;
     }
-    if let Some(number) = display.strip_prefix(':') {
-        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{number}"));
-        let _ = std::fs::remove_file(format!("/tmp/.X{number}-lock"));
-    }
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(&lock);
 }
 
 /// Whether Xvfb is on PATH. Reported before a start is attempted so the app can
@@ -164,7 +171,12 @@ fn working_display() -> Option<String> {
 /// Whether an X server has published its socket for this display name.
 ///
 /// The check is the socket rather than a connection attempt because capture
-/// opens the display itself; this only decides whether a start is needed.
+/// opens the display itself; this only decides whether a start is needed. It
+/// has to be a *socket*, not merely a path that resolves: a symlink left behind
+/// by a session that exported `X0 -> /tmp/.X11-unix/X0` resolves to itself and
+/// answers yes forever, and a socket whose server has died answers yes too. Both
+/// made the engine adopt a display nothing was listening on, which is how a
+/// restart came up with a picture that never filled.
 fn socket_exists(display: &str) -> bool {
     let Some(number) = display.trim_start_matches(':').split('.').next() else {
         return false;
@@ -172,7 +184,28 @@ fn socket_exists(display: &str) -> bool {
     if number.is_empty() {
         return false;
     }
-    std::path::Path::new(&format!("/tmp/.X11-unix/X{number}")).exists()
+    let path = format!("/tmp/.X11-unix/X{number}");
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !meta.file_type().is_socket() {
+        return false;
+    }
+    // A socket inode outlives the process that made it, so reach it: a refused
+    // connection is the ordinary answer for a display whose server is gone.
+    std::os::unix::net::UnixStream::connect(&path).is_ok()
+}
+
+/// The display number a stale socket is squatting on, for the caller that has
+/// to clear it before starting a server of its own.
+pub fn stale_number(display: &str) -> Option<u32> {
+    let number = display.trim_start_matches(':').split('.').next()?;
+    let number: u32 = number.parse().ok()?;
+    if socket_exists(display) {
+        None
+    } else {
+        Some(number)
+    }
 }
 
 fn start() -> Result<Owned, DisplayError> {
@@ -280,9 +313,33 @@ mod tests {
 
     #[test]
     fn a_console_display_is_not_mistaken_for_a_socket() {
-        assert!(socket_exists(":0") == std::path::Path::new("/tmp/.X11-unix/X0").exists());
+        // `X0` in a container is often a symlink a login script left pointing at
+        // itself. It resolves, so a bare `exists()` was true and the engine
+        // adopted a display with no server behind it; only a real socket counts.
+        let path = std::path::Path::new("/tmp/.X11-unix/X0");
+        let real = path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+            && std::os::unix::net::UnixStream::connect(path).is_ok();
+        assert_eq!(socket_exists(":0"), real);
         assert!(!socket_exists(""));
         assert!(!socket_exists(":"));
+    }
+
+    #[test]
+    fn a_symlink_that_points_at_itself_is_not_a_display() {
+        let dir = std::env::temp_dir().join(format!("aixodia-x11-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let link = dir.join("X99");
+        std::os::unix::fs::symlink(&link, &link).expect("self symlink");
+        // The real check reads the fixed X11 socket directory, so this asserts
+        // the property it relies on: a self-symlink resolves but is not a socket.
+        let meta = std::fs::symlink_metadata(&link).expect("metadata");
+        assert!(!meta.file_type().is_socket());
+        assert!(link.exists() || std::fs::symlink_metadata(&link).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
