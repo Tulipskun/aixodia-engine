@@ -388,12 +388,17 @@ impl ScreenHub {
 
     /// Opens the display if it is not open yet, at the current settings.
     fn ensure_screen(&self) -> Result<(), String> {
+        // A server with no monitor is the ordinary case. Before the capture
+        // display is opened, the engine brings up one of its own if the
+        // machine has none, so the screen window works wherever the engine
+        // runs rather than only where someone is logged in.
+        let display = crate::display::ensure().map_err(|e| e.0)?;
         // The input connection is opened alongside the capture one, on its own
         // handle, so an event never has to wait for a frame to be read.
         {
             let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
             if input.is_none() {
-                *input = Input::open(&self.display).ok();
+                *input = Input::open(&display).ok();
             }
         }
         let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
@@ -401,8 +406,8 @@ impl ScreenHub {
             return Ok(());
         }
         let settings = self.settings_now();
-        let screen = Screen::open(&self.display, settings.width, settings.height)
-            .map_err(|e| e.to_string())?;
+        let screen =
+            Screen::open(&display, settings.width, settings.height).map_err(|e| e.to_string())?;
         *guard = Some(screen);
         Ok(())
     }
