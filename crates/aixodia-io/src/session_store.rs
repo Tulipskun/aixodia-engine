@@ -46,6 +46,10 @@ impl SessionStore for D1 {
         D1::history(self, id).await
     }
 
+    async fn undo(&self, id: &str) -> Result<Vec<Turn>, SessionError> {
+        D1::undo(self, id).await
+    }
+
     async fn append_turns(&self, id: &str, turns: &[TurnInput]) -> Result<Vec<Turn>, SessionError> {
         D1::append_turns(self, id, turns).await
     }

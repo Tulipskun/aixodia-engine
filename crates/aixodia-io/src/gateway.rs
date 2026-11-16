@@ -80,6 +80,9 @@ pub trait SessionStore: Send + Sync {
     async fn save_agent(&self, id: &str, patch: &AgentPatch) -> Result<(), SessionError>;
     async fn turns(&self, id: &str) -> Result<Vec<Turn>, SessionError>;
     async fn history(&self, id: &str) -> Result<Vec<Message>, SessionError>;
+
+    /// Takes back the newest question and everything it produced.
+    async fn undo(&self, id: &str) -> Result<Vec<Turn>, SessionError>;
     async fn append_turns(&self, id: &str, turns: &[TurnInput]) -> Result<Vec<Turn>, SessionError>;
 
     /// The same append, reporting a partial write.
@@ -394,6 +397,7 @@ impl Gateway {
                     .patch(update_session),
             )
             .route("/api/sessions/:id/turns", get(get_session_turns))
+            .route("/api/sessions/:id/undo", post(undo_session_turn))
             .route("/api/sessions/:id/objectives", get(get_session_objectives))
             .route("/api/chat/completions", post(crate::chat::chat))
             .merge(self.register_api())
@@ -786,6 +790,23 @@ async fn get_session_turns(
         g.sessions.turns(&id).await
     };
     match turns {
+        Ok(turns) => write_json(
+            StatusCode::OK,
+            json!({"turns": turns.iter().map(turn_json).collect::<Vec<_>>()}),
+        ),
+        Err(err) => write_error(StatusCode::BAD_GATEWAY, "database_error", &err.to_string()),
+    }
+}
+
+/// Takes back the last exchange of a chat.
+///
+/// The newest question and everything it produced go together: the answer, the
+/// tool calls and their results. Deleting only the answer would leave a
+/// question with no reply, and deleting only the question would leave a trail
+/// describing work nobody asked for. The rows that remain are returned so the
+/// phone can redraw without another round trip.
+async fn undo_session_turn(State(g): State<Arc<Gateway>>, Path(id): Path<String>) -> Response {
+    match g.sessions.undo(&id).await {
         Ok(turns) => write_json(
             StatusCode::OK,
             json!({"turns": turns.iter().map(turn_json).collect::<Vec<_>>()}),

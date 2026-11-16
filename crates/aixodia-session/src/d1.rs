@@ -243,6 +243,38 @@ impl D1 {
         Ok(messages_from_turns(&self.turns(id).await?))
     }
 
+    /// Removes the most recent exchange from a session and returns what is left.
+    ///
+    /// An exchange starts at the newest user turn and takes everything after it
+    /// with it: the answer, the tool calls and their results, and any narration
+    /// the model wrote between them. Those rows only exist because of that
+    /// question, so leaving them behind would give the session a half-turn and
+    /// the next request a trail that describes work nobody asked for.
+    ///
+    /// Nothing is removed when the session has no user turn, or when more than
+    /// one message is still waiting to be answered — the newest question may not
+    /// have a reply yet, and undoing in the middle of one would delete a request
+    /// that is still being served.
+    pub async fn undo(&self, id: &str) -> Result<Vec<Turn>> {
+        let turns = self.turns(id).await?;
+        let Some(index) = turns.iter().rposition(|turn| turn.role == "user") else {
+            return Ok(turns);
+        };
+        if index + 1 == turns.len() {
+            // The newest turn is the question itself: it has not been answered
+            // yet, so the turn is still running and must not be cut in half.
+            return Ok(turns);
+        }
+        let from_seq = turns[index].seq;
+        self.db
+            .query(
+                "DELETE FROM chat_turns WHERE session_id=? AND seq>=?",
+                &[Value::from(id), Value::from(from_seq)],
+            )
+            .await?;
+        Ok(turns[..index].to_vec())
+    }
+
     /// Writes the turns of one round. It retries only the unwritten suffix:
     /// replaying a successful chunk used to duplicate it when a later insert
     /// failed.

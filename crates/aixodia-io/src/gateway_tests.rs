@@ -165,6 +165,18 @@ impl SessionStore for MemStore {
         Ok(messages_from_turns(&self.stored_turns(id)))
     }
 
+    async fn undo(&self, id: &str) -> Result<Vec<Turn>, SessionError> {
+        let mut all = self.turns.lock().unwrap();
+        let list = all.entry(id.to_string()).or_default();
+        // The newest question and everything after it, which is what D1 deletes.
+        if let Some(index) = list.iter().rposition(|turn| turn.role == "user") {
+            if index + 1 < list.len() {
+                list.truncate(index);
+            }
+        }
+        Ok(list.clone())
+    }
+
     async fn append_turns(&self, id: &str, turns: &[TurnInput]) -> Result<Vec<Turn>, SessionError> {
         let mut all = self.turns.lock().unwrap();
         let list = all.entry(id.to_string()).or_default();
@@ -571,6 +583,9 @@ impl SessionStore for SlowStore {
     }
     async fn history(&self, id: &str) -> Result<Vec<Message>, SessionError> {
         self.inner.history(id).await
+    }
+    async fn undo(&self, id: &str) -> Result<Vec<Turn>, SessionError> {
+        self.inner.undo(id).await
     }
     async fn unfinished(&self, limit: i64) -> Result<Vec<UnfinishedTurn>, SessionError> {
         self.inner.unfinished(limit).await
@@ -1025,6 +1040,9 @@ impl SessionStore for PartialStore {
     }
     async fn history(&self, id: &str) -> Result<Vec<Message>, SessionError> {
         self.inner.history(id).await
+    }
+    async fn undo(&self, id: &str) -> Result<Vec<Turn>, SessionError> {
+        self.inner.undo(id).await
     }
     async fn unfinished(&self, limit: i64) -> Result<Vec<UnfinishedTurn>, SessionError> {
         self.inner.unfinished(limit).await
@@ -2663,4 +2681,61 @@ fn the_rideable_wait_equals_the_keyless_retry_budget() {
         "KEYLESS_BACKOFF sums to {budget:?} but RIDEABLE_WAIT is {:?}",
         aixodia_provider::RIDEABLE_WAIT
     );
+}
+
+// ---------------------------------------------------------------------------
+// undo
+// ---------------------------------------------------------------------------
+
+/// Undo takes the question and everything it produced, in one endpoint, so the
+/// phone never has to decide which rows belonged to the exchange.
+#[tokio::test]
+async fn undo_removes_the_newest_question_and_its_answer() {
+    let _guard = config_lock().lock().unwrap();
+    let (gateway, _upstream) = new_test_gateway(Arc::new(MemStore::new())).await;
+
+    let (_, body) = post_json(&gateway.router(), "/api/sessions", r#"{"title":"undo"}"#).await;
+    let id = body_json(&body)["id"].as_str().unwrap().to_string();
+
+    post_json(
+        &gateway.router(),
+        "/api/chat/completions",
+        &format!(r#"{{"model":"mock/test-model","session_id":"{id}","messages":[{{"role":"user","content":"first"}}]}}"#),
+    )
+    .await;
+    post_json(
+        &gateway.router(),
+        "/api/chat/completions",
+        &format!(r#"{{"model":"mock/test-model","session_id":"{id}","messages":[{{"role":"user","content":"second"}}]}}"#),
+    )
+    .await;
+
+    let (status, body) =
+        post_json(&gateway.router(), &format!("/api/sessions/{id}/undo"), "").await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let left = body_json(&body)["turns"].clone();
+    let left = left.as_array().expect("turns array");
+    assert!(
+        left.iter().all(|turn| turn["text"] != "second"),
+        "the undone question is still there: {body}"
+    );
+    assert!(
+        left.iter().any(|turn| turn["text"] == "first"),
+        "undo took more than the newest exchange: {body}"
+    );
+
+    // A second undo is the same call on the exchange before it.
+    let (status, _) = post_json(&gateway.router(), &format!("/api/sessions/{id}/undo"), "").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// An empty session has nothing to take back, and saying so must not fail: the
+/// menu command is pressed on every chat, including a fresh one.
+#[tokio::test]
+async fn undo_on_an_empty_chat_changes_nothing() {
+    let _guard = config_lock().lock().unwrap();
+    let (gateway, _upstream) = new_test_gateway(Arc::new(MemStore::new())).await;
+    let (status, body) = post_json(&gateway.router(), "/api/sessions/missing/undo", "").await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body_json(&body)["turns"].as_array().unwrap().len(), 0);
 }

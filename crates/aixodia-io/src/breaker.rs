@@ -125,6 +125,12 @@ mod tests {
         ) -> Result<Vec<aixodia_provider::Message>, aixodia_session::Error> {
             Ok(Vec::new())
         }
+        async fn undo(
+            &self,
+            _id: &str,
+        ) -> Result<Vec<aixodia_session::Turn>, aixodia_session::Error> {
+            Ok(Vec::new())
+        }
         async fn append_turns(
             &self,
             _id: &str,
