@@ -179,7 +179,16 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
     // was still holding when it died.
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let _ = serve(stream, &pty, &ring, &attached, &dead);
+        // A connection whose engine died must not stop the next one from being
+        // accepted: reading from a socket nobody is writing to blocks forever,
+        // and the accept loop cannot wait for it.
+        let pty = pty.clone();
+        let ring = ring.clone();
+        let attached = attached.clone();
+        let dead = dead.clone();
+        std::thread::spawn(move || {
+            let _ = serve(stream, &pty, &ring, &attached, &dead);
+        });
     }
     let _ = std::fs::remove_file(&path);
     IoError::new(ErrorKind::Other, "the holder stopped accepting")
@@ -311,6 +320,10 @@ pub fn connect_or_start(
             if libc::setsid() < 0 {
                 return Err(IoError::last_os_error());
             }
+            // A holder owns a shell, not the engine's port. Descriptors the
+            // engine marked inheritable for its own update would otherwise pass
+            // through to the holder and then to the shell a user types into.
+            close_inheritable_sockets();
             Ok(())
         });
     }
@@ -335,6 +348,47 @@ pub fn connect_or_start(
 }
 
 type IoErrorResult<T> = std::io::Result<T>;
+
+/// Marks every open listening socket close-on-exec, so a child cannot inherit
+/// the engine's port.
+///
+/// The engine clears that flag on its own listener while an update hands it
+/// over, and the flag stays cleared. Any process started from then on — a holder,
+/// and the shell inside it — would hold the same socket.
+fn close_inheritable_sockets() {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let mut accepting: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                &mut accepting as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 || accepting == 0 {
+            continue;
+        }
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
 
 /// Ends the shell held for `id`, whether or not this engine started it.
 ///

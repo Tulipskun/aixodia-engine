@@ -404,17 +404,66 @@ fn inherited_listener() -> Option<tokio::net::TcpListener> {
     let raw: std::os::unix::io::RawFd = std::env::var(HANDOVER_LISTENER_ENV).ok()?.parse().ok()?;
     // The variable must not leak into anything this image starts.
     std::env::remove_var(HANDOVER_LISTENER_ENV);
-    if raw < 0 {
+    if raw < 0 || !is_listening_socket(raw) {
+        // A name that does not describe a listening socket is an inheritance
+        // that did not happen — a launcher that copied the environment, or a
+        // shell that exported it. Adopting the number anyway would take over
+        // whatever descriptor now holds it, and a closed one would make the
+        // bind below fail with "address already in use" for a port nothing
+        // listens on.
         return None;
     }
-    // SAFETY: the descriptor belongs to this process, was declared inheritable
-    // by the image it came from, and nothing else owns it here. `from_raw_fd`
-    // takes ownership, so it is closed when the listener is dropped.
+    // The descriptor was made inheritable so it could cross the `execve` that
+    // replaced the previous image, and that flag is still on it. Every process
+    // this one starts would inherit a listening socket it has no business
+    // holding — a shell a user types into would be able to accept on the engine's
+    // port. It is closed again here now that the handover is over.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+    // SAFETY: the descriptor was just verified to be a listening socket of this
+    // process, and nothing else owns it here. `from_raw_fd` takes ownership, so
+    // it is closed when the listener is dropped.
     let std_listener = unsafe { std::net::TcpListener::from_raw_fd(raw) };
     if std_listener.set_nonblocking(true).is_err() {
         return None;
     }
     tokio::net::TcpListener::from_std(std_listener).ok()
+}
+
+/// Whether `fd` is this process's listening TCP socket.
+///
+/// The kernel answers both questions, so an inherited number is never trusted on
+/// its own: `SO_ACCEPTCONN` says it is listening, and a successful
+/// `getsockname` on a TCP socket says it is the right kind of descriptor.
+fn is_listening_socket(fd: std::os::unix::io::RawFd) -> bool {
+    let mut accepting: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            &mut accepting as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc < 0 || accepting == 0 {
+        return false;
+    }
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
+            &mut addr_len,
+        )
+    };
+    rc == 0 && addr.sin_family as libc::c_int == libc::AF_INET
 }
 
 fn chat_func(gateway: Arc<Gateway>) -> aixodia_mobile::ChatFunc {
