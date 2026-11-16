@@ -430,6 +430,13 @@ fn is_application_config_env(key: &std::ffi::OsStr) -> bool {
     let Some(key) = key.to_str() else {
         return false;
     };
+    // The handover variable is how the next image learns which descriptor is
+    // its listening socket. It is not configuration to be reloaded from KV: if
+    // it were dropped here, the new image would bind the port itself and fail
+    // with "address already in use", because the old socket is still open.
+    if key == HANDOVER_FD_ENV {
+        return false;
+    }
     key.starts_with("AIXODIA_")
         || matches!(
             key,
@@ -797,6 +804,14 @@ mod tests {
                 "{key} is a credential or OS setting and must be preserved"
             );
         }
+        // The listening socket's descriptor number travels in this variable. It
+        // matches the AIXODIA_ prefix that configuration is stripped by, so a
+        // plain prefix rule dropped it and the new image bound the port again —
+        // it died with "address already in use" while the old socket was open.
+        assert!(
+            !is_application_config_env(std::ffi::OsStr::new(HANDOVER_FD_ENV)),
+            "the handover descriptor must survive an in-place update"
+        );
     }
 
     /// The self-update tests share the process-wide HOME and SIGUSR1 handler,
