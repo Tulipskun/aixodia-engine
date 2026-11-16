@@ -28,10 +28,8 @@ pub const AGENTROUTER_FINGERPRINT: &[(&str, &str)] = &[
     ("User-Agent", "RooCode/3.53.0"),
 ];
 
-/// The smallest output budget given to the Responses API. A reasoning model
-/// spends output tokens before it writes the answer, so a budget sized for the
-/// answer alone is spent entirely on thinking.
-const RESPONSES_MIN_BUDGET: i64 = 4096;
+/// Output budget when the caller does not set one, matching the chat path.
+const RESPONSES_DEFAULT_MAX_TOKENS: i64 = 4096;
 
 /// Whether an upstream refusal is really an instruction to use `/v1/responses`.
 ///
@@ -1266,14 +1264,14 @@ fn build_responses_request(req: &Request, stream: bool) -> ResponsesRequest {
         model: req.model.clone(),
         input: Value::Array(items),
         stream,
-        // `max_tokens` is how long the *answer* may be. On these models the
-        // reasoning is spent from the same budget, so passing it straight
-        // through starves the answer: a 20-token reply budget is consumed
-        // thinking and the response comes back empty. The floor leaves room for
-        // both and is only a cap — nothing is generated past what is needed.
-        max_output_tokens: Some(match req.max_tokens {
-            0 => 32000,
-            n => n.max(RESPONSES_MIN_BUDGET),
+        // Same rule as the chat path: a caller that asks for a limit gets it,
+        // and one that asks for nothing gets the default. Overriding a number
+        // the caller chose would hide its own mistake and spend tokens it did
+        // not budget for.
+        max_output_tokens: Some(if req.max_tokens > 0 {
+            req.max_tokens
+        } else {
+            RESPONSES_DEFAULT_MAX_TOKENS
         }),
         tools: Vec::new(),
         tool_choice: None,
