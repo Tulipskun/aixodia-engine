@@ -245,8 +245,30 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         client_auth::client_guard,
     ));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;
-    tracing::info!("listening on 127.0.0.1:8787");
+    // A listener inherited from the process this one replaced. An update is an
+    // `execve`, which closes every descriptor that is not marked to survive it,
+    // so without this the new image would have to bind again — and for the
+    // moment between the old image letting go of the port and the new one
+    // taking it, every request would be refused. That gap is what an update
+    // without downtime means, so the socket is handed over instead.
+    let listener = match inherited_listener() {
+        Some(listener) => {
+            tracing::info!("listening on 127.0.0.1:8787 (inherited from the previous image)");
+            listener
+        }
+        None => {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;
+            tracing::info!("listening on 127.0.0.1:8787");
+            listener
+        }
+    };
+    // An update carries this socket across the swap, so the port is never
+    // unbound: requests that arrive during the `execve` wait in the accept
+    // queue instead of being refused.
+    {
+        use std::os::unix::io::AsRawFd as _;
+        selfupdate::keep_listener_across_update(listener.as_raw_fd());
+    }
 
     // Publish the stable Named Tunnel URL only after cloudflared has registered
     // an edge connection. The hostname and origin route are configured in Cloudflare.
@@ -317,7 +339,22 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // otherwise. A scheduled check replaced the running binary underneath
     // whoever was connected — a terminal asking for a ticket during the swap
     // got no answer and the screen read that as the engine being gone.
+    let update_idle = idle.clone();
     let _update = selfupdate::notify_update(idle);
+    let update_loop = tokio::spawn(async move {
+        // A request queued while a chat was in flight has to get its moment:
+        // nothing else calls `apply_pending` except the end of a chat, and a
+        // machine whose chat has been quiet for hours would wait forever. This
+        // loop does not poll the release page — it only checks in when a queue
+        // exists, so an idle install is still driven by `aixodia update` and
+        // never by the clock.
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if selfupdate::is_pending() && update_idle() {
+                selfupdate::apply_pending().await;
+            }
+        }
+    });
 
     let shutdown = cancel.clone();
     let server = axum::serve(listener, mux.into_make_service())
@@ -350,6 +387,35 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
 /// One chat turn through the gateway's HTTP chat route, in process, exactly as
 /// Go's `chatViaGateway` does. The phone socket and the API share routing,
 /// history and persistence.
+/// The env var naming the listener an update handed over.
+const HANDOVER_LISTENER_ENV: &str = "AIXODIA_HANDOVER_LISTENER_FD";
+
+/// Takes the listening socket this process inherited, if any.
+///
+/// An update replaces this process with `execve`, which closes every descriptor
+/// not marked to survive it. The socket therefore has to be both marked and
+/// described to the next image, and it is the *same* kernel socket either way:
+/// connections queued while the swap happened are still there to accept, so no
+/// request is refused.
+fn inherited_listener() -> Option<tokio::net::TcpListener> {
+    use std::os::unix::io::FromRawFd as _;
+
+    let raw: std::os::unix::io::RawFd = std::env::var(HANDOVER_LISTENER_ENV).ok()?.parse().ok()?;
+    // The variable must not leak into anything this image starts.
+    std::env::remove_var(HANDOVER_LISTENER_ENV);
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: the descriptor belongs to this process, was declared inheritable
+    // by the image it came from, and nothing else owns it here. `from_raw_fd`
+    // takes ownership, so it is closed when the listener is dropped.
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(raw) };
+    if std_listener.set_nonblocking(true).is_err() {
+        return None;
+    }
+    tokio::net::TcpListener::from_std(std_listener).ok()
+}
+
 fn chat_func(gateway: Arc<Gateway>) -> aixodia_mobile::ChatFunc {
     Arc::new(move |call: ChatCall| {
         let gateway = gateway.clone();

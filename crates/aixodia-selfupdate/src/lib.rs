@@ -452,12 +452,45 @@ fn is_application_config_env(key: &std::ffi::OsStr) -> bool {
         )
 }
 
+/// The listening socket to hand to the next image, if the caller kept one.
+///
+/// An update is an `execve`, which closes every descriptor not marked to
+/// survive it. A server that bound its own port would therefore have to bind
+/// again afterwards, and the requests arriving in between would be refused.
+/// Registering the socket here is what lets the swap happen without that gap.
+static HANDOVER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Names the descriptor the next image should adopt as its listener.
+pub const HANDOVER_FD_ENV: &str = "AIXODIA_HANDOVER_LISTENER_FD";
+
+/// Registers the listening socket an update must carry across `execve`.
+#[cfg(unix)]
+pub fn keep_listener_across_update(fd: std::os::unix::io::RawFd) {
+    HANDOVER_FD.store(fd, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// No descriptor to keep on platforms without `execve`.
+#[cfg(not(unix))]
+pub fn keep_listener_across_update(_fd: i32) {}
+
 /// Replaces this process with the binary at `target`. The pid and arguments
 /// remain stable; CF_TOKEN and standard OS environment are preserved, while
 /// application configuration variables are reloaded from KV/D1 by the new image.
 #[cfg(unix)]
 pub fn exec_in_place(target: &str) -> Result<()> {
     use std::os::unix::ffi::OsStringExt;
+
+    let handover = HANDOVER_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if handover >= 0 {
+        // Cleared, so it survives the exec, and told to the next image by name.
+        unsafe {
+            let flags = libc::fcntl(handover, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(handover, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+        }
+        std::env::set_var(HANDOVER_FD_ENV, handover.to_string());
+    }
 
     let args: Vec<CString> = std::env::args_os()
         .map(|arg| CString::new(arg.into_vec()).unwrap_or_default())
@@ -578,7 +611,24 @@ impl UpdateSignalGuard {
     #[cfg(unix)]
     fn arm(handler: Arc<dyn Fn() + Send + Sync>) -> Self {
         SIGNAL_HANDLER.get_or_init(|| Mutex::new(Vec::new()));
+        // The pipe is created once, before the signal can arrive, so the
+        // handler never allocates. A second arm reuses it.
+        if SIGNAL_WRITE_FD.load(std::sync::atomic::Ordering::SeqCst) < 0 {
+            let mut fds = [0 as libc::c_int; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+                SIGNAL_WRITE_FD.store(fds[1], std::sync::atomic::Ordering::SeqCst);
+                spawn_signal_reader(fds[0]);
+            }
+        }
+        // A launcher can leave the update signal blocked in the mask this
+        // process inherited, and a blocked signal is never delivered however
+        // well it is caught: `aixodia update` would wait for an install that
+        // could not start. Unblocking it here is what makes the command work.
         unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, UPDATE_SIGNAL);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             libc::signal(
                 UPDATE_SIGNAL,
                 handle_signal as *const () as libc::sighandler_t,
@@ -627,6 +677,18 @@ type SignalHandlers = Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>;
 #[cfg(unix)]
 static SIGNAL_HANDLER: OnceLock<SignalHandlers> = OnceLock::new();
 
+/// The write end of the self-pipe the signal handler wakes.
+///
+/// `handle_signal` runs in signal context, where the only safe things are a
+/// write to a file descriptor and a return. Reaching for the handler list
+/// there — locking a mutex the main thread may already hold, spawning a thread
+/// and joining it — could deadlock, and a mutex taken at the wrong moment left
+/// `aixodia update` doing nothing at all with no log line to say so. The fd is
+/// set up once, before any signal can arrive, and the handler's only job is to
+/// push one byte through it.
+#[cfg(unix)]
+static SIGNAL_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 #[cfg(unix)]
 impl Drop for UpdateSignalGuard {
     fn drop(&mut self) {
@@ -642,20 +704,48 @@ impl Drop for UpdateSignalGuard {
     }
 }
 
+/// Woken by the signal handler. Reads the byte it pushed and runs the handlers
+/// on a normal thread, where locking and I/O are allowed.
+#[cfg(unix)]
+fn spawn_signal_reader(fd: i32) {
+    std::thread::spawn(move || loop {
+        let mut byte = [0u8; 1];
+        let read = unsafe { libc::read(fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+        if read < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if read == 0 {
+            return;
+        }
+        let Some(list) = SIGNAL_HANDLER.get() else {
+            continue;
+        };
+        let Ok(list) = list.lock() else {
+            continue;
+        };
+        let Some(handler) = list.last().cloned() else {
+            continue;
+        };
+        drop(list);
+        handler();
+    });
+}
+
 #[cfg(unix)]
 extern "C" fn handle_signal(_signal: libc::c_int) {
-    // Only async-signal-safe work happens here: take a clone of the handler
-    // and run it on a fresh thread, so the handler may do I/O and allocate.
-    let Some(list) = SIGNAL_HANDLER.get() else {
+    let fd = SIGNAL_WRITE_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd < 0 {
         return;
-    };
-    let Ok(list) = list.lock() else {
-        return;
-    };
-    let Some(handler) = list.last().cloned() else {
-        return;
-    };
-    let _ = std::thread::spawn(move || handler()).join();
+    }
+    // One byte, and nothing else: this is the only work a signal handler may do.
+    let byte = [1u8; 1];
+    unsafe {
+        libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+    }
 }
 
 /// Runs a future to completion on a private single-threaded runtime. Used only
