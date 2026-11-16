@@ -341,7 +341,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // got no answer and the screen read that as the engine being gone.
     let update_idle = idle.clone();
     let _update = selfupdate::notify_update(idle);
-    let update_loop = tokio::spawn(async move {
+    let _update_loop = tokio::spawn(async move {
         // A request queued while a chat was in flight has to get its moment:
         // nothing else calls `apply_pending` except the end of a chat, and a
         // machine whose chat has been quiet for hours would wait forever. This
