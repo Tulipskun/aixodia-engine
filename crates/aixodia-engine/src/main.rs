@@ -107,6 +107,17 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         anyhow::bail!("CF_TOKEN is not set");
     }
     let db = DbClient::new();
+
+    // The socket comes first, before anything that talks to the network.
+    //
+    // An update replaces this image with `execve`, and the image it replaces
+    // held the listening socket. Taking the port over is therefore the very
+    // first thing the new image has to do: every check and read below crosses
+    // the tunnel and costs seconds, and doing them first left the port
+    // unaccepted for as long as they took — which the phone saw as the engine
+    // being gone, even though the swap itself had no gap at all.
+    let listener = listen();
+
     if let Err(reason) = db.verify_detailed(&token).await {
         // The reason matters: a bad token and an unreachable API both used to
         // print "CF_TOKEN is invalid", which sent operators to the wrong place.
@@ -149,16 +160,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     if parsed_tunnel_url.scheme() != "https" || parsed_tunnel_url.host_str().is_none() {
         anyhow::bail!("Workers KV key tunnel_url must be an https:// URL");
     }
-
-    // The socket comes first, before anything that talks to the network.
-    //
-    // An update replaces this image with `execve`, and the image it replaces
-    // held the listening socket. Taking the port over is therefore the very
-    // first thing the new image has to do: every configuration read below goes
-    // over the tunnel and costs seconds, and doing them first left the port
-    // unaccepted for as long as they took — which the phone saw as the engine
-    // being gone, even though the swap itself had no gap at all.
-    let listener = listen();
 
     d1log::start()?;
     d1log::info("engine started");
