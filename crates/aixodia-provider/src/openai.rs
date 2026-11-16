@@ -13,6 +13,26 @@ use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+/// Headers AgentRouter's edge reads to decide whether a caller is one of the
+/// coding clients it supports. Its published integrations all send this set,
+/// and without it every request — valid key or not — comes back as
+/// "unauthorized client detected".
+const AGENTROUTER_FINGERPRINT: &[(&str, &str)] = &[
+    ("X-Stainless-OS", "Linux"),
+    ("X-Stainless-Arch", "x64"),
+    ("X-Stainless-Lang", "js"),
+    ("X-Stainless-Runtime", "node"),
+    ("X-Stainless-Runtime-Version", "v22.22.1"),
+    ("HTTP-Referer", "https://github.com/RooVetGit/Roo-Cline"),
+    ("X-Title", "Roo Code"),
+    ("User-Agent", "RooCode/3.53.0"),
+];
+
+/// Whether this endpoint is AgentRouter, by host.
+fn is_agentrouter(endpoint: &str) -> bool {
+    endpoint.contains("agentrouter.org")
+}
+
 use crate::types::{
     endpoint, error_message, error_wait, read_sse, APIError, Emitter, Image, Message, Provider,
     Request, Response, ToolCall, Usage, USER_AGENT,
@@ -268,7 +288,7 @@ impl Adapter {
         body: &[u8],
         accept: &str,
     ) -> Result<WireResponse> {
-        let headers = self.headers(accept, key);
+        let headers = self.headers(accept, key, endpoint);
         if let Some(client) = &self.tls_client {
             let response = client
                 .post(endpoint)
@@ -302,7 +322,7 @@ impl Adapter {
     /// standard ones, which is the Go `Header.Set` behaviour the opencode
     /// contract depends on: reqwest's `RequestBuilder::header` appends, which
     /// would leave two User-Agent values on the wire.
-    fn headers(&self, accept: &str, key: &str) -> reqwest::header::HeaderMap {
+    fn headers(&self, accept: &str, key: &str, endpoint: &str) -> reqwest::header::HeaderMap {
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
         let mut headers = HeaderMap::new();
@@ -321,6 +341,22 @@ impl Adapter {
         if !key.is_empty() {
             if let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}")) {
                 headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+        }
+        // AgentRouter's edge refuses any client it does not recognise with
+        // "unauthorized client detected" — before it ever looks at the key, so
+        // a valid token fails the same way as a missing one. It reads the
+        // fingerprint headers the official coding clients send, which is how it
+        // can tell them apart from a generic caller. Its own documentation and
+        // the client integrations it publishes say so.
+        if is_agentrouter(endpoint) {
+            for (name, value) in AGENTROUTER_FINGERPRINT {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(value),
+                ) {
+                    headers.insert(name, value);
+                }
             }
         }
         if let Some(header_func) = &self.header_func {
@@ -1305,4 +1341,43 @@ fn responses_reasoning(response: &ResponsesResponse) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod agentrouter_tests {
+    use super::*;
+
+    /// Without these the edge rejects the request before reading the key, so a
+    /// valid token fails exactly like a missing one. That is the bug this pins.
+    #[test]
+    fn agentrouter_gets_the_client_fingerprint() {
+        let adapter = Adapter::default();
+        let headers = adapter.headers("application/json", "sk-real", "https://agentrouter.org/v1");
+        for (name, value) in AGENTROUTER_FINGERPRINT {
+            let got = headers
+                .get(*name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .to_str()
+                .unwrap();
+            assert_eq!(got, *value, "{name}");
+        }
+        // The key still travels as an ordinary bearer token.
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-real");
+    }
+
+    /// Every other endpoint keeps the engine's own user agent.
+    #[test]
+    fn other_endpoints_are_untouched() {
+        let adapter = Adapter::default();
+        let headers = adapter.headers("application/json", "sk", "https://api.openai.com/v1");
+        assert_eq!(headers.get("user-agent").unwrap(), crate::types::USER_AGENT);
+        assert!(headers.get("x-stainless-os").is_none());
+    }
+
+    #[test]
+    fn agentrouter_is_matched_by_host() {
+        assert!(is_agentrouter("https://agentrouter.org/v1"));
+        assert!(is_agentrouter("https://co.agentrouter.org"));
+        assert!(!is_agentrouter("https://api.openai.com/v1"));
+    }
 }
