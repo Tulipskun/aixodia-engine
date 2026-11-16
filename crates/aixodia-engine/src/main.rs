@@ -150,6 +150,16 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         anyhow::bail!("Workers KV key tunnel_url must be an https:// URL");
     }
 
+    // The socket comes first, before anything that talks to the network.
+    //
+    // An update replaces this image with `execve`, and the image it replaces
+    // held the listening socket. Taking the port over is therefore the very
+    // first thing the new image has to do: every configuration read below goes
+    // over the tunnel and costs seconds, and doing them first left the port
+    // unaccepted for as long as they took — which the phone saw as the engine
+    // being gone, even though the swap itself had no gap at all.
+    let listener = listen();
+
     d1log::start()?;
     d1log::info("engine started");
     tracing::info!("engine started");
@@ -245,31 +255,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         client_auth.clone(),
         client_auth::client_guard,
     ));
-
-    // A listener inherited from the process this one replaced. An update is an
-    // `execve`, which closes every descriptor that is not marked to survive it,
-    // so without this the new image would have to bind again — and for the
-    // moment between the old image letting go of the port and the new one
-    // taking it, every request would be refused. That gap is what an update
-    // without downtime means, so the socket is handed over instead.
-    let listener = match inherited_listener() {
-        Some(listener) => {
-            tracing::info!("listening on 127.0.0.1:8787 (inherited from the previous image)");
-            listener
-        }
-        None => {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:8787").await?;
-            tracing::info!("listening on 127.0.0.1:8787");
-            listener
-        }
-    };
-    // An update carries this socket across the swap, so the port is never
-    // unbound: requests that arrive during the `execve` wait in the accept
-    // queue instead of being refused.
-    {
-        use std::os::unix::io::AsRawFd as _;
-        selfupdate::keep_listener_across_update(listener.as_raw_fd());
-    }
 
     // Publish the stable Named Tunnel URL only after cloudflared has registered
     // an edge connection. The hostname and origin route are configured in Cloudflare.
@@ -393,6 +378,37 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
 /// One chat turn through the gateway's HTTP chat route, in process, exactly as
 /// Go's `chatViaGateway` does. The phone socket and the API share routing,
 /// history and persistence.
+/// Takes the port this process must answer on, as early as possible.
+///
+/// An inherited socket is adopted as-is; otherwise the port is bound here. Called
+/// before the configuration reads so an update's new image is accept-ready
+/// immediately rather than after the network round-trips those reads need.
+fn listen() -> tokio::net::TcpListener {
+    let listener = match inherited_listener() {
+        Some(listener) => {
+            tracing::info!("listening on 127.0.0.1:8787 (inherited from the previous image)");
+            listener
+        }
+        None => {
+            let bound = std::net::TcpListener::bind("127.0.0.1:8787")
+                .expect("the engine must own 127.0.0.1:8787");
+            bound
+                .set_nonblocking(true)
+                .expect("a non-blocking listener");
+            tracing::info!("listening on 127.0.0.1:8787");
+            tokio::net::TcpListener::from_std(bound).expect("a tokio listener")
+        }
+    };
+    // An update carries this socket across the swap, so the port is never
+    // unbound: requests arriving during the `execve` wait in the accept queue
+    // instead of being refused.
+    {
+        use std::os::unix::io::AsRawFd as _;
+        selfupdate::keep_listener_across_update(listener.as_raw_fd());
+    }
+    listener
+}
+
 /// The env var naming the listener an update handed over.
 const HANDOVER_LISTENER_ENV: &str = "AIXODIA_HANDOVER_LISTENER_FD";
 
