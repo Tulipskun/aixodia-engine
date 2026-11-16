@@ -64,6 +64,17 @@ async fn async_main() {
         std::process::exit(update_once().await);
     }
 
+    // The shell holder: the engine starts this binary again to own a terminal's
+    // pty, so the shell is not a child of the engine's lifetime and survives it.
+    if std::env::args().nth(1).as_deref() == Some("term-holder") {
+        let arg = |n: usize| std::env::args().nth(n);
+        let id = arg(2).unwrap_or_default();
+        let shell = arg(3).unwrap_or_else(|| "/bin/bash".to_string());
+        let cols: u16 = arg(4).and_then(|v| v.parse().ok()).unwrap_or(80);
+        let rows: u16 = arg(5).and_then(|v| v.parse().ok()).unwrap_or(24);
+        aixodia_terminal::run_holder(&id, &shell, cols, rows, None);
+    }
+
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
     tokio::spawn(async move {
@@ -178,16 +189,9 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let hub = Arc::new(Hub::new());
     let chat = chat_func(gateway.clone());
     let mut terminal_server = TerminalServer::new(token.clone());
-    let tmux_enabled = db
-        .config_kv_get("runtime/tmux_enabled")
-        .await?
-        .map(|value| value.trim() != "0" && !value.trim().eq_ignore_ascii_case("false"))
-        .unwrap_or(true);
-    terminal_server.tmux = aixodia_terminal::tmux_available() && tmux_enabled;
-    if terminal_server.tmux {
-        aixodia_terminal::tmux::hide_status_bars();
-        aixodia_terminal::tmux::disable_mouse();
-    }
+    // Shells are kept by the engine's own holder, so a terminal survives an
+    // engine restart without tmux being installed at all.
+    terminal_server.tmux = false;
     // The screen is a hub per process, like the terminal server: one display,
     // one capture, however many phones are looking at it.
     let display = db

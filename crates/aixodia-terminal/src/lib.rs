@@ -4,6 +4,7 @@
 //! detach without ending it. Output is kept in a 4 MiB ring so a returning
 //! client gets the tail and the modes the program left on.
 
+mod holder;
 mod modes;
 mod pty;
 pub mod tmux;
@@ -59,9 +60,84 @@ enum Frame {
     Ping,
 }
 
+/// Where a shell actually lives.
+///
+/// A pty is the simple case: the engine holds the master and the shell is its
+/// direct child, which is all a short-lived session needs. A [`Holder`] is the
+/// case that matters for a phone: a separate process owns the pty, so the shell
+/// keeps running when the engine does not, and the engine reconnects to it
+/// instead of starting over.
+enum Shell {
+    Direct(Arc<Pty>),
+    Held(Arc<holder::Holder>),
+}
+
+impl Shell {
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Shell::Direct(pty) => pty.read(buf),
+            // A holder reports nothing when it has nothing to say, which is the
+            // same thing `WouldBlock` means to the caller.
+            Shell::Held(h) => Ok(0),
+        }
+    }
+
+    fn write(&self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Shell::Direct(pty) => pty.write(data),
+            Shell::Held(h) => h.write_all(data),
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        match self {
+            Shell::Direct(pty) => pty.resize(cols, rows),
+            Shell::Held(h) => h.resize(cols, rows),
+        }
+    }
+
+    fn kick(&self) -> std::io::Result<()> {
+        match self {
+            Shell::Direct(pty) => pty.kick(),
+            // The holder sends SIGWINCH itself when it applies a resize.
+            Shell::Held(_) => Ok(()),
+        }
+    }
+
+    fn dead(&self) -> bool {
+        match self {
+            Shell::Direct(pty) => pty.dead(),
+            Shell::Held(h) => h.finished(),
+        }
+    }
+
+    fn exit_code(&self) -> i32 {
+        match self {
+            Shell::Direct(pty) => pty.exit_code(),
+            Shell::Held(h) => h.exit_code(),
+        }
+    }
+
+    fn close(&self) {
+        match self {
+            Shell::Direct(pty) => pty.close(),
+            // Closing the connection only detaches; the holder ends when its
+            // shell does, which is what makes a restart survivable.
+            Shell::Held(h) => h.close(),
+        }
+    }
+
+    fn raw_fd(&self) -> Option<i32> {
+        match self {
+            Shell::Direct(pty) => Some(pty::raw_fd(&pty.master())),
+            Shell::Held(_) => None,
+        }
+    }
+}
+
 struct Session {
     id: String,
-    pty: Arc<Pty>,
+    pty: Arc<Shell>,
     start: u64,
     shell: String,
     dir: String,
@@ -385,20 +461,42 @@ impl Server {
         let rows = if rows == 0 { 24 } else { rows };
         let dir = Self::dir();
         let shell = self.shell().to_string();
-        let p = if self.tmux {
-            tmux::start(id, &shell, cols, rows, Some(&dir))
-                .map_err(|err| std::io::Error::new(err.kind(), format!("tmux: {err}")))?
-        } else {
-            Pty::start(&shell, &["-l".to_string()], cols, rows, Some(&dir))?
-        };
-        let p = Arc::new(p);
+        // A shell is started in a holder, which keeps it across an engine
+        // restart: the pty belongs to that process, not to this one, so the
+        // phone's tab still has something to reattach to when a new engine
+        // comes up.
+        if self.tmux {
+            let p = tmux::start(id, &shell, cols, rows, Some(&dir))
+                .map_err(|err| std::io::Error::new(err.kind(), format!("tmux: {err}")))?;
+            let p = Arc::new(Shell::Direct(Arc::new(p)));
+            return self
+                .adopt(id, shell, dir, cols, rows, p)
+                .map(|s| (s, false));
+        }
+        let held = holder::connect_or_start(id, &shell, cols, rows, Some(&dir))
+            .map_err(|err| std::io::Error::new(err.kind(), format!("holder: {err}")))?;
+        let p = Arc::new(Shell::Held(Arc::new(held)));
+        self.adopt(id, shell, dir, cols, rows, p)
+            .map(|s| (s, false))
+    }
+
+    /// Registers a started shell as a session and starts its readers.
+    fn adopt(
+        self: &Arc<Self>,
+        id: &str,
+        shell: String,
+        dir: String,
+        cols: u16,
+        rows: u16,
+        p: Arc<Shell>,
+    ) -> std::io::Result<Arc<Session>> {
         // The pid the app is told about is the shell's, not the connection's:
         // under tmux the pty holds a client that is recreated on every attach,
         // while the pane's shell keeps the pid the tab was opened with.
         let pid = if self.tmux {
-            tmux::pane_pid(id).unwrap_or_else(|| p.pid())
+            tmux::pane_pid(id).unwrap_or_default()
         } else {
-            p.pid()
+            holder::shell_pid(id).unwrap_or_default()
         };
         let start = process_start(pid).unwrap_or(0);
         let session = Arc::new(Session {
@@ -426,11 +524,17 @@ impl Server {
             .insert(id.to_string(), session.clone());
         self.spawn_reader(session.clone());
         self.spawn_pings(session.clone());
-        Ok((session, false))
+        Ok(session)
     }
 
     fn spawn_reader(self: &Arc<Self>, session: Arc<Session>) {
-        let fd = pty::raw_fd(&session.pty.master());
+        if let Shell::Held(held) = &*session.pty {
+            self.spawn_holder_reader(session.clone(), held.clone());
+            return;
+        }
+        let Some(fd) = session.pty.raw_fd() else {
+            return;
+        };
         std::thread::spawn(move || {
             let mut buf = vec![0u8; READ_CHUNK];
             loop {
@@ -474,6 +578,52 @@ impl Server {
                     {
                         continue;
                     }
+                    Err(_) => break,
+                }
+            }
+            let code = session.mark_dead();
+            session.send(Frame::Text(
+                json!({"type": "exit", "code": code}).to_string(),
+            ));
+        });
+    }
+
+    /// Reads the frames a holder sends: the shell's output, and its exit.
+    ///
+    /// A holder replays what its ring kept before it serves the first frame, so
+    /// the output produced while no engine was connected arrives here as if it
+    /// had just been written.
+    fn spawn_holder_reader(self: &Arc<Self>, session: Arc<Session>, held: Arc<holder::Holder>) {
+        std::thread::spawn(move || {
+            loop {
+                if session.cancel.is_cancelled() {
+                    break;
+                }
+                match held.read_frame() {
+                    Ok(Some((holder::KIND_OUTPUT, chunk))) => {
+                        if !chunk.is_empty() {
+                            let mut tracker =
+                                session.modes.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut ring = session.ring.lock().unwrap_or_else(|e| e.into_inner());
+                            tracker.scan(&chunk);
+                            ring.extend_from_slice(&chunk);
+                            trim_ring(&mut ring, RING_CAP);
+                            drop(ring);
+                            drop(tracker);
+                            session.last_act.store(now_unix(), Ordering::SeqCst);
+                            session.send(Frame::Binary(Arc::new(chunk)));
+                        }
+                    }
+                    Ok(Some((holder::KIND_EXIT, payload))) => {
+                        let code = payload
+                            .get(..4)
+                            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .unwrap_or(-1);
+                        held.set_exit_code(code);
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                     Err(_) => break,
                 }
             }
@@ -714,6 +864,15 @@ impl Server {
     {
         self.attach(stream, id, cols, rows).await
     }
+}
+
+/// Runs a shell for the engine that started it, and for the ones that replace it.
+///
+/// This is the body of the `term-holder` subcommand. It never returns.
+pub fn run_holder(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> ! {
+    let err = holder::run(id, shell, cols, rows, dir);
+    eprintln!("term-holder: {err}");
+    std::process::exit(1);
 }
 
 /// Whether tmux is on PATH. The engine uses it to keep shells across restarts.

@@ -1,0 +1,407 @@
+//! A shell that outlives the engine.
+//!
+//! A pty belongs to whichever process holds its master descriptor. When the
+//! engine holds it, an engine that dies closes the descriptor and the shell dies
+//! with it — the phone's tab then reconnects to nothing, and typing again means
+//! starting over.
+//!
+//! So the descriptor is not held by the engine. The engine starts the same
+//! binary again as `term-holder`, hands it the shell, and talks to it over a
+//! unix socket. The holder is a child of the engine but not its prisoner: it
+//! keeps the pty and keeps reading, and it is still there when a new engine
+//! connects. Nothing about an engine restart reaches the shell; the pane simply
+//! has a different reader afterwards.
+//!
+//! The socket carries the same three things a subscriber needs — output as it
+//! arrives, input to write, and a resize — so the engine treats a holder exactly
+//! like a local pty. Output produced while no engine was connected is not lost
+//! either: the holder keeps a ring of it and replays the tail on attach, which is
+//! what makes the scrollback of a rebooted engine look like a paused one.
+
+use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::pty::Pty;
+
+/// How much output a holder keeps for a client that has not attached yet.
+const RING_CAP: usize = 4 << 20;
+
+/// A frame is a one-byte kind and its payload.
+pub const KIND_OUTPUT: u8 = b'o';
+const KIND_INPUT: u8 = b'i';
+const KIND_RESIZE: u8 = b'r';
+pub const KIND_EXIT: u8 = b'x';
+
+fn holder_dir() -> PathBuf {
+    let base = std::env::var_os("AIXODIA_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("terminals")
+}
+
+/// Where a holder for `id` advertises itself.
+pub fn socket_path(id: &str) -> PathBuf {
+    let mut name = String::new();
+    for c in id.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            name.push(c);
+        } else {
+            name.push('_');
+        }
+    }
+    holder_dir().join(format!("{name}.sock"))
+}
+
+/// The ring a holder keeps while nobody is attached.
+struct Ring {
+    data: Vec<u8>,
+}
+
+impl Ring {
+    fn new() -> Self {
+        Self {
+            data: Vec::with_capacity(64 << 10),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+        if self.data.len() > RING_CAP {
+            // The tail is what a returning client needs, so the oldest bytes go.
+            let cut = self.data.len() - RING_CAP;
+            self.data.drain(..cut);
+        }
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.data)
+    }
+}
+
+/// Runs the holder for one shell and never returns.
+///
+/// This is the body of the `term-holder` subcommand: it owns the pty, serves
+/// whichever engine connects, and outlives any number of them.
+pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> IoError {
+    let path = socket_path(id);
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return err;
+        }
+    }
+    // A socket file left by a holder that has since died would make bind fail.
+    let _ = std::fs::remove_file(&path);
+    let Ok(listener) = UnixListener::bind(&path) else {
+        return IoError::last_os_error();
+    };
+    // Only this user may talk to a shell.
+    let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+
+    let Ok(pty) = Pty::start(shell, &["-l".to_string()], cols, rows, dir) else {
+        let _ = std::fs::remove_file(&path);
+        return IoError::last_os_error();
+    };
+    let _ = std::fs::write(socket_path(id).with_extension("pid"), pty.pid().to_string());
+    let pty = Arc::new(pty);
+    let ring = Arc::new(Mutex::new(Ring::new()));
+    let dead = Arc::new(AtomicBool::new(false));
+
+    // One reader for the whole life of the shell. Output goes into the ring
+    // whether or not anyone is attached, and to the attached client when there
+    // is one, so a reconnect loses nothing it could have shown.
+    let reader_pty = pty.clone();
+    let reader_ring = ring.clone();
+    let reader_dead = dead.clone();
+    let attached: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+    let writer = attached.clone();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 32 << 10];
+        loop {
+            if reader_pty.dead() {
+                reader_dead.store(true, Ordering::SeqCst);
+                if let Some(mut stream) = writer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = frame(
+                        &mut stream,
+                        KIND_EXIT,
+                        &reader_pty.exit_code().to_le_bytes(),
+                    );
+                }
+                return;
+            }
+            match reader_pty.read(&mut buf) {
+                Ok(0) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(n) => {
+                    let bytes = &buf[..n];
+                    reader_ring
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(bytes);
+                    let mut slot = writer.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(stream) = slot.as_mut() {
+                        if frame(stream, KIND_OUTPUT, bytes).is_err() {
+                            *slot = None;
+                        }
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    });
+
+    // Accept loop: one engine at a time. A new connection replaces the old one,
+    // which is what lets a restarted engine take back a pane the previous one
+    // was still holding when it died.
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let _ = serve(stream, &pty, &ring, &attached, &dead);
+    }
+    let _ = std::fs::remove_file(&path);
+    IoError::new(ErrorKind::Other, "the holder stopped accepting")
+}
+
+/// Serves one connected engine until it goes away.
+fn serve(
+    stream: UnixStream,
+    pty: &Arc<Pty>,
+    ring: &Arc<Mutex<Ring>>,
+    attached: &Arc<Mutex<Option<UnixStream>>>,
+    dead: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    // Whatever happened while nobody was attached is handed over first, so the
+    // phone sees the output it missed instead of a screen that forgot it.
+    let replay = ring.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut out = stream.try_clone()?;
+    if !replay.is_empty() {
+        frame(&mut out, KIND_OUTPUT, &replay)?;
+    }
+    if dead.load(Ordering::SeqCst) {
+        frame(&mut out, KIND_EXIT, &pty.exit_code().to_le_bytes())?;
+        return Ok(());
+    }
+    *attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+
+    let mut input = stream;
+    let mut header = [0u8; 5];
+    loop {
+        if input.read_exact(&mut header).is_err() {
+            break;
+        }
+        let kind = header[0];
+        let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        if input.read_exact(&mut payload).is_err() {
+            break;
+        }
+        match kind {
+            KIND_INPUT => {
+                if pty.write(&payload).is_err() {
+                    break;
+                }
+            }
+            KIND_RESIZE => {
+                if payload.len() >= 4 {
+                    let cols = u16::from_le_bytes([payload[0], payload[1]]);
+                    let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                    let _ = pty.resize(cols, rows);
+                    let _ = pty.kick();
+                }
+            }
+            _ => {}
+        }
+    }
+    *attached.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    Ok(())
+}
+
+/// The shell a holder is running, read from the process table.
+///
+/// The holder records it beside its socket so the engine can name the same pid
+/// the tab was opened with, which is what makes "the shell is still the one you
+/// left" checkable rather than assumed.
+pub fn shell_pid(id: &str) -> Option<i32> {
+    let path = socket_path(id).with_extension("pid");
+    let text = std::fs::read_to_string(path).ok()?;
+    text.trim().parse().ok()
+}
+
+fn frame(mut stream: &UnixStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+    let mut header = [0u8; 5];
+    header[0] = kind;
+    header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(payload)?;
+    stream.flush()
+}
+
+/// Starts a holder for `id` and connects to it.
+///
+/// The holder is detached from the engine's own lifetime: it is started in its
+/// own session, and its output streams are the engine's own close-on-exec files
+/// so nothing of the engine survives inside it.
+pub fn connect_or_start(
+    id: &str,
+    shell: &str,
+    cols: u16,
+    rows: u16,
+    dir: Option<&str>,
+) -> IoErrorResult<Holder> {
+    let path = socket_path(id);
+    if let Ok(stream) = UnixStream::connect(&path) {
+        return Ok(Holder::new(stream, path));
+    }
+    let exe = std::env::current_exe()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("term-holder")
+        .arg(id)
+        .arg(shell)
+        .arg(cols.to_string())
+        .arg(rows.to_string())
+        .env_remove("CF_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    // The holder must not die with the engine, so it leads its own session and
+    // never receives the engine's terminal signals.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(IoError::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+
+    // The socket appears once the holder has bound it, which it does before
+    // starting the shell, so a short wait is enough and a long one is a bug.
+    for _ in 0..200 {
+        if let Ok(stream) = UnixStream::connect(&path) {
+            // Reaping here would tie the holder's exit to this process; it is
+            // left to the holder's own session instead.
+            drop(child.id());
+            return Ok(Holder::new(stream, path));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    Err(IoError::new(
+        ErrorKind::TimedOut,
+        "the terminal holder did not come up",
+    ))
+}
+
+type IoErrorResult<T> = std::io::Result<T>;
+
+/// The engine's end of a holder connection.
+pub struct Holder {
+    stream: UnixStream,
+    path: PathBuf,
+    /// Set by the holder's exit frame, so a shell that ended while the engine
+    /// was away is reported as ended rather than as a connection that is quiet.
+    finished: AtomicBool,
+    exit_code: std::sync::atomic::AtomicI32,
+}
+
+/// The exit code of a shell whose holder has not said otherwise.
+const NO_EXIT_CODE: i32 = -1;
+
+impl Holder {
+    fn new(stream: UnixStream, path: PathBuf) -> Self {
+        let _ = stream.set_nonblocking(true);
+        Self {
+            stream,
+            path,
+            finished: AtomicBool::new(false),
+            exit_code: std::sync::atomic::AtomicI32::new(NO_EXIT_CODE),
+        }
+    }
+
+    /// Records the exit code the holder reported.
+    pub fn set_exit_code(&self, code: i32) {
+        self.exit_code.store(code, Ordering::SeqCst);
+        self.finished.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the shell inside the holder has ended.
+    pub fn finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code.load(Ordering::SeqCst)
+    }
+
+    /// Detaches without ending the shell: the holder outlives this connection.
+    pub fn close(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn write_all(&self, data: &[u8]) -> std::io::Result<()> {
+        let _ = self.stream.set_nonblocking(false);
+        let result = frame(&self.stream, KIND_INPUT, data);
+        let _ = self.stream.set_nonblocking(true);
+        result
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        let mut payload = [0u8; 4];
+        payload[0..2].copy_from_slice(&cols.to_le_bytes());
+        payload[2..4].copy_from_slice(&rows.to_le_bytes());
+        let _ = self.stream.set_nonblocking(false);
+        let result = frame(&self.stream, KIND_RESIZE, &payload);
+        let _ = self.stream.set_nonblocking(true);
+        result
+    }
+
+    /// Reads one frame, or reports nothing yet.
+    pub fn read_frame(&self) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+        let mut header = [0u8; 5];
+        let mut stream = &self.stream;
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        let kind = header[0];
+        let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut payload = vec![0u8; len];
+        let _ = self.stream.set_nonblocking(false);
+        let read = stream.read_exact(&mut payload);
+        let _ = self.stream.set_nonblocking(true);
+        read?;
+        Ok(Some((kind, payload)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_name_has_no_separator() {
+        let path = socket_path("../../etc/passwd");
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(!name.contains('/'), "{name} must not escape the holder dir");
+    }
+}
