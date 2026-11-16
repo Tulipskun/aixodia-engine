@@ -14,18 +14,21 @@ mod devices;
 mod handover;
 mod tunnel;
 
-use std::future::IntoFuture;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::middleware;
+use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::Router;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt as _;
 
 use aixodia_config as config;
 use aixodia_db::Client as DbClient;
@@ -117,6 +120,49 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // unaccepted for as long as they took — which the phone saw as the engine
     // being gone, even though the swap itself had no gap at all.
     let listener = listen();
+
+    // Start answering on the inherited socket before reading any configuration.
+    //
+    // The reads below cross the tunnel and take tens of seconds together. Until
+    // this process calls `accept`, a request that arrived during the `execve`
+    // sits in the accept queue unanswered, and the phone reads that silence as
+    // the engine being gone. So the routes are served through a slot that holds
+    // the real router once it is built: `/healthz` answers from the first
+    // instant (that is the request the tunnel watches), anything else is told
+    // plainly that the engine is still starting rather than left to time out.
+    let routes: SharedRoutes = Arc::new(tokio::sync::RwLock::new(None));
+    let booting = routes.clone();
+    let boot = Router::new().fallback(move |request: axum::extract::Request| {
+        let booting = booting.clone();
+        async move {
+            if let Some(router) = booting.read().await.clone() {
+                return router
+                    .oneshot(request)
+                    .await
+                    .unwrap_or_else(|never| match never {});
+            }
+            if request.uri().path() == "/healthz" {
+                let body = json!({
+                    "ok": true,
+                    "version": aixodia_io::gateway::VERSION,
+                    "pid": std::process::id(),
+                    "update": "signal:USR1",
+                    "starting": true,
+                });
+                return (StatusCode::OK, axum::Json(body)).into_response();
+            }
+            (StatusCode::SERVICE_UNAVAILABLE, "engine is starting").into_response()
+        }
+    });
+    let shutting_down = cancel.clone();
+    let mut serving_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            boot.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { shutting_down.cancelled().await })
+        .await
+    });
 
     if let Err(reason) = db.verify_detailed(&token).await {
         // The reason matters: a bad token and an unreachable API both used to
@@ -348,20 +394,23 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         }
     });
 
-    let shutdown = cancel.clone();
-    let server = axum::serve(listener, mux.into_make_service())
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .into_future();
-    tokio::pin!(server);
+    // Every route is up; the requests that were waiting in the accept queue are
+    // answered by the real router from this point on.
+    *routes.write().await = Some(mux);
+    tracing::info!("routes installed");
+
     tokio::select! {
-        result = &mut server => {
-            result?;
+        result = &mut serving_task => {
+            match result {
+                Ok(served) => served?,
+                Err(err) => return Err(err.into()),
+            }
         }
         _ = cancel.cancelled() => {
             // Stop the turns this process owns before waiting for connections,
             // and give a wedged SSE stream the same five seconds Go does.
             runs.close();
-            let _ = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut serving_task).await;
         }
     }
     // A turn can answer while its rows are still on their way to D1, and those
@@ -379,6 +428,13 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
 /// One chat turn through the gateway's HTTP chat route, in process, exactly as
 /// Go's `chatViaGateway` does. The phone socket and the API share routing,
 /// history and persistence.
+/// The router the listening socket dispatches to, empty until it is built.
+///
+/// The socket has to accept before the engine has read its configuration, so the
+/// accept loop is started with a stand-in and given the real router through this
+/// slot once every route exists.
+type SharedRoutes = Arc<tokio::sync::RwLock<Option<Router>>>;
+
 /// Takes the port this process must answer on, as early as possible.
 ///
 /// An inherited socket is adopted as-is; otherwise the port is bound here. Called
