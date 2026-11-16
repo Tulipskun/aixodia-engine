@@ -209,14 +209,36 @@ fn write_state(value: &str) {
 }
 
 /// Whether the published asset differs from the running copy. The asset's
-/// `updated_at` is the change signal; [`install`] confirms by sha256 of the
-/// downloaded bytes.
+/// `updated_at` is the change signal, and the asset's own sha256 is the second
+/// one: a release that says it is newer than the recorded state is not proof
+/// that the bytes on disk are the bytes it publishes, and a state file that
+/// agrees with the release while the image differs left `aixodia update`
+/// reporting "already the published build" over a binary it never replaced.
+/// [`install`] confirms by sha256 of the downloaded bytes either way.
 pub async fn need_update() -> Result<(bool, Release)> {
     let release = latest().await?;
     if release.updated_at.is_empty() || release.updated_at == read_state() {
-        return Ok((false, release));
+        if release_matches_running(&release) {
+            return Ok((false, release));
+        }
+        return Ok((true, release));
     }
     Ok((true, release))
+}
+
+/// Whether the running image already has the published bytes.
+///
+/// An empty digest means the release predates GitHub publishing one; the state
+/// file is then the only evidence available and it is trusted.
+fn release_matches_running(release: &Release) -> bool {
+    let published = release.digest.trim().trim_start_matches("sha256:");
+    if published.is_empty() {
+        return true;
+    }
+    match current_sha256() {
+        Ok(running) => running == published,
+        Err(_) => true,
+    }
 }
 
 /// The two halves of an update, behind one lock so a test can swap them and
