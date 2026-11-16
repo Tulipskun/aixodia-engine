@@ -36,11 +36,19 @@ const KIND_INPUT: u8 = b'i';
 const KIND_RESIZE: u8 = b'r';
 pub const KIND_EXIT: u8 = b'x';
 
+/// Where holder sockets and pid files live.
+///
+/// The engine's own state directory, so a terminal's socket sits beside the
+/// engine's pid and log rather than in a world-writable `/tmp` shared with
+/// anything else that happens to use the same name. `HOME` is the one variable
+/// the engine and the holder it starts both already have.
 fn holder_dir() -> PathBuf {
-    let base = std::env::var_os("AIXODIA_STATE")
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("terminals")
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".aixodia")
+        .join("terminals")
 }
 
 /// Where a holder for `id` advertises itself.
@@ -272,7 +280,7 @@ pub fn connect_or_start(
         .env_remove("CF_TOKEN")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::inherit());
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
