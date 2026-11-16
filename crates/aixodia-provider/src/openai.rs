@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 /// coding clients it supports. Its published integrations all send this set,
 /// and without it every request — valid key or not — comes back as
 /// "unauthorized client detected".
-const AGENTROUTER_FINGERPRINT: &[(&str, &str)] = &[
+pub const AGENTROUTER_FINGERPRINT: &[(&str, &str)] = &[
     ("X-Stainless-OS", "Linux"),
     ("X-Stainless-Arch", "x64"),
     ("X-Stainless-Lang", "js"),
@@ -28,8 +28,23 @@ const AGENTROUTER_FINGERPRINT: &[(&str, &str)] = &[
     ("User-Agent", "RooCode/3.53.0"),
 ];
 
+/// Whether an upstream refusal is really an instruction to use `/v1/responses`.
+///
+/// Some gateways only serve the Responses API for a given model and answer a
+/// chat completion with a 400 that names it. There is no flag to read — the
+/// message is the signal — so the check is deliberately narrow: a 4xx whose
+/// body asks for the responses path. A 5xx is a transport problem and is
+/// retried elsewhere, and an authentication failure is never a model mismatch.
+fn wants_responses(raw: &[u8], status: u16) -> bool {
+    if !(400..500).contains(&status) {
+        return false;
+    }
+    let body = String::from_utf8_lossy(raw).to_ascii_lowercase();
+    body.contains("/v1/responses") || body.contains("responses api")
+}
+
 /// Whether this endpoint is AgentRouter, by host.
-fn is_agentrouter(endpoint: &str) -> bool {
+pub fn is_agentrouter(endpoint: &str) -> bool {
     endpoint.contains("agentrouter.org")
 }
 
@@ -116,6 +131,12 @@ impl Adapter {
             } => (status, retry_after, raw),
         };
         if !(200..300).contains(&status) {
+            // Some gateways serve only the Responses API for certain models and
+            // answer a chat completion with a pointer to it. The error text is
+            // the only signal they give, so it is what decides the retry.
+            if wants_responses(&raw, status) {
+                return self.complete_via_responses(req, prov, key).await;
+            }
             return Err(APIError::new(status, error_message(&raw))
                 .with_retry_after(error_wait(&raw, retry_after))
                 .into_anyhow());
@@ -1372,6 +1393,26 @@ mod agentrouter_tests {
         let headers = adapter.headers("application/json", "sk", "https://api.openai.com/v1");
         assert_eq!(headers.get("user-agent").unwrap(), crate::types::USER_AGENT);
         assert!(headers.get("x-stainless-os").is_none());
+    }
+
+    /// A gateway that only serves the Responses API says so in the error. That
+    /// text is the only signal available, so it has to be read narrowly.
+    #[test]
+    fn a_request_to_use_the_responses_api_is_recognised() {
+        let body = br#"{"error":{"message":"model does not support /v1/chat/completions, please use /v1/responses"}}"#;
+        assert!(wants_responses(body, 400));
+        assert!(wants_responses(b"please use the Responses API", 422));
+    }
+
+    #[test]
+    fn other_failures_are_not_mistaken_for_it() {
+        // Authentication, rate limits and server faults are not model mismatches.
+        assert!(!wants_responses(
+            br#"{"error":{"message":"unauthorized client detected"}}"#,
+            401
+        ));
+        assert!(!wants_responses(b"internal error", 500));
+        assert!(!wants_responses(br#"{"error":"bad model"}"#, 400));
     }
 
     #[test]

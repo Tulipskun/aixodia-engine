@@ -120,14 +120,27 @@ pub async fn fetch_models(cfg: &ConfigProvider) -> anyhow::Result<Vec<String>> {
     // need a key answers 401 and that is reported as its own error.
     let endpoint = models_endpoint(cfg)?;
 
-    let mut request = http_client()
+    // Headers are built in one map first: reqwest appends what `header()`
+    // passes, so setting User-Agent twice would put two values on the wire and
+    // the edge would read the engine's own name instead of the client's.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("Accept", "application/json".parse()?);
+    headers.insert("User-Agent", aixodia_provider::USER_AGENT.parse()?);
+    if let Some(key) = cfg.keys.first() {
+        headers.insert("Authorization", format!("Bearer {key}").parse()?);
+    }
+    // Listing models goes through the same edge as a chat, so it needs the same
+    // client fingerprint or AgentRouter refuses it as an unknown client.
+    if aixodia_provider::openai::is_agentrouter(&endpoint) {
+        for (name, value) in aixodia_provider::openai::AGENTROUTER_FINGERPRINT {
+            headers.insert(*name, value.parse()?);
+        }
+    }
+
+    let request = http_client()
         .get(&endpoint)
         .timeout(Duration::from_secs(15))
-        .header("Accept", "application/json")
-        .header("User-Agent", aixodia_provider::USER_AGENT);
-    if let Some(key) = cfg.keys.first() {
-        request = request.header("Authorization", format!("Bearer {key}"));
-    }
+        .headers(headers);
 
     let response = request.send().await?;
     let status = response.status();
