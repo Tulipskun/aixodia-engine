@@ -30,7 +30,7 @@ pub trait Store: Send + Sync {
     async fn update(&self, run: &Run) -> Result<()>;
     async fn get(&self, id: &str) -> Result<Option<Run>>;
     async fn find_by_client(&self, client_id: &str) -> Result<Option<Run>>;
-    async fn interrupt_stale(&self) -> Result<()>;
+    async fn interrupt_stale(&self, created_before: i64) -> Result<()>;
     async fn append_events(&self, events: &[Event]) -> Result<()>;
     async fn events(&self, run_id: &str, after: i64) -> Result<Vec<Event>>;
 }
@@ -158,13 +158,18 @@ impl Store for D1Store {
     /// will never arrive. `waiting_approval` is a status older builds wrote;
     /// no build writes it any more, but rows already in D1 still carry it and
     /// would otherwise read back as running forever.
-    async fn interrupt_stale(&self) -> Result<()> {
+    ///
+    /// `created_before` is the unix second this image started. Rows created at
+    /// or after it belong to this image — the engine answers before this
+    /// statement is sent, so a turn can already be running when it lands — and
+    /// marking one of those would deny a live run its own answer.
+    async fn interrupt_stale(&self, created_before: i64) -> Result<()> {
         self.db
             .query(
                 "UPDATE runs SET status='interrupted', updated_at=unixepoch(),
                      error=CASE WHEN error='' THEN 'engine restarted' ELSE error END
-                 WHERE status IN ('running','waiting_approval')",
-                &[],
+                 WHERE status IN ('running','waiting_approval') AND created_at < ?",
+                &[Value::from(created_before)],
             )
             .await?;
         Ok(())
@@ -324,10 +329,10 @@ impl Store for MemoryStore {
             .cloned())
     }
 
-    async fn interrupt_stale(&self) -> Result<()> {
+    async fn interrupt_stale(&self, created_before: i64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         for run in state.runs.values_mut() {
-            if !run.status.terminal() {
+            if !run.status.terminal() && run.created_at < created_before {
                 run.status = Status::Interrupted;
                 run.error = "engine restarted".to_string();
                 run.updated_at = crate::event::unix_now();
@@ -410,19 +415,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_runs_are_interrupted() {
+    async fn stale_runs_are_interrupted_but_not_the_ones_this_image_started() {
         let store = MemoryStore::new();
-        store
-            .insert(&Run {
-                id: "a".to_string(),
-                status: Status::Running,
-                ..Run::default()
-            })
-            .await
-            .expect("insert");
-        store.interrupt_stale().await.expect("interrupt");
-        let run = store.get("a").await.expect("get").expect("run");
-        assert_eq!(run.status, Status::Interrupted);
-        assert_eq!(run.error, "engine restarted");
+        for (id, created_at) in [("left-over", 100), ("brand-new", 200)] {
+            store
+                .insert(&Run {
+                    id: id.to_string(),
+                    status: Status::Running,
+                    created_at,
+                    ..Run::default()
+                })
+                .await
+                .expect("insert");
+        }
+        store.interrupt_stale(200).await.expect("interrupt");
+        let stale = store.get("left-over").await.expect("get").expect("run");
+        assert_eq!(stale.status, Status::Interrupted);
+        assert_eq!(stale.error, "engine restarted");
+        let live = store.get("brand-new").await.expect("get").expect("run");
+        assert_eq!(live.status, Status::Running);
+        assert_eq!(live.error, "");
     }
 }

@@ -215,13 +215,14 @@ impl Manager {
         }
     }
 
-    /// Prepares the schema, marks runs left behind by an earlier process as
-    /// interrupted, and starts the background persistence loop.
+    /// Prepares the schema and starts the background persistence loop.
+    ///
+    /// The DDL is gated by `~/.aixodia/schema.json`, so on any machine that has
+    /// already run it this is a file read rather than a round trip, and it stays
+    /// in the boot path: the tables a run is written to must exist before the
+    /// first run is accepted.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         self.store.ensure().await?;
-        if let Err(err) = self.store.interrupt_stale().await {
-            tracing::warn!(error = %err, "run: mark stale runs");
-        }
         let weak: Weak<Manager> = Arc::downgrade(self);
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
@@ -245,6 +246,19 @@ impl Manager {
             }
         });
         Ok(())
+    }
+
+    /// Marks the runs an earlier process left behind as interrupted.
+    ///
+    /// This is a real `UPDATE` over the tunnel — six seconds on this machine —
+    /// and no route waits for its answer, so the engine calls it once it is
+    /// already answering rather than leaving the phone on "engine is starting"
+    /// until it returns. `started_at` is the unix second this image started: a
+    /// row created at or after it belongs to this image and must be left alone.
+    pub async fn interrupt_stale(&self, started_at: i64) {
+        if let Err(err) = self.store.interrupt_stale(started_at).await {
+            tracing::warn!(error = %err, "run: mark stale runs");
+        }
     }
 
     /// Stops accepting work and cancels the turns this process owns.

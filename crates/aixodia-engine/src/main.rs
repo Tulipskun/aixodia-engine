@@ -399,6 +399,25 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     *routes.write().await = Some(mux);
     tracing::info!("routes installed");
 
+    // A run the previous image left behind still reads as "running" until this
+    // statement lands, and it takes seconds here: it is one `UPDATE` over the
+    // tunnel. Nothing a client waits for depends on its answer, so it is sent
+    // now that requests are already being served instead of holding the phone on
+    // "engine is starting" while it runs. The cutoff is this process's own start,
+    // because a turn accepted during these seconds is this image's to finish.
+    tokio::spawn({
+        let runs = runs.clone();
+        let started_at = tunnel::started_at();
+        async move {
+            let began = std::time::Instant::now();
+            runs.interrupt_stale(started_at).await;
+            tracing::info!(
+                elapsed_ms = began.elapsed().as_millis() as u64,
+                "stale runs marked interrupted"
+            );
+        }
+    });
+
     tokio::select! {
         result = &mut serving_task => {
             match result {
