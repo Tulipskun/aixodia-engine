@@ -847,7 +847,8 @@ fn spawn_config_reloader(cancel: CancellationToken, db: DbClient) {
 
 /// The version of the `chat_turns` columns this image needs. Bump it whenever
 /// the DDL in `aixodia_session::D1::ensure_turns` changes: the statements only
-/// run on a machine that has not recorded this version.
+/// run on a machine that has not recorded this version. Every image after that
+/// answers from `~/.aixodia/schema.json` and never asks D1 again.
 const SESSION_SCHEMA: &str = "1";
 
 /// The version of the `objectives` table this image needs. Bump it whenever the
