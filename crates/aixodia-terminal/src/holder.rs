@@ -349,24 +349,18 @@ pub fn connect_or_start(
 
 type IoErrorResult<T> = std::io::Result<T>;
 
-/// Marks every open listening socket close-on-exec, so a child cannot inherit
-/// the engine's port.
+/// Marks every listening socket this process holds close-on-exec.
 ///
 /// The engine clears that flag on its own listener while an update hands it
-/// over, and the flag stays cleared. Any process started from then on — a holder,
-/// and the shell inside it — would hold the same socket.
+/// over, and the flag stays cleared, so a child started afterwards would hold
+/// the port. This runs between `fork` and `exec`, where allocating is not safe:
+/// every step is a fixed-size ioctl or fcntl on a bounded range of numbers, and
+/// a descriptor that is not a listening socket is left alone.
 fn close_inheritable_sockets() {
-    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(fd) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
+    // A ceiling well above any descriptor this process can realistically hold.
+    const MAX_FD: i32 = 256;
+    let mut fd: i32 = 0;
+    while fd < MAX_FD {
         let mut accepting: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let rc = unsafe {
@@ -378,15 +372,15 @@ fn close_inheritable_sockets() {
                 &mut len,
             )
         };
-        if rc != 0 || accepting == 0 {
-            continue;
-        }
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags >= 0 {
-                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        if rc == 0 && accepting != 0 {
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
             }
         }
+        fd += 1;
     }
 }
 
