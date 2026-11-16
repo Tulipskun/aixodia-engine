@@ -7,7 +7,6 @@
 mod holder;
 mod modes;
 mod pty;
-pub mod tmux;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, Ordering};
@@ -141,9 +140,8 @@ struct Session {
     start: u64,
     shell: String,
     dir: String,
-    /// The shell process this session *is*. Under tmux that is the pane's shell,
-    /// not the tmux client the pty actually runs, so the number a tab was opened
-    /// with survives a detach and an engine restart.
+    /// The shell process this session *is*. The holder runs it, so the number a
+    /// tab was opened with survives a detach and an engine restart.
     shell_pid: AtomicI32,
     cols: AtomicU16,
     rows: AtomicU16,
@@ -231,7 +229,6 @@ pub struct Server {
     ping_every: Duration,
     idle_after: Duration,
     shell: String,
-    pub tmux: bool,
     logf: Mutex<Option<Logf>>,
 }
 
@@ -245,7 +242,6 @@ impl Server {
             ping_every: DEFAULT_PING_EVERY,
             idle_after: IDLE_REAP_AFTER,
             shell: default_shell(),
-            tmux: false,
             logf: Mutex::new(None),
         }
     }
@@ -304,8 +300,7 @@ impl Server {
         self.consume_ticket(&ticket)
     }
 
-    /// Every live session, oldest first, including tmux sessions that survived a
-    /// restart.
+    /// Every live session, oldest first.
     pub fn list(&self) -> Vec<Info> {
         self.reap(false);
         let sessions: Vec<Arc<Session>> = {
@@ -326,26 +321,6 @@ impl Server {
                 title: String::new(),
             })
             .collect();
-        if self.tmux {
-            let seen: std::collections::HashSet<String> =
-                out.iter().map(|info| info.id.clone()).collect();
-            for session in tmux::list() {
-                if seen.contains(&session.id) {
-                    continue;
-                }
-                out.push(Info {
-                    id: session.id,
-                    pid: session.pid,
-                    shell: "tmux".to_string(),
-                    cwd: session.cwd,
-                    cols: 0,
-                    rows: 0,
-                    alive: true,
-                    created_at: session.created_at,
-                    title: session.title,
-                });
-            }
-        }
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         out
     }
@@ -387,9 +362,6 @@ impl Server {
         }
         session.mark_dead();
         session.pty.close();
-        if self.tmux {
-            tmux::kill(id);
-        }
     }
 
     fn shell(&self) -> &str {
@@ -428,7 +400,6 @@ impl Server {
                         let _ = session.pty.resize(cols, rows);
                     }
                     let kick = reattach_kick(
-                        self.tmux,
                         resized,
                         session
                             .modes
@@ -465,14 +436,6 @@ impl Server {
         // restart: the pty belongs to that process, not to this one, so the
         // phone's tab still has something to reattach to when a new engine
         // comes up.
-        if self.tmux {
-            let p = tmux::start(id, &shell, cols, rows, Some(&dir))
-                .map_err(|err| std::io::Error::new(err.kind(), format!("tmux: {err}")))?;
-            let p = Arc::new(Shell::Direct(Arc::new(p)));
-            return self
-                .adopt(id, shell, dir, cols, rows, p)
-                .map(|s| (s, false));
-        }
         let held = holder::connect_or_start(id, &shell, cols, rows, Some(&dir))
             .map_err(|err| std::io::Error::new(err.kind(), format!("holder: {err}")))?;
         let p = Arc::new(Shell::Held(Arc::new(held)));
@@ -490,14 +453,9 @@ impl Server {
         rows: u16,
         p: Arc<Shell>,
     ) -> std::io::Result<Arc<Session>> {
-        // The pid the app is told about is the shell's, not the connection's:
-        // under tmux the pty holds a client that is recreated on every attach,
-        // while the pane's shell keeps the pid the tab was opened with.
-        let pid = if self.tmux {
-            tmux::pane_pid(id).unwrap_or_default()
-        } else {
-            holder::shell_pid(id).unwrap_or_default()
-        };
+        // The pid the app is told about is the shell the holder runs, which is
+        // the same number before and after an engine restart.
+        let pid = holder::shell_pid(id).unwrap_or_default();
         let start = process_start(pid).unwrap_or(0);
         let session = Arc::new(Session {
             id: id.to_string(),
@@ -599,7 +557,9 @@ impl Server {
                 if session.cancel.is_cancelled() {
                     break;
                 }
-                match held.read_frame() {
+                // Sleep on the socket rather than on the clock: a keystroke's
+                // echo must not wait for the next poll tick.
+                match held.wait_readable(250).and_then(|_| held.read_frame()) {
                     Ok(Some((holder::KIND_OUTPUT, chunk))) => {
                         if !chunk.is_empty() {
                             let mut tracker =
@@ -711,15 +671,7 @@ impl Server {
                 .replay();
             (ring, modes)
         };
-        let replay = replay_frame(
-            if self.tmux {
-                tmux::capture_history(&id)
-            } else {
-                None
-            },
-            &modes,
-            &ring,
-        );
+        let replay = replay_frame(None, &modes, &ring);
 
         let (mut reader, writer) = aixodia_wsock::ServerConn::new(stream).split();
         let ready = json!({
@@ -875,19 +827,11 @@ pub fn run_holder(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>
     std::process::exit(1);
 }
 
-/// Whether tmux is on PATH. The engine uses it to keep shells across restarts.
-pub fn tmux_available() -> bool {
-    tmux::available()
-}
-
-/// The bytes that put a client's screen where the pane already is.
+/// The bytes that put a client's screen where the shell already is.
 ///
-/// A tmux-backed pane speaks for itself: `capture_history` reads its history and
-/// its screen off the server, so the client gets lines the engine's ring never
-/// saw and the phone can page them without asking again. Anywhere else the ring
-/// is the only record, and it is replayed with the pane's queries stripped — an
-/// unanswered `DA`/`DSC` tail would have the client waiting on a device that is
-/// not there.
+/// The ring is the record, and it is replayed with the shell's own queries
+/// stripped — an unanswered `DA`/`DSC` tail would have the client waiting on a
+/// device that is not there.
 fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8]) -> Vec<u8> {
     let body = match history {
         Some(pane) => pane,
@@ -902,15 +846,13 @@ fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8]) -> Vec<u8> 
 
 /// Whether a reattach must ask the client to paint the screen back.
 ///
-/// A size change is itself the signal: TIOCSWINSZ reached the client through the
-/// engine's pty and tmux redraws it. What is left is a same-size attach, where
-/// the replay above normally carries the whole screen already. It is still asked
-/// to paint because the capture can fail — and a pane this process merely
-/// adopted, with nothing in the ring either, would otherwise leave the phone
-/// sitting on a cleared grid until the keyboard changed the size. A plain shell
-/// needs the kick only on the alternate screen, where the program owns the grid.
-fn reattach_kick(tmux: bool, resized: bool, alt_screen: bool) -> bool {
-    !resized && (tmux || alt_screen)
+/// A size change is itself the signal: TIOCSWINSZ already reached the program
+/// through the pty, so asking again would only make it repaint twice. What is
+/// left is a same-size attach, where the replay above normally carries the whole
+/// screen already. A full-screen program still needs the kick, because its grid
+/// belongs to the program and only a SIGWINCH makes it paint after a reconnect.
+fn reattach_kick(resized: bool, alt_screen: bool) -> bool {
+    !resized && alt_screen
 }
 
 fn default_shell() -> String {
@@ -1024,135 +966,53 @@ async fn close(
         .cloned();
     if let Some(session) = session {
         server.drop_session(&id, &session);
-    } else if server.tmux {
-        // Nothing in memory is not nothing on the machine. An engine restart
-        // empties the map while the tmux server keeps the shell, so a close that
-        // only looked in the map reported success and left the shell alive —
-        // and the next list handed the phone back a tab it had closed.
-        tmux::kill(&id);
+    } else {
+        // Nothing in memory is not nothing on the machine: a shell outlives an
+        // engine restart in its holder, so a close that only looked in the map
+        // would report success and leave the shell running.
+        holder::close(&id);
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reattach_kick, replay_frame, tmux};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_same_size_reattach_under_tmux_asks_for_a_repaint() {
-        // The pane lives in the tmux server and nothing but a SIGWINCH makes
-        // the client paint it; this is the reconnect the phone sees as blank.
-        assert!(reattach_kick(true, false, false));
-        assert!(reattach_kick(true, false, true));
-    }
+    use super::{reattach_kick, replay_frame};
 
     #[test]
     fn a_resize_is_its_own_repaint() {
-        // TIOCSWINSZ already signalled the client, tmux or not.
-        assert!(!reattach_kick(true, true, false));
-        assert!(!reattach_kick(false, true, false));
+        // TIOCSWINSZ already signalled the client, so asking again is noise.
+        assert!(!reattach_kick(true, false));
+        assert!(!reattach_kick(true, true));
     }
 
     #[test]
     fn a_plain_shell_reattaches_from_the_ring() {
-        assert!(!reattach_kick(false, false, false));
+        assert!(!reattach_kick(false, false));
     }
 
     #[test]
-    fn a_tmux_history_replaces_the_ring_it_never_watched() {
-        // The engine's ring is what this process saw; a pane that outlived a
-        // restart holds lines no ring does. Whichever the caller hands over wins,
-        // and the reset stays first so the client clears before it paints.
-        let replay = replay_frame(Some(b"old history".to_vec()), b"\x1b[?1h", b"ring tail");
-        assert_eq!(replay, b"\x1bc\x1b[?1hold history".to_vec());
+    fn a_full_screen_program_is_asked_to_paint() {
+        // A program in the alternate screen repaints only when signalled, and a
+        // phone that just reconnected otherwise sees the blank it left behind.
+        assert!(reattach_kick(false, true));
+    }
+
+    #[test]
+    fn the_ring_is_replayed_when_there_is_no_history() {
+        // A holder keeps its own ring across an engine restart, so the engine's
+        // replay is what the phone paints on reconnect.
         let ring_only = replay_frame(None, b"\x1b[?1h", b"ring tail");
         assert!(ring_only.ends_with(b"ring tail"));
-    }
-
-    /// Lines above the bottom of the screen only exist in the tmux server, so a
-    /// client that asks for the pane's history has to be answered from there. This
-    /// drives a real pane; skipped where tmux is not installed.
-    #[test]
-    fn a_pane_answers_with_its_history() {
-        if !tmux::available() {
-            return;
-        }
-        let id = format!("capturetest-{}", std::process::id());
-        let Ok(pty) = tmux::start(&id, "/bin/bash", 40, 12, Some("/tmp")) else {
-            return;
-        };
-        let _ = pty.write(b"for i in $(seq 1 200); do echo \"aa-$i\"; done\r");
-        let deadline = Instant::now() + Duration::from_secs(6);
-        let history = loop {
-            std::thread::sleep(Duration::from_millis(100));
-            let found = tmux::capture_history(&id).unwrap_or_default();
-            let text = String::from_utf8_lossy(&found).into_owned();
-            if text.contains("aa-200") {
-                break text;
-            }
-            if Instant::now() > deadline {
-                tmux::kill(&id);
-                panic!("the pane never printed its 200 lines");
-            }
-        };
-        tmux::kill(&id);
-        // Twelve rows of screen cannot hold two hundred lines, so the ones above
-        // it came from the history and the replay is the whole page.
-        let lines: Vec<&str> = history
-            .lines()
-            .map(|line| line.trim_end_matches('\r'))
-            .collect();
         assert!(
-            lines.contains(&"aa-1"),
-            "the oldest line is missing: a client would page into nothing"
+            ring_only.starts_with(b"\x1bc"),
+            "the client must clear first"
         );
-        assert!(lines.contains(&"aa-200"), "the last line is missing");
     }
 
     #[test]
-    fn a_full_screen_program_without_tmux_is_asked_to_paint() {
-        assert!(reattach_kick(false, false, true));
-    }
-
-    /// The pty the engine holds keeps its tmux client across a detach, and the
-    /// client paints nothing until a SIGWINCH reaches it — the repaint a
-    /// reconnected phone was missing. This drives the engine's own pty and kick.
-    /// Skipped where tmux is not installed.
-    #[test]
-    fn a_kick_repaints_the_tmux_pane() {
-        if !tmux::available() {
-            return;
-        }
-        let id = format!("kicktest-{}", std::process::id());
-        let Ok(pty) = tmux::start(&id, "/bin/bash", 40, 120, Some("/tmp")) else {
-            return;
-        };
-        let drain = |ms: u64| {
-            let mut out = Vec::new();
-            let mut buf = [0u8; 8192];
-            let deadline = Instant::now() + Duration::from_millis(ms);
-            while Instant::now() < deadline {
-                match pty.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => out.extend_from_slice(&buf[..n]),
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-            out
-        };
-        let first = drain(1_200);
-        // Let the startup paint finish, so nothing still in flight can be
-        // mistaken for the repaint the kick asks for.
-        let _ = drain(300);
-        let kicked = pty.kick().is_ok();
-        let repaint = drain(1_200);
-        tmux::kill(&id);
-        assert!(!first.is_empty(), "the tmux client never painted");
-        assert!(kicked, "the pty has no foreground group to signal");
-        assert!(!repaint.is_empty(), "a SIGWINCH repainted nothing");
+    fn history_wins_over_the_ring_when_both_exist() {
+        let replay = replay_frame(Some(b"old history".to_vec()), b"\x1b[?1h", b"ring tail");
+        assert_eq!(replay, b"\x1bc\x1b[?1hold history".to_vec());
     }
 }

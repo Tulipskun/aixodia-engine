@@ -188,10 +188,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
 
     let hub = Arc::new(Hub::new());
     let chat = chat_func(gateway.clone());
-    let mut terminal_server = TerminalServer::new(token.clone());
-    // Shells are kept by the engine's own holder, so a terminal survives an
-    // engine restart without tmux being installed at all.
-    terminal_server.tmux = false;
+    let terminal_server = TerminalServer::new(token.clone());
     // The screen is a hub per process, like the terminal server: one display,
     // one capture, however many phones are looking at it.
     let display = db

@@ -19,6 +19,7 @@
 //! what makes the scrollback of a rebooted engine look like a paused one.
 
 use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,6 +141,13 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
                 }
                 return;
             }
+            // Wait for the pty to have something before reading it. Sleeping
+            // instead capped this loop at one pass per sleep, and every byte the
+            // shell printed waited for the next pass: a keystroke's echo cost a
+            // full interval. `poll` returns the moment a byte is there.
+            if !wait_readable(&reader_pty) {
+                continue;
+            }
             match reader_pty.read(&mut buf) {
                 Ok(0) => {
                     std::thread::sleep(Duration::from_millis(20));
@@ -157,9 +165,7 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
                         }
                     }
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
                 Err(err) if err.kind() == ErrorKind::Interrupted => {}
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(20));
@@ -244,6 +250,19 @@ pub fn shell_pid(id: &str) -> Option<i32> {
     text.trim().parse().ok()
 }
 
+/// Blocks until the pty has bytes, or reports that it is time to look at the
+/// shell's liveness again.
+fn wait_readable(pty: &Pty) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd: pty.master().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 250) };
+    // A timeout is not an error: it is the tick that notices a dead shell.
+    ready >= 0
+}
+
 fn frame(mut stream: &UnixStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut header = [0u8; 5];
     header[0] = kind;
@@ -317,6 +336,21 @@ pub fn connect_or_start(
 
 type IoErrorResult<T> = std::io::Result<T>;
 
+/// Ends the shell held for `id`, whether or not this engine started it.
+///
+/// A shell outlives an engine restart, so a closed tab must reach the holder
+/// rather than only the engine's map: otherwise the shell keeps running and the
+/// next list hands back a tab the phone had already closed.
+pub fn close(id: &str) {
+    let path = socket_path(id);
+    if let Ok(mut stream) = UnixStream::connect(&path) {
+        let _ = frame(&stream, KIND_EXIT, &[]);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("pid"));
+}
+
 /// The engine's end of a holder connection.
 pub struct Holder {
     stream: UnixStream,
@@ -380,6 +414,25 @@ impl Holder {
         let result = frame(&self.stream, KIND_RESIZE, &payload);
         let _ = self.stream.set_nonblocking(true);
         result
+    }
+
+    /// Waits for the socket to have a frame, so a caller is woken by the byte
+    /// arriving instead of polling for it.
+    pub fn wait_readable(&self, timeout_ms: i32) -> std::io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd: self.stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ready < 0 {
+            let err = IoError::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        Ok(ready > 0)
     }
 
     /// Reads one frame, or reports nothing yet.
