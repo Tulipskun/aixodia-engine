@@ -42,6 +42,10 @@ pub struct D1Store {
     db: Client,
 }
 
+/// The version of the run tables this image needs. Bump it whenever the DDL in
+/// [`Store::ensure`] changes.
+const SCHEMA: &str = "1";
+
 impl D1Store {
     pub fn new(db: Client) -> Self {
         Self { db }
@@ -51,6 +55,13 @@ impl D1Store {
 #[async_trait]
 impl Store for D1Store {
     async fn ensure(&self) -> Result<()> {
+        // These five statements only have work to do on a machine that has never
+        // run them; afterwards each is a round trip over the tunnel that changes
+        // nothing. The version is recorded locally, which an update's `execve`
+        // preserves, so a restarted image skips the DDL its predecessor applied.
+        if !aixodia_db::schema::claim("runs", SCHEMA) {
+            return Ok(());
+        }
         for statement in [
             "CREATE TABLE IF NOT EXISTS runs (
                 id TEXT PRIMARY KEY,
@@ -77,6 +88,7 @@ impl Store for D1Store {
         ] {
             self.db.query(statement, &[]).await?;
         }
+        aixodia_db::schema::record("runs", SCHEMA);
         Ok(())
     }
 
