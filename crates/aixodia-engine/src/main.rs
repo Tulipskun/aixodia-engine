@@ -323,16 +323,21 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
 
     aixodia_io::auto_backup::spawn(gateway.clone(), cancel.clone());
 
+    // What "safe to replace this image" means: no turn is being answered and no
+    // run is being driven. Both are work whose result is owed to someone still
+    // connected, and an exec ends it mid-answer.
+    //
+    // A write queued to D1 deliberately does not count. Waiting for one was
+    // wrong twice over: `execve` ends the runtime whether or not the queue is
+    // empty, so waiting only moves the loss later instead of preventing it, and
+    // a D1 call that hangs left the condition false forever with nothing else
+    // running — an engine that could then never be updated at all. The queue is
+    // drained on shutdown, where the engine can afford to wait, and a queued
+    // write lost to an update is the history of a turn whose answer the caller
+    // already has.
     let idle = {
         let runs = runs.clone();
-        let gateway = gateway.clone();
-        move || {
-            ACTIVE_CHATS.load(Ordering::SeqCst) == 0
-                && runs.active() == 0
-                // A turn that answered before its rows landed still owes D1 the
-                // write, and an in-place update cannot finish it afterwards.
-                && !gateway.owes_backups()
-        }
+        move || ACTIVE_CHATS.load(Ordering::SeqCst) == 0 && runs.active() == 0
     };
     // Updates install only while no chat is in flight, and always as an
     // in-place exec, so the pid never changes. Nothing polls the release page:

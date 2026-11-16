@@ -671,7 +671,16 @@ impl Server {
                 .replay();
             (ring, modes)
         };
-        let replay = replay_frame(None, &modes, &ring);
+        // The ring here is what this engine has watched since it started, which
+        // under a holder includes the replay the holder handed over: the output
+        // produced while no engine was connected. Replaying it back is right —
+        // a reattaching phone has seen none of it. What must not happen is the
+        // reset being applied to a client that is *already* at that screen. So
+        // the reset opens the frame and the ring follows it once, and the ring
+        // is emptied as it is sent; otherwise the same history is painted again
+        // on every attach and the screen grows a blank gap between an old
+        // prompt and the one the shell is actually on.
+        let replay = replay_frame(None, &modes, &ring, eff_rows);
 
         let (mut reader, writer) = aixodia_wsock::ServerConn::new(stream).split();
         let ready = json!({
@@ -832,16 +841,46 @@ pub fn run_holder(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>
 /// The ring is the record, and it is replayed with the shell's own queries
 /// stripped — an unanswered `DA`/`DSC` tail would have the client waiting on a
 /// device that is not there.
-fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8]) -> Vec<u8> {
+fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8], rows: u16) -> Vec<u8> {
     let body = match history {
         Some(pane) => pane,
-        None => strip_queries(ring),
+        None => tail_lines(&strip_queries(ring), rows),
     };
     let mut out = Vec::with_capacity(RIS_RESET.len() + modes.len() + body.len());
     out.extend_from_slice(RIS_RESET);
     out.extend_from_slice(modes);
     out.extend_from_slice(&body);
     out
+}
+
+/// The last screenful of a shell's output, cut on a line boundary.
+///
+/// A replay is painted by scrolling a fresh screen, not by restoring one: every
+/// line fed in above the screen's height pushes the earlier ones up and away,
+/// which is what a terminal is supposed to do. Feeding the whole ring therefore
+/// does not restore the screen — it scrolls through the shell's entire history
+/// and leaves the phone showing whatever came last, with the prompt the shell is
+/// actually on sitting below a screenful of older output.
+///
+/// Handing over only the tail makes the result the screen: the last `rows` lines
+/// fill the viewport and nothing is pushed out of sight. The cut lands on a
+/// newline so an escape sequence is never split in half.
+fn tail_lines(ring: &[u8], rows: u16) -> Vec<u8> {
+    let want = rows.max(1) as usize;
+    let mut seen = 0usize;
+    // Nothing is dropped unless the ring really holds more lines than the screen
+    // can show; a short ring is the whole screen already.
+    let mut start = 0usize;
+    for i in (0..ring.len()).rev() {
+        if ring[i] == b'\n' {
+            seen += 1;
+            if seen > want {
+                start = i + 1;
+                break;
+            }
+        }
+    }
+    ring[start..].to_vec()
 }
 
 /// Whether a reattach must ask the client to paint the screen back.
@@ -1002,8 +1041,8 @@ mod tests {
     fn the_ring_is_replayed_when_there_is_no_history() {
         // A holder keeps its own ring across an engine restart, so the engine's
         // replay is what the phone paints on reconnect.
-        let ring_only = replay_frame(None, b"\x1b[?1h", b"ring tail");
-        assert!(ring_only.ends_with(b"ring tail"));
+        let ring_only = replay_frame(None, b"\x1b[?1h", b"ring tail\n", 24);
+        assert!(ring_only.ends_with(b"ring tail\n"));
         assert!(
             ring_only.starts_with(b"\x1bc"),
             "the client must clear first"
@@ -1012,7 +1051,50 @@ mod tests {
 
     #[test]
     fn history_wins_over_the_ring_when_both_exist() {
-        let replay = replay_frame(Some(b"old history".to_vec()), b"\x1b[?1h", b"ring tail");
+        let replay = replay_frame(
+            Some(b"old history".to_vec()),
+            b"\x1b[?1h",
+            b"ring tail\n",
+            24,
+        );
         assert_eq!(replay, b"\x1bc\x1b[?1hold history".to_vec());
+    }
+
+    #[test]
+    fn a_replay_is_one_screenful_and_not_the_whole_ring() {
+        // Repainting by scrolling means everything above the viewport is lost,
+        // so the replay must be exactly the lines the screen can hold. Feeding
+        // the whole ring left the phone showing the end of a long history with
+        // the live prompt pushed below it.
+        let mut ring = Vec::new();
+        for n in 0..100 {
+            ring.extend_from_slice(format!("line {n}\n").as_bytes());
+        }
+        let replay = replay_frame(None, b"", &ring, 5);
+        let body = &replay[super::RIS_RESET.len()..];
+        assert_eq!(
+            body.iter().filter(|b| **b == b'\n').count(),
+            5,
+            "only the last screenful may be painted"
+        );
+        assert!(body.ends_with(b"line 99\n"), "the tail is what is kept");
+        assert!(!body.starts_with(b"line 0\n"), "the head is dropped");
+    }
+
+    #[test]
+    fn a_cut_never_lands_inside_an_escape_sequence() {
+        // Splitting an escape leaves the client in a state no program asked for.
+        let mut ring = Vec::new();
+        for n in 0..10 {
+            let colour = 30 + n;
+            let line = format!("{}[{}mtext {}\n", '\u{1b}', colour, n);
+            ring.extend_from_slice(line.as_bytes());
+        }
+        let replay = replay_frame(None, b"", &ring, 3);
+        let body = &replay[super::RIS_RESET.len()..];
+        assert!(
+            body.starts_with(b"\x1b[3"),
+            "the cut must fall on a line boundary, not mid-sequence"
+        );
     }
 }
