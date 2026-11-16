@@ -479,7 +479,16 @@ impl D1 {
 
     /// Has the columns the current engine writes. The D1 tables predate some of
     /// them, and adding a column is cheap and idempotent.
-    pub async fn ensure_turns(&self) {
+    ///
+    /// `schema` is the version this image needs. It is recorded in the local
+    /// state directory once applied, and a later process that finds the same
+    /// version does not ask D1 again — each of these three statements is a round
+    /// trip over the tunnel, and every one of them only ever answers "duplicate
+    /// column" after the first boot.
+    pub async fn ensure_turns(&self, schema: &str) {
+        if !aixodia_db::schema::claim("session-turns", schema) {
+            return;
+        }
         for statement in [
             "ALTER TABLE chat_turns ADD COLUMN generation_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_turns ADD COLUMN reasoning_content TEXT NOT NULL DEFAULT ''",
@@ -492,6 +501,7 @@ impl D1 {
                 }
             }
         }
+        aixodia_db::schema::record("session-turns", schema);
     }
 }
 

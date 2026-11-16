@@ -212,9 +212,9 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     tracing::info!("engine started");
 
     let store = Arc::new(D1::new(db.clone()));
-    store.ensure_turns().await;
+    store.ensure_turns(SESSION_SCHEMA).await;
     let objectives = Arc::new(aixodia_goals::D1::new(db.clone()));
-    objectives.ensure().await;
+    objectives.ensure(GOALS_SCHEMA).await;
     config::set_store(Some(Arc::new(config::Store::new(Arc::new(db.kv())))));
 
     spawn_config_reloader(cancel.clone(), db.clone());
@@ -844,6 +844,15 @@ fn spawn_config_reloader(cancel: CancellationToken, db: DbClient) {
         }
     });
 }
+
+/// The version of the `chat_turns` columns this image needs. Bump it whenever
+/// the DDL in `aixodia_session::D1::ensure_turns` changes: the statements only
+/// run on a machine that has not recorded this version.
+const SESSION_SCHEMA: &str = "1";
+
+/// The version of the `objectives` table this image needs. Bump it whenever the
+/// DDL in `aixodia_goals::D1::ensure` changes.
+const GOALS_SCHEMA: &str = "1";
 
 /// The engine's local state directory. The keeper records only its child
 /// cloudflared pid here so an in-place executable update can reap an old tunnel.

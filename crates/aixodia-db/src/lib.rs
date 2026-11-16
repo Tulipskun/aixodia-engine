@@ -12,6 +12,8 @@
 //! [`Client::verify_kv`] before any KV call. Both are retried by the config
 //! reloader, exactly as in the Go engine.
 
+pub mod schema;
+
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -102,7 +104,7 @@ struct DatabaseResult {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct KvNamespaceResult {
     #[serde(default)]
     id: String,
@@ -163,9 +165,139 @@ struct Credentials {
     config_kv_namespace: String,
 }
 
+/// The account and namespaces a token resolved to, kept where an `execve` can
+/// still find them.
+///
+/// Only a fingerprint of the token is stored, never the token itself: the file
+/// is proof that *this* credential was resolved, not a copy of it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskIdentity {
+    token_hash: String,
+    account_id: String,
+    db_id: String,
+    kv_namespace: String,
+    config_kv_namespace: String,
+}
+
+impl DiskIdentity {
+    /// `$HOME/.aixodia/identity.json`.
+    fn path() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+        Some(
+            std::path::PathBuf::from(home)
+                .join(".aixodia")
+                .join("identity.json"),
+        )
+    }
+
+    fn load() -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::path()?).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        let Some(parent) = path.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let Ok(raw) = serde_json::to_string(self) else {
+            return;
+        };
+        let temp = path.with_extension("json.new");
+        if std::fs::write(&temp, raw).is_err() || std::fs::rename(&temp, &path).is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+
+    /// Whether this identity was resolved from the token the caller holds.
+    fn matches(&self, token: &str) -> bool {
+        !self.account_id.is_empty()
+            && !self.db_id.is_empty()
+            && self.token_hash == hash_token(token)
+    }
+}
+
+/// A stable fingerprint of a credential, so the file never holds the token.
+fn hash_token(token: &str) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    // Two rounds of a keyed-enough mix: this only has to tell one operator's
+    // token from another's, and the file is not a credential store.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    let first = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (first, token.len()).hash(&mut hasher);
+    format!("{first:016x}{:016x}", hasher.finish())
+}
+
 struct Inner {
     http: reqwest::Client,
     cred: RwLock<Credentials>,
+    /// The configuration keys this process has already read, by key.
+    ///
+    /// Workers KV is a cache in front of a store that only an operator changes,
+    /// and the reads that fill this are the ones startup needs before it can
+    /// answer anything — eight of them, each a round trip over the tunnel. A
+    /// restart paid for all eight again, which is why an update left the engine
+    /// silent for half a minute after it had already exec'd. A read is now a
+    /// lookup unless the key has been written through this client.
+    config_kv_cache: tokio::sync::RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// The account's KV namespaces, once listed.
+    kv_namespaces: tokio::sync::RwLock<Option<Vec<KvNamespaceResult>>>,
+    /// The configuration values a previous image read, kept on disk.
+    config_kv_disk: std::sync::Mutex<Option<DiskConfigCache>>,
+}
+
+/// Configuration values read from Workers KV, written where a `execve` can
+/// still find them.
+///
+/// Only the values are kept, keyed by namespace: pointing the engine at another
+/// namespace invalidates the whole file rather than mixing two accounts'
+/// settings, and a write through [`Client::config_kv_put`] replaces the entry it
+/// touched.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiskConfigCache {
+    namespace: String,
+    values: std::collections::HashMap<String, Option<String>>,
+}
+
+impl DiskConfigCache {
+    /// The cache file: `$HOME/.aixodia/config-cache.json`.
+    fn path() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+        Some(
+            std::path::PathBuf::from(home)
+                .join(".aixodia")
+                .join("config-cache.json"),
+        )
+    }
+
+    /// Reads the file, keeping it only when it belongs to `namespace`.
+    fn load(namespace: &str) -> Option<Self> {
+        let raw = std::fs::read_to_string(Self::path()?).ok()?;
+        let cache: Self = serde_json::from_str(&raw).ok()?;
+        (cache.namespace == namespace).then_some(cache)
+    }
+
+    /// Writes the file. A failure is not fatal: the value is already in memory,
+    /// and the worst a lost file costs is the next read going to the network.
+    fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let Ok(raw) = serde_json::to_string(self) else {
+            return;
+        };
+        let temp = path.with_extension("json.new");
+        if std::fs::write(&temp, raw).is_err() || std::fs::rename(&temp, &path).is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
 }
 
 /// D1 + KV client. Cheap to clone: all clones share one HTTP client and one
@@ -192,6 +324,9 @@ impl Client {
             inner: Arc::new(Inner {
                 http,
                 cred: RwLock::new(Credentials::default()),
+                config_kv_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+                kv_namespaces: tokio::sync::RwLock::new(None),
+                config_kv_disk: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -248,6 +383,24 @@ impl Client {
             return Err(Error::NotVerified);
         }
 
+        // The account and database a token resolves to do not change, and an
+        // update replaces this process with `execve`, which keeps the disk. So a
+        // token that resolved once is trusted to resolve the same way, and the
+        // three requests this would otherwise make before the engine can answer
+        // are skipped. A revoked token is refused by the API itself on the first
+        // real call, so this trades a slow failure at boot for a fast one later.
+        if let Some(cached) = DiskIdentity::load() {
+            if cached.matches(cf_token) {
+                let mut cred = self.inner.cred.write().unwrap();
+                cred.token = cf_token.to_string();
+                cred.account_id = cached.account_id;
+                cred.db_id = cached.db_id;
+                cred.kv_namespace = cached.kv_namespace;
+                cred.config_kv_namespace = cached.config_kv_namespace;
+                return Ok(());
+            }
+        }
+
         // This endpoint only answers for user-owned tokens. An account-owned
         // token is a normal server credential and answers 401 here even when it
         // is valid; the account and database lookups below are the real proof.
@@ -269,6 +422,27 @@ impl Client {
         cred.account_id = account_id;
         cred.db_id = db_id;
         Ok(())
+    }
+
+    /// Writes the resolved identity to disk so the next image can skip resolving
+    /// it again. Called once both namespaces are known.
+    fn remember_identity(&self) {
+        let cred = self.inner.cred.read().unwrap();
+        if cred.token.is_empty()
+            || cred.account_id.is_empty()
+            || cred.db_id.is_empty()
+            || cred.config_kv_namespace.is_empty()
+        {
+            return;
+        }
+        DiskIdentity {
+            token_hash: hash_token(&cred.token),
+            account_id: cred.account_id.clone(),
+            db_id: cred.db_id.clone(),
+            kv_namespace: cred.kv_namespace.clone(),
+            config_kv_namespace: cred.config_kv_namespace.clone(),
+        }
+        .save();
     }
 
     async fn database_location(&self, cf_token: &str) -> Result<(String, String)> {
@@ -384,14 +558,10 @@ impl Client {
     /// Finds the provider namespace, creating it when permitted. The config
     /// reloader retries this independently of daemon startup.
     pub async fn verify_kv(&self) -> Result<()> {
-        let token = self.token();
-        let account_id = self.account_id();
-        if token.is_empty() || account_id.is_empty() {
-            return Err(Error::NotVerified);
+        if !self.kv_namespace().is_empty() {
+            return Ok(());
         }
-
-        let path = format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100");
-        let namespaces: Vec<KvNamespaceResult> = self.get(&path, &token).await?;
+        let namespaces = self.kv_namespaces().await?;
         if let Some(found) = namespaces
             .iter()
             .find(|namespace| namespace.title == KV_NAMESPACE_TITLE)
@@ -413,6 +583,27 @@ impl Client {
         Ok(())
     }
 
+    /// The account's KV namespaces, listed once per process.
+    ///
+    /// Both namespace lookups below ask the same question — one listing answers
+    /// both — and the answer only changes when an operator creates a namespace,
+    /// which is not something a running engine has to notice.
+    async fn kv_namespaces(&self) -> Result<Vec<KvNamespaceResult>> {
+        let token = self.token();
+        let account_id = self.account_id();
+        if token.is_empty() || account_id.is_empty() {
+            return Err(Error::NotVerified);
+        }
+        let cached = self.inner.kv_namespaces.read().await.clone();
+        if let Some(namespaces) = cached {
+            return Ok(namespaces);
+        }
+        let path = format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100");
+        let namespaces: Vec<KvNamespaceResult> = self.get(&path, &token).await?;
+        *self.inner.kv_namespaces.write().await = Some(namespaces.clone());
+        Ok(namespaces)
+    }
+
     /// Whether [`verify_kv`](Self::verify_kv) has found the namespace.
     pub fn kv_ready(&self) -> bool {
         !self.kv_namespace().is_empty()
@@ -422,13 +613,11 @@ impl Client {
     /// namespace this one is never created automatically: its tunnel token
     /// must be provisioned explicitly by the operator.
     pub async fn verify_config_kv(&self) -> Result<()> {
-        let token = self.token();
-        let account_id = self.account_id();
-        if token.is_empty() || account_id.is_empty() {
-            return Err(Error::NotVerified);
+        if !self.config_kv_namespace().is_empty() {
+            self.remember_identity();
+            return Ok(());
         }
-        let path = format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100");
-        let namespaces: Vec<KvNamespaceResult> = self.get(&path, &token).await?;
+        let namespaces = self.kv_namespaces().await?;
         let found = namespaces
             .into_iter()
             .find(|namespace| namespace.title == CONFIG_KV_NAMESPACE_TITLE)
@@ -437,6 +626,7 @@ impl Client {
                 message: format!("Workers KV namespace {CONFIG_KV_NAMESPACE_TITLE:?} not found; create it in Cloudflare first"),
             })?;
         self.inner.cred.write().unwrap().config_kv_namespace = found.id;
+        self.remember_identity();
         Ok(())
     }
 
@@ -453,10 +643,73 @@ impl Client {
         )
     }
 
+    /// Reads a configuration key, from memory once this process has seen it.
+    ///
+    /// A missing key is cached as a missing key: `config_kv_put_if_changed`
+    /// relies on the read agreeing with the store, and it goes through the
+    /// invalidation below, so a write made here is never hidden by this map.
+    ///
+    /// The map is backed by a file under the engine's state directory. An update
+    /// replaces this process with `execve`, which empties memory but not disk, so
+    /// the image that comes up answers its configuration from the values its
+    /// predecessor already read instead of paying for the tunnel again — that
+    /// wait was the last thing an update still cost.
     pub async fn config_kv_get(&self, key: &str) -> Result<Option<String>> {
         if !self.config_kv_ready() {
             return Err(Error::KvNotVerified);
         }
+        let cached = {
+            let cache = self.inner.config_kv_cache.read().await;
+            cache.get(key).cloned()
+        };
+        if let Some(cached) = cached {
+            return Ok(cached);
+        }
+        let value = match self.config_kv_cached(key) {
+            Some(value) => value,
+            None => self.config_kv_fetch(key).await?,
+        };
+        self.config_kv_remember(key, value.clone()).await;
+        Ok(value)
+    }
+
+    /// The value the last process read for `key`, if the file cache holds one.
+    fn config_kv_cached(&self, key: &str) -> Option<Option<String>> {
+        let namespace = self.config_kv_namespace();
+        let mut on_disk = self
+            .inner
+            .config_kv_disk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if on_disk.as_ref().map(|c| c.namespace.as_str()) != Some(namespace.as_str()) {
+            *on_disk = DiskConfigCache::load(&namespace);
+        }
+        on_disk.as_ref().and_then(|c| c.values.get(key).cloned())
+    }
+
+    /// Records a value in memory and on disk.
+    async fn config_kv_remember(&self, key: &str, value: Option<String>) {
+        self.inner
+            .config_kv_cache
+            .write()
+            .await
+            .insert(key.to_string(), value.clone());
+        let mut on_disk = self
+            .inner
+            .config_kv_disk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let namespace = self.config_kv_namespace();
+        let cache = on_disk.get_or_insert_with(|| DiskConfigCache {
+            namespace: namespace.clone(),
+            values: std::collections::HashMap::new(),
+        });
+        cache.values.insert(key.to_string(), value);
+        cache.save();
+    }
+
+    /// The read behind [`Self::config_kv_get`], without the cache.
+    async fn config_kv_fetch(&self, key: &str) -> Result<Option<String>> {
         let response = self
             .inner
             .http
@@ -492,6 +745,19 @@ impl Client {
         let raw = read_limited(response, 1 << 20).await?;
         if !(200..300).contains(&status) {
             return Err(kv_error("config KV write", status as i32, &raw));
+        }
+        self.inner.config_kv_cache.write().await.remove(key);
+        if let Some(cache) = self
+            .inner
+            .config_kv_disk
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            cache
+                .values
+                .insert(key.to_string(), Some(value.to_string()));
+            cache.save();
         }
         Ok(())
     }

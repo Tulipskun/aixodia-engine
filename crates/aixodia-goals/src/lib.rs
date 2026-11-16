@@ -79,7 +79,15 @@ impl D1 {
 
     /// Creates the objectives table. It runs at startup; an existing table is
     /// left untouched.
-    pub async fn ensure(&self) {
+    ///
+    /// `schema` is the version this image needs. A process that finds that
+    /// version already applied in the local state directory skips both
+    /// statements, which otherwise cost two D1 round trips per start to be told
+    /// the table already exists.
+    pub async fn ensure(&self, schema: &str) {
+        if !aixodia_db::schema::claim("objectives", schema) {
+            return;
+        }
         for statement in [
             "CREATE TABLE IF NOT EXISTS objectives (
                 id TEXT PRIMARY KEY,
@@ -96,6 +104,7 @@ impl D1 {
                 tracing::warn!(error = %err, "goals: schema");
             }
         }
+        aixodia_db::schema::record("objectives", schema);
     }
 }
 
