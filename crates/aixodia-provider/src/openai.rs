@@ -28,6 +28,11 @@ pub const AGENTROUTER_FINGERPRINT: &[(&str, &str)] = &[
     ("User-Agent", "RooCode/3.53.0"),
 ];
 
+/// The smallest output budget given to the Responses API. A reasoning model
+/// spends output tokens before it writes the answer, so a budget sized for the
+/// answer alone is spent entirely on thinking.
+const RESPONSES_MIN_BUDGET: i64 = 4096;
+
 /// Whether an upstream refusal is really an instruction to use `/v1/responses`.
 ///
 /// Some gateways only serve the Responses API for a given model and answer a
@@ -160,6 +165,11 @@ impl Adapter {
                 retry_after,
                 raw,
             } => {
+                // `send` folds a 400 into this branch, so the detour to the
+                // Responses API has to be taken here as well as below.
+                if wants_responses(&raw, status) {
+                    return self.stream_via_responses(req, prov, key, emit).await;
+                }
                 return Err(APIError::new(status, error_message(&raw))
                     .with_retry_after(error_wait(&raw, retry_after))
                     .into_anyhow());
@@ -170,6 +180,12 @@ impl Adapter {
         let retry_after = response.retry_after;
         if !(200..300).contains(&status) {
             let raw = response.read(1 << 20).await?;
+            // A streamed request is refused the same way as a buffered one, so
+            // it has to take the same detour to the Responses API. The caller
+            // is on the streaming path either way; nothing has been emitted yet.
+            if wants_responses(&raw, status) {
+                return self.stream_via_responses(req, prov, key, emit).await;
+            }
             return Err(APIError::new(status, error_message(&raw))
                 .with_retry_after(error_wait(&raw, retry_after))
                 .into_anyhow());
@@ -427,6 +443,20 @@ impl Adapter {
         out.usage = usage;
         out.reasoning_content = responses_reasoning(&parsed);
         if out.content.is_empty() && out.tool_calls.is_empty() {
+            // A reasoning model spends output tokens thinking before it writes
+            // anything. If the budget runs out during that, the reply is empty
+            // and the only clue is `incomplete_details`, so say that instead of
+            // "empty output" — it is the difference between a bug and a too
+            // small limit.
+            if let Some(reason) = &parsed.incomplete_details {
+                if reason.reason == "max_output_tokens" {
+                    return Err(anyhow!(
+                        "openai: the model ran out of output tokens while reasoning \
+                         (max_output_tokens={}); raise max_tokens",
+                        parsed.max_output_tokens
+                    ));
+                }
+            }
             return Err(anyhow!("openai: empty responses output"));
         }
         Ok(out)
@@ -1084,6 +1114,16 @@ struct ResponsesResponse {
     output: Vec<OutputItem>,
     #[serde(default)]
     usage: Option<RespUsage>,
+    #[serde(default)]
+    incomplete_details: Option<RespIncomplete>,
+    #[serde(default)]
+    max_output_tokens: i64,
+}
+
+#[derive(Deserialize, Default)]
+struct RespIncomplete {
+    #[serde(default)]
+    reason: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -1226,10 +1266,14 @@ fn build_responses_request(req: &Request, stream: bool) -> ResponsesRequest {
         model: req.model.clone(),
         input: Value::Array(items),
         stream,
-        max_output_tokens: Some(if req.max_tokens > 0 {
-            req.max_tokens
-        } else {
-            32000
+        // `max_tokens` is how long the *answer* may be. On these models the
+        // reasoning is spent from the same budget, so passing it straight
+        // through starves the answer: a 20-token reply budget is consumed
+        // thinking and the response comes back empty. The floor leaves room for
+        // both and is only a cap — nothing is generated past what is needed.
+        max_output_tokens: Some(match req.max_tokens {
+            0 => 32000,
+            n => n.max(RESPONSES_MIN_BUDGET),
         }),
         tools: Vec::new(),
         tool_choice: None,
