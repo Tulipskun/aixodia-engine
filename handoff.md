@@ -3,12 +3,18 @@
 เขียนเมื่อจบเซสชันที่ทำงานเรื่อง zero-downtime update, cache ของ config และ terminal scroll
 ใช้เป็นจุดเริ่มต้นของแชทใหม่ — อ่านไฟล์นี้ก่อน แล้วค่อยอ่าน `AGENTS.md`
 
+> **สภาพแวดล้อมที่ handoff นี้ถูกอัปเดตล่าสุด:** เครื่อง `instabox-alpha` (x86_64, 4 cores, 7.5 GB,
+> Debian 13) — ไม่ใช่ RMX3371 aarch64 ใน §10 ที่เป็นเครื่องผู้ใช้ repo อยู่ที่ `/root/aixodia-engine`,
+> `/root/aixodia-app`, `/root/aixodia-web`, `/root/droidime` (ย้ายออกมาจาก `/root/workspace` แล้ว)
+> engine ที่รันอยู่คือ build ของ `40d4867` (pid ใน `/root/.aixodia/aixodia.pid`)
+
 ---
 
 ## 0. กติกาที่ตกลงกันไว้ (สำคัญ)
 
 - ผู้ใช้สื่อสารภาษาไทย ตอบเป็นไทย
-- **ต้องอ่าน `AGENTS.md` (`/root/AGENTS.md` → symlink ไป `aixodia-app/AGENTS.md`) ก่อนแก้โค้ด**
+- **ต้องอ่าน `AGENTS.md` ก่อนแก้โค้ด** — มีไฟล์เดียวกันอยู่ที่ `/root/AGENTS.md` และในแต่ละ repo
+  (`aixodia-engine/AGENTS.md`, `aixodia-app/AGENTS.md`, …) เป็นสำเนา ไม่ใช่ symlink
   - §1 โครงสร้างก่อน / อ่านไฟล์เต็ม / ห้าม grep เดาสุ่ม
   - §2 ห้ามเชื่อความจำ ตรวจ ground truth ก่อน
   - §3 ห้ามเพิ่ม dependency เองโดยไม่ได้รับอนุญาต
@@ -36,6 +42,8 @@
 | Terminal scrollback หลัง reattach | ✅ replay 2,000 บรรทัดท้าย (ไม่เกิน 256 KiB) แทนหนึ่งหน้าจอ |
 | WM | ✅ `_NET_SUPPORTING_WM_CHECK` + เคารพ `WM_NORMAL_HINTS` |
 | Chat / sign-in / screen / undo | ทำงาน (undo ยังไม่เคยทดสอบกับ D1 จริง) |
+| Build/เทสต์บนเครื่องนี้ | ✅ rust 1.99.1, `cargo test --workspace -j 2` = 363 passed, clippy `-D warnings` ผ่าน |
+| Release ที่ deploy อยู่ | ✅ `40d4867` (CI + Release engine success, `aixodia update` swap แล้ว pid เดิม) |
 
 ---
 
@@ -221,6 +229,16 @@ D1 round trip (SELECT 1)      6.74 s   ← เพดานที่เหลื�
 - หลัง download asset ต้อง `chmod +x`
 - engine ต้องมี `CF_TOKEN` — launcher อ่านจาก `/root/.aixodia/cf.env` (mode 600, ห้ามพิมพ์ค่าออกมา)
 - `/proc` เป็น `hidepid=2` แต่ engine รันเป็น uid 0 อ่าน `/proc/<pid>/exe` ได้
+- **`git push` ต้องมี credential ก่อน**: `git ls-remote` ของ repo public ผ่านได้โดยไม่ต้อง auth
+  ทำให้เข้าใจผิดว่า push ได้ — ต้อง `gh auth setup-git` (มี `GH_TOKEN` ของ Tulipskun อยู่ใน env)
+  และ git config `user.name`/`user.email` ไม่มีในเครื่องใหม่ → ตั้งเป็น
+  `Tulipskun <103128996+Tulipskun@users.noreply.github.com>` ก่อน commit
+- **`cargo test --workspace` ด้วย `-j` สูง ๆ ทำ disk เต็มตอน link** (`No space left on device`
+  ที่ `target/debug/deps`; `/` มี 16 GB และ target/debug ใช้ ~6 GB) → ใช้ `-j 2`
+  หรือ `rm -rf target/release` ก่อน
+- **commit message หลายบรรทัดผ่าน heredoc ใน bash tool ถูกตัดง่าย** — เคยได้ commit ที่ message
+  มี `EOF2` ค้างอยู่และไฟล์ผิด commit → เขียน message ลงไฟล์ (`/tmp/msg1`) แล้ว `git commit -F /tmp/msg1`
+  และตรวจด้วย `git log --format='%h %s'` + `git show --stat` ก่อน push
 
 ---
 
@@ -274,7 +292,15 @@ routes installed
 
 ## 10. ข้อมูลระบบ
 
-- เครื่อง: RMX3371 (Android, chroot Debian 13 trixie, aarch64), ~7 cores / 7.5 GB RAM / 4 GB swap, **ไม่มี IPv6**
+- เครื่องสำหรับพัฒนา/ปล่อย build ในเซสชันล่าสุด (คนละเครื่องกับมือถือผู้ใช้):
+- `instabox-alpha` — x86_64, 4 cores, 7.5 GB RAM, Debian 13, `/` 16 GB (ไม่ต้องมี swap)
+- repo: `/root/aixodia-engine`, `/root/aixodia-app`, `/root/aixodia-web`, `/root/droidime`
+- engine รันที่ `127.0.0.1:8787` เหมือนกัน, tunnel `cloudflared` → `https://engine.aixodia.dpdns.org`
+- เครื่องนี้มี `gh` ที่ล็อกอินอยู่ และมี `/usr/bin/java` 21 แต่ **ยังไม่มี Android SDK/gradle**
+  → `:app:testDebugUnitTest` รันบนเครื่องนี้ไม่ได้ (CI เป็นคนรัน)
+
+เครื่องผู้ใช้ (ข้อมูลเดิม):
+- RMX3371 (Android, chroot Debian 13 trixie, **aarch64**), ~7 cores / 7.5 GB RAM / 4 GB swap, **ไม่มี IPv6**
 - Engine port `127.0.0.1:8787`, tunnel ผ่าน cloudflared → `https://engine.aixodia.dpdns.org`
 - state dir: `/root/.aixodia/`
   - `aixodia.pid`, `engine.log`, `selfupdate.state`, `cf.env` (600)
@@ -294,12 +320,15 @@ routes installed
 
 engine:
 ```
+40d4867  Keep the handoff right about the replay, the manager and the owed count
 a187786  Release the owed count when a write ends, however it ends
 50248dd  Be the manager EWMH looks for, and obey the size a client asked for
 446d18a  Hand a reattaching client its history, not just the screen it is on
 ```
 
-engine (เซสชันก่อนหน้า):
+engine (เซสชันก่อนหน้า — **ไม่มีอยู่ใน history ของ repo นี้แล้ว**: repo ที่ clone มาที่เครื่องนี้
+เริ่มจาก `372bf33` เดียว ข้อความ commit ด้านล่างเก็บไว้เป็นบันทึกว่าเคยทำอะไร):
+```
 d5f1911  Read the order a client sent even when its replay cannot be written
 04f0a34  End the shell when a tab is closed, not just the engine's side of it
 8bd5997  Let a full-screen program paint the screen a reattaching client is missing
