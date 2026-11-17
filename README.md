@@ -94,9 +94,9 @@ API keys are in Workers KV.
 ## Configuration
 
 `CF_TOKEN` is the only application configuration environment variable.
-Three more variables place an engine on a host that runs several of them
-(`AIXODIA_INSTANCE`, `AIXODIA_PORT`/`AIXODIA_BIND`, `AIXODIA_STATE_DIR`), and the
-launcher sets them — see [Several instances on one host](#several-instances-on-one-host).
+Two optional variables exist for a deployment of several machines
+(`AIXODIA_INSTANCE`, `AIXODIA_STATE_DIR`) and are never required — see
+[Many machines, one public domain](#many-machines-one-public-domain).
 The operating system's `HOME` and `PATH` are used only for the local state
 directory and executable discovery. Runtime settings are read from Cloudflare
 Workers KV; relational and durable application data lives in D1.
@@ -133,40 +133,43 @@ heartbeat task. `daemon/url` is compared with its stored value before a write,
 so ordinary restarts do not write it again. `CF_TOKEN` needs D1 Edit and Workers
 KV read/write access; the Android client needs Workers KV read access.
 
-## Several instances on one host
+## Many machines, one public domain
 
-One host can run more than one engine: a second phone, a second account, a
-separate set of terminals. Each instance is the same binary, told apart by three
-environment variables and nothing else.
+Every machine runs its own engine on `127.0.0.1:8787` behind its own Named
+Tunnel — the port never changes and no configuration beyond `CF_TOKEN` is
+needed. What they share is the Workers KV namespace, which holds single keys:
+the second machine to start would otherwise publish `daemon/url` over the first
+one's, and both would read the same `tunnel_token`.
 
-| Variable | Meaning | Default |
-|---|---|---|
-| `AIXODIA_INSTANCE` | Instance name: 1-32 lower-case letters, digits, single hyphens | unset — the single engine |
-| `AIXODIA_PORT` | Port the instance answers on (launcher) | `8787` |
-| `AIXODIA_BIND` | Full address the engine binds (set by the launcher from the port) | `127.0.0.1:8787` |
-| `AIXODIA_STATE_DIR` | Where the instance keeps pid, log database, schema version, terminals, self-update state | `$HOME/.aixodia` |
+So each engine names itself. The name is a short tag derived from the machine's
+own `/etc/machine-id` (eight hex digits, prefixed `m-`), stable across reboots
+and engine updates and different on every machine. All of its keys live under
+that name:
 
-A named instance reads and writes its own Workers KV keys, under
-`instances/<name>/`: `instances/<name>/tunnel_token`,
-`instances/<name>/tunnel_url`, and the `daemon/url` /`daemon/version` it
-publishes. Everything else (`auth/*`, `access/*`, `client/*`, `mcp/upstream`) is
-shared, because it describes the deployment rather than one engine.
+| Key | Purpose |
+|---|---|
+| `instances/<machine>/tunnel_token` | This machine's Named Tunnel connector token |
+| `instances/<machine>/tunnel_url` | This machine's public HTTPS hostname |
+| `instances/<machine>/daemon/url` | The live endpoint, published when it changes |
+| `instances/<machine>/daemon/version` | Start/boot metadata for uptime |
 
-```bash
-AIXODIA_INSTANCE=phone AIXODIA_PORT=8788 aixodia start    # state in ~/.aixodia/instances/phone
-AIXODIA_INSTANCE=phone aixodia status
-AIXODIA_INSTANCE=phone aixodia stop
-aixodia status                                            # the unnamed engine on 8787, untouched
-```
+`/healthz` reports the name as `instance`, so an operator can see which machine
+answered and which keys belong to it. `auth/*`, `access/*`, `client/*` and
+`mcp/upstream` stay shared: they describe the deployment, not one machine.
 
-Public reachability comes from one hostname instead of one per engine:
-`gateway/` is a Cloudflare Worker that resolves `https://<host>/<instance>/…` to
-that instance's own Named Tunnel and strips the instance segment, so every engine
-serves its usual paths. See [gateway/README.md](gateway/README.md) for the KV
-entries, the Access service token and the per-instance tunnel steps.
+An operator who wants a readable name in the public URL sets `AIXODIA_INSTANCE`
+(lower-case letters, digits and single hyphens, at most 32 characters). It is an
+override, never a requirement.
 
-An engine started without `AIXODIA_INSTANCE` is unaffected by all of this: it
-answers on `127.0.0.1:8787` and reads the bare KV keys it always read.
+One hostname serves them all through `gateway/`: the Worker resolves
+`https://<host>/<machine>/…` to that machine's tunnel and strips the segment, so
+each engine keeps serving its usual paths. See
+[gateway/README.md](gateway/README.md) for the KV entries, the Access service
+token and the per-machine tunnel steps.
+
+`AIXODIA_STATE_DIR` optionally moves an engine's local state (pid, log database,
+schema version, terminal sockets, self-update state) out of `$HOME/.aixodia`; an
+ordinary install never sets it.
 
 ## File manager
 

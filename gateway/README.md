@@ -1,10 +1,14 @@
 # AIxodia engine gateway
 
-Gives every engine instance its own path on **one** public hostname:
+Gives every machine's engine its own path on **one** public hostname:
 
 ```
-https://engines.aixodia.dpdns.org/<instance>/api/...   →   https://<instance>.aixodia.dpdns.org/api/...
+https://engines.aixodia.dpdns.org/<machine>/api/...   →   https://<machine>.aixodia.dpdns.org/api/...
 ```
+
+`<machine>` is the name the engine gives itself: `m-` plus eight hex digits of
+its `/etc/machine-id`, or whatever `AIXODIA_INSTANCE` overrides it with. It is
+printed at startup (`machine m-…`) and returned by `/healthz` as `instance`.
 
 The Worker reads the first path segment, looks the instance up in the Workers KV
 namespace bound as `ENGINE_ORIGINS`, removes the segment, and forwards the request
@@ -30,8 +34,8 @@ path segment that names the instance.
 - Worker route `engines.aixodia.dpdns.org/*` (change `wrangler.toml` if the
   gateway should live on `engine.aixodia.dpdns.org` instead — note that hostname
   is the single-instance engine's public address today).
-- KV namespace bound as `ENGINE_ORIGINS`, one entry per instance:
-  key `<instance>`, value `<instance>.aixodia.dpdns.org`.
+- KV namespace bound as `ENGINE_ORIGINS`, one entry per machine:
+  key `<machine>`, value `<machine>.aixodia.dpdns.org`.
 - Access application protecting `*.aixodia.dpdns.org/*` with a service-token
   policy, and that service token stored as the `ACCESS_CLIENT_ID` /
   `ACCESS_CLIENT_SECRET` secrets.
@@ -48,29 +52,27 @@ npx wrangler kv namespace create ENGINE_ORIGINS
 npx wrangler secret put ACCESS_CLIENT_ID
 npx wrangler secret put ACCESS_CLIENT_SECRET
 npx wrangler deploy
-npx wrangler kv key put --binding=ENGINE_ORIGINS phone-2 phone-2.aixodia.dpdns.org
+npx wrangler kv key put --binding=ENGINE_ORIGINS m-8a7d1192 m-8a7d1192.aixodia.dpdns.org
 ```
 
-## Provisioning an instance
+## Provisioning a machine
 
-1. Create a remotely-managed Named Tunnel for the instance.
-2. Point its public hostname `<instance>.aixodia.dpdns.org` at
-   `http://localhost:<port>`, where `<port>` is the port that instance answers on
-   (`AIXODIA_PORT`).
+`<machine>` below is the engine's own name: `aixodia status` (or the log line
+`machine m-…`) prints it after the engine has started once, and `/healthz`
+returns it as `instance`. Nothing on the machine needs configuring.
+
+1. Create a remotely-managed Named Tunnel for the machine.
+2. Point its public hostname `<machine>.aixodia.dpdns.org` at
+   `http://localhost:8787` — the engine's port is the same on every machine.
 3. Protect that hostname with the Access service-token policy.
-4. Write the KV entry: `ENGINE_ORIGINS <instance>` = `<instance>.aixodia.dpdns.org`.
-5. Write the engine's own configuration keys under `instances/<instance>/`:
-   `instances/<instance>/tunnel_token` (the tunnel connector token) and
-   `instances/<instance>/tunnel_url` (`https://<instance>.aixodia.dpdns.org`).
-6. Start the engine:
+4. Write the KV entry: `ENGINE_ORIGINS <machine>` = `<machine>.aixodia.dpdns.org`.
+5. Write the engine's own two keys: `instances/<machine>/tunnel_token` (the
+   tunnel connector token) and `instances/<machine>/tunnel_url`
+   (`https://<machine>.aixodia.dpdns.org`).
+6. `aixodia start` — `CF_TOKEN` is the only variable it needs.
 
-   ```bash
-   AIXODIA_INSTANCE=<instance> AIXODIA_PORT=<port> aixodia start
-   ```
-
-The engine publishes its live address to `instances/<instance>/daemon/url` and its
-version to `instances/<instance>/daemon/version`, exactly as a single-instance
-engine publishes to `daemon/url` and `daemon/version`.
+The engine publishes its live address to `instances/<machine>/daemon/url` and its
+version to `instances/<machine>/daemon/version`.
 
 ## Test
 

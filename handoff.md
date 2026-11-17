@@ -338,38 +338,57 @@ routes installed
 
 ---
 
-## 10.1 หลาย engine บนเครื่องเดียว / domain เดียว (ทำแล้ว)
+## 10.1 หลายเครื่อง ใช้ domain เดียว (ทำแล้ว — โค้ด, ยังไม่ deploy gateway)
 
-ต่างจากเดิม: engine เคยมีตัวเดียวต่อ host — พอร์ต `127.0.0.1:8787` ฝังในโค้ด, state อยู่ที่
-`$HOME/.aixodia` และอ่าน KV key เปล่า (`tunnel_token`, `tunnel_url`, `daemon/url`)
+โจทย์ของผู้ใช้: **หลายเครื่อง (คนละเครื่อง) รัน engine ของตัวเอง** ไม่ใช่เครื่องเดียวรันหลายตัว
+→ **พอร์ตเดิม `127.0.0.1:8787` ทุกเครื่อง** และ **ห้ามบังคับใส่ env อื่นนอกจาก `CF_TOKEN`**
 
-ตอนนี้ instance หนึ่งตัวแยกจากกันด้วย env 3 ตัว (launcher เป็นคนตั้งให้):
+ปัญหาเดิม: `tunnel_token`, `tunnel_url`, `daemon/url`, `daemon/version` เป็น key เดียวใน
+Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สองที่ start จะทับ `daemon/url` ของเครื่องแรก
+และทั้งคู่จะ dial tunnel เดียวกัน
 
-| env | ความหมาย | ค่าเริ่มต้น |
-|---|---|---|
-| `AIXODIA_INSTANCE` | ชื่อ instance (a-z0-9 + hyphen เดี่ยว, ≤32) | ไม่ตั้ง = engine ตัวเดียวแบบเดิม |
-| `AIXODIA_PORT` | พอร์ต (launcher ใช้สร้าง `AIXODIA_BIND`) | 8787 |
-| `AIXODIA_BIND` | ที่อยู่ที่ engine bind จริง | `127.0.0.1:8787` |
-| `AIXODIA_STATE_DIR` | state ของ instance นี้ | `$HOME/.aixodia` |
+ทางแก้ที่ใช้ (แบบเดียวกับ droidime แต่ไม่ต้องตั้งชื่อเอง):
 
-- KV key ของ instance: `instances/<name>/tunnel_token`, `…/tunnel_url`, `…/daemon/url`,
-  `…/daemon/version` (`crates/aixodia-engine/src/instance.rs::Keys`)
-- state dir มาจาก crate ใหม่ `crates/aixodia-state` — ใช้ร่วมโดย `aixodia-db` (identity/config-cache/
-  schema), `d1log`, `aixodia-selfupdate`, `aixodia-terminal` (terminals/) จึงไม่ปนกันข้าม instance
-- launcher: `AIXODIA_INSTANCE=phone AIXODIA_PORT=8788 aixodia start|stop|status|logs|update`,
-  home ของ instance = `~/.aixodia/instances/<name>`, hook autostart แยกไฟล์ต่อ instance
-- **domain เดียว**: `gateway/` = Cloudflare Worker (`aixodia-engine-gateway`) ที่
-  `https://<host>/<instance>/…` → ตัด segment แรกออก → `<instance>.aixodia.dpdns.org/…`
-  พร้อม Access service token (เหมือน `aixodia-mcp-gateway` ของ droidime ทุกอย่าง)
-  ยังไม่ได้ deploy — ต้องสร้าง KV `ENGINE_ORIGINS` + secret `ACCESS_CLIENT_ID/SECRET` ก่อน
+| เรื่อง | รายละเอียด |
+|---|---|
+| ชื่อเครื่อง | `m-<8 hex>` = sha256 ของ `/etc/machine-id` ตัด 4 ไบต์แรก → คงที่ข้าม reboot/update, ไม่ซ้ำกันข้ามเครื่อง |
+| override (ไม่บังคับ) | `AIXODIA_INSTANCE` (a-z0-9 + hyphen เดี่ยว ≤32) ใช้เมื่ออยากได้ชื่ออ่านง่ายใน URL |
+| ถ้าไม่มี machine-id | hash ของ hostname (`/proc/sys/kernel/hostname`); ไม่มีทั้งคู่ → error บอกให้ตั้ง `AIXODIA_INSTANCE` |
+| KV key | `instances/<machine>/tunnel_token`, `…/tunnel_url`, `…/daemon/url`, `…/daemon/version` |
+| ที่ใช้ร่วมกัน | `auth/*`, `access/*`, `client/*`, `mcp/upstream` (เป็นของ deployment ไม่ใช่ของเครื่อง) |
+| พอร์ต | 8787 เหมือนเดิมทุกเครื่อง — ไม่มี `AIXODIA_PORT`/`AIXODIA_BIND` แล้ว |
+| `/healthz` | เพิ่มฟิลด์ `instance` = ชื่อเครื่อง |
+| `AIXODIA_STATE_DIR` | มี แต่ **ไม่บังคับ** (ค่าเริ่มต้น `$HOME/.aixodia`) มาจาก crate ใหม่ `crates/aixodia-state` ที่ db/d1log/schema/selfupdate/terminal ใช้ร่วมกัน |
 
-ตรวจแล้วบนเครื่องนี้: `instance probe; state /tmp/inst-probe3; keys instances/probe/…` +
-`listening on 127.0.0.1:8799` แล้วจบด้วย `Workers KV key instances/probe/tunnel_token is missing`
-(ถูกต้อง เพราะยังไม่ได้ provision) — engine ตัวจริงบน 8787 ไม่ถูกแตะ
+**domain เดียว**: `gateway/` = Cloudflare Worker `aixodia-engine-gateway`
+`https://<host>/<machine>/api/…` → ตัด segment แรกออก → `<machine>.aixodia.dpdns.org/api/…`
+พร้อม Access service token, fail-closed (เหมือน `aixodia-mcp-gateway` ของ droidime)
+ตั้ง default route ไว้ที่ `engines.aixodia.dpdns.org/*` — **ยังไม่ deploy**
 
-เทสต์: `gateway: npm test = 9 passed`, `aixodia-state 3`, `instance::* 4`, ของเดิมใน
-db/terminal/selfupdate ผ่านหมด, clippy `-D warnings` ผ่าน (ต้องใช้ rustfmt/clippy จาก toolchain
-`stable` เพราะ toolchain 1.99.1 เป็น profile minimal และ symlink `rustup` ใน `/root/.cargo/bin` เสีย)
+### สถานะ / สิ่งที่ต้องทำต่อ
+
+1. deploy gateway: `npx wrangler kv namespace create ENGINE_ORIGINS` → ใส่ id ใน `gateway/wrangler.toml`
+   → `wrangler secret put ACCESS_CLIENT_ID` / `ACCESS_CLIENT_SECRET` (ค่า secret ของ Worker เดิม
+   **อ่านกลับไม่ได้**) → `wrangler deploy`
+2. provision ต่อเครื่อง: tunnel ของเครื่องนั้น + CNAME `<machine>.aixodia.dpdns.org` →
+   `http://localhost:8787` + Access service-token policy + KV `ENGINE_ORIGINS <machine>` =
+   `<machine>.aixodia.dpdns.org` + `instances/<machine>/tunnel_token` และ `…/tunnel_url`
+3. **เครื่องนี้ (`instabox-alpha`) ยังใช้ key เปล่า** — ชื่อเครื่องคือ `m-8a7d1192`
+   ถ้าจะย้ายมาใช้รูปแบบใหม่ต้อง copy ค่า `tunnel_token`/`tunnel_url` (และ `daemon/*`) ไปไว้ใต้
+   `instances/m-8a7d1192/` **ก่อน** update engine ไม่งั้น engine จะฟ้อง
+   `Workers KV key instances/m-8a7d1192/tunnel_token is missing or empty`
+
+ตรวจแล้ว: `cargo test` (instance 3, aixodia-state 3, db/terminal/selfupdate ของเดิม),
+launcher suite `bash aixodia_test.sh` ผ่านหมด (ไฟล์ `aixodia` / `aixodia_test.sh` **เหมือน commit
+`6d980ca` ทุกไบต์** — ไม่มีการแก้ launcher ในงานนี้), `gateway: npm test = 9 passed`,
+clippy `-D warnings` ผ่าน
+
+⚠️ ต้องใช้ `rustfmt`/`clippy` จาก toolchain `stable` (`/root/.rustup/toolchains/stable-*/bin`)
+เพราะ toolchain 1.99.1 เป็น profile minimal และ symlink `rustup` ใน `/root/.cargo/bin` เสีย
+(`cargo fmt`/`clippy` ของ 1.99.1 ใช้ไม่ได้) — build ปกติใช้ 1.99.1 ได้ตาม `rust-toolchain.toml`
+
+⚠️ **มี GitHub PAT หลุดใน `/root/.aixodia/engine.log`** (โผล่ในข้อความ handover ของ session ก่อน)
+— ต้อง revoke/ออกใหม่
 
 ---
 
@@ -377,6 +396,9 @@ db/terminal/selfupdate ผ่านหมด, clippy `-D warnings` ผ่าน 
 
 engine:
 ```
+9a15204  Test the launcher's half of running several engines
+acfab3d  Let one host run several engines, and give them one public address
+6d980ca  Docs: point the handoff at the folders the repos actually live in
 40d4867  Keep the handoff right about the replay, the manager and the owed count
 a187786  Release the owed count when a write ends, however it ends
 50248dd  Be the manager EWMH looks for, and obey the size a client asked for

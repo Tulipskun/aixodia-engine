@@ -167,19 +167,10 @@ if wait_for_file "$home/pid"; then
   else
     fail "engine working directory/state path mismatch (cwd=$(cat "$home/cwd" 2>/dev/null))"
   fi
-  # Three variables are the engine's placement, not configuration: which state
-  # directory it owns, where it binds, and which instance it is. Everything else
-  # the launcher knows must stay behind.
-  leaked="$(grep -vE '^(AIXODIA_STATE_DIR|AIXODIA_BIND|AIXODIA_INSTANCE)=' "$home/engine-env" 2>/dev/null || true)"
-  if [ -z "$leaked" ]; then
-    pass "the engine inherits only what places it, not the configuration"
+  if [ ! -s "$home/engine-env" ]; then
+    pass "application configuration environment variables are not inherited by the engine"
   else
-    fail "application configuration variables leaked into the engine (env=$leaked)"
-  fi
-  if grep -qx "AIXODIA_STATE_DIR=$home/state" "$home/engine-env" 2>/dev/null; then
-    pass "the engine is told the state directory it owns"
-  else
-    fail "the engine was not told its state directory ($(cat "$home/engine-env" 2>/dev/null))"
+    fail "application configuration variables leaked into the engine (env=$(cat "$home/engine-env" 2>/dev/null))"
   fi
   if grep -q "engine boot: detached" "$home/state/engine.log" 2>/dev/null; then
     pass "engine output is redirected to AIXODIA_HOME/engine.log"
@@ -452,63 +443,6 @@ if [ ! -e "$as_hookdir/aixodia-autostart.sh" ]; then
   pass "autostart off removes the hook"
 else
   fail "autostart off (output=$out)"
-fi
-
-# A second engine on the same host: its own state directory, its own port, and
-# the unnamed engine on 8787 left alone.
-if out=$(AIXODIA_INSTANCE=phone-2 AIXODIA_HOME="$(tmpdir)" AIXODIA_LOCAL_URL="$DEAD_URL" \
-        bash "$LAUNCHER" start 2>&1); then
-  fail "an instance started without a port"
-elif printf '%s' "$out" | grep -q 'needs AIXODIA_PORT'; then
-  pass "an instance without a port is refused, not put on 8787"
-else
-  fail "instance without a port (output=$out)"
-fi
-if out=$(AIXODIA_INSTANCE=Phone_2 AIXODIA_PORT=8799 AIXODIA_HOME="$(tmpdir)" \
-        bash "$LAUNCHER" start 2>&1); then
-  fail "an instance name that is not a path segment was accepted"
-elif printf '%s' "$out" | grep -q 'lower-case letters'; then
-  pass "an instance name that could break a KV key or a URL is refused"
-else
-  fail "instance name validation (output=$out)"
-fi
-
-inst_home="$(tmpdir)"
-inst_bin="$(tmpdir)"
-make_resident_engine "$inst_bin/aixodia-engine"
-mkdir -p "$inst_bin"
-make_cloudflared "$inst_bin"
-out=$(CF_TOKEN=test-token AIXODIA_INSTANCE=phone-2 AIXODIA_PORT=8799 \
-  AIXODIA_HOME="$inst_home" AIXODIA_ENGINE_BIN="$inst_bin/aixodia-engine" \
-  AIXODIA_LOCAL_URL="$DEAD_URL" AIXODIA_START_WAIT=2 PATH="$inst_bin:$PATH" \
-  ENGINE_PID_FILE="$inst_home/pid" ENGINE_CWD_FILE="$inst_home/cwd" \
-  ENGINE_HOME_FILE="$inst_home/home" ENGINE_ENV_FILE="$inst_home/env" \
-  ENGINE_HEALTH_FILE="$inst_home/hz/healthz" ENGINE_STOP_FILE="$inst_home/stop" \
-  bash "$LAUNCHER" start 2>&1)
-if [ -s "$inst_home/env" ] &&
-   grep -qx 'AIXODIA_INSTANCE=phone-2' "$inst_home/env" &&
-   grep -qx 'AIXODIA_BIND=127.0.0.1:8799' "$inst_home/env" &&
-   grep -qx "AIXODIA_STATE_DIR=$inst_home" "$inst_home/env"; then
-  pass "an instance is told its name, its port and its own state directory"
-else
-  fail "instance environment (output=$out, env=$(cat "$inst_home/env" 2>/dev/null))"
-fi
-if [ "$(cat "$inst_home/cwd" 2>/dev/null || true)" = "$inst_home" ]; then
-  pass "an instance starts inside its own state directory"
-else
-  fail "instance working directory (cwd=$(cat "$inst_home/cwd" 2>/dev/null), output=$out)"
-fi
-if [ -s "$inst_home/pid" ]; then
-  inst_pid="$(cat "$inst_home/pid")"
-  if out=$(CF_TOKEN=test-token AIXODIA_INSTANCE=phone-2 AIXODIA_PORT=8799 AIXODIA_HOME="$inst_home" \
-        AIXODIA_LOCAL_URL="$DEAD_URL" ENGINE_STOP_FILE="$inst_home/stop" \
-        bash "$LAUNCHER" stop 2>&1) && wait_gone "$inst_pid"; then
-    pass "an instance is stopped by the same name it was started with"
-  else
-    fail "instance stop (output=$out)"
-  fi
-else
-  fail "instance start never wrote a pid file (output=$out)"
 fi
 
 echo

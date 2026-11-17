@@ -111,18 +111,15 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         anyhow::bail!("CF_TOKEN is not set");
     }
     let db = DbClient::new();
-    // Which address this engine answers on, and which KV keys are its own: an
-    // instance keeps its tunnel credentials and its published URL apart from any
-    // other engine on the same host.
-    let bind = instance::bind()?;
-    let keys = instance::Keys::from_env()?;
-    if let Some(name) = keys.instance() {
-        tracing::info!(
-            "instance {name}; state {}; keys {}…",
-            aixodia_state::state_dir().display(),
-            keys.prefix()
-        );
-    }
+    // Every machine keeps its tunnel credentials and its published URL under its
+    // own key, so several engines can share one Workers KV namespace, one
+    // Cloudflare account and one public domain without overwriting each other.
+    let keys = instance::Keys::for_this_machine()?;
+    tracing::info!(
+        "machine {}; state {}",
+        keys.name(),
+        aixodia_state::state_dir().display()
+    );
 
     // The socket comes first, before anything that talks to the network.
     //
@@ -132,7 +129,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // the tunnel and costs seconds, and doing them first left the port
     // unaccepted for as long as they took — which the phone saw as the engine
     // being gone, even though the swap itself had no gap at all.
-    let listener = listen(&bind);
+    let listener = listen();
 
     // Start answering on the inherited socket before reading any configuration.
     //
@@ -145,8 +142,10 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // plainly that the engine is still starting rather than left to time out.
     let routes: SharedRoutes = Arc::new(tokio::sync::RwLock::new(None));
     let booting = routes.clone();
+    let boot_instance = keys.name().to_string();
     let boot = Router::new().fallback(move |request: axum::extract::Request| {
         let booting = booting.clone();
+        let boot_instance = boot_instance.clone();
         async move {
             if let Some(router) = booting.read().await.clone() {
                 return router
@@ -157,6 +156,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
             if request.uri().path() == "/healthz" {
                 let body = json!({
                     "ok": true,
+                    "instance": boot_instance,
                     "version": aixodia_io::gateway::VERSION,
                     "pid": std::process::id(),
                     "update": "signal:USR1",
@@ -494,19 +494,19 @@ type SharedRoutes = Arc<tokio::sync::RwLock<Option<Router>>>;
 /// An inherited socket is adopted as-is; otherwise the port is bound here. Called
 /// before the configuration reads so an update's new image is accept-ready
 /// immediately rather than after the network round-trips those reads need.
-fn listen(bind: &str) -> tokio::net::TcpListener {
+fn listen() -> tokio::net::TcpListener {
     let listener = match inherited_listener() {
         Some(listener) => {
-            tracing::info!("listening on {bind} (inherited from the previous image)");
+            tracing::info!("listening on 127.0.0.1:8787 (inherited from the previous image)");
             listener
         }
         None => {
-            let bound = std::net::TcpListener::bind(bind)
-                .unwrap_or_else(|err| panic!("the engine must own {bind}: {err}"));
+            let bound = std::net::TcpListener::bind("127.0.0.1:8787")
+                .expect("the engine must own 127.0.0.1:8787");
             bound
                 .set_nonblocking(true)
                 .expect("a non-blocking listener");
-            tracing::info!("listening on {bind}");
+            tracing::info!("listening on 127.0.0.1:8787");
             tokio::net::TcpListener::from_std(bound).expect("a tokio listener")
         }
     };

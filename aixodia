@@ -3,33 +3,9 @@
 # "start" runs the engine detached in its own session and returns.
 set -euo pipefail
 
-INSTANCE="${AIXODIA_INSTANCE:-}"
-# An instance is a second engine on the same host. It gets its own state
-# directory and its own port, and the engine is told both: everything it keeps
-# (pid, log database, schema version, terminals, self-update state) lives under
-# that directory, so the two never read each other's state or tunnel.
-if [ -n "$INSTANCE" ]; then
-  case "$INSTANCE" in
-    *--* | -* | *- | *[!a-z0-9-]*)
-      echo "aixodia: AIXODIA_INSTANCE must be lower-case letters, digits and single hyphens: $INSTANCE" >&2
-      exit 2
-      ;;
-  esac
-fi
-AIXODIA_HOME="${AIXODIA_HOME:-${INSTANCE:+$HOME/.aixodia/instances/$INSTANCE}}"
 AIXODIA_HOME="${AIXODIA_HOME:-$HOME/.aixodia}"
 ENGINE_BIN="${AIXODIA_ENGINE_BIN:-aixodia-engine}"
-PORT="${AIXODIA_PORT:-}"
-if [ -n "$INSTANCE" ] && [ -z "$PORT" ]; then
-  echo "aixodia: instance '$INSTANCE' needs AIXODIA_PORT (the engine on port 8787 is the unnamed one)" >&2
-  exit 2
-fi
-PORT="${PORT:-8787}"
-case "$PORT" in
-  ''|*[!0-9]*) echo "aixodia: AIXODIA_PORT must be a number: $PORT" >&2; exit 2 ;;
-esac
-LOCAL_URL="${AIXODIA_LOCAL_URL:-http://127.0.0.1:$PORT}"
-BIND="${AIXODIA_BIND:-127.0.0.1:$PORT}"
+LOCAL_URL="${AIXODIA_LOCAL_URL:-http://127.0.0.1:8787}"
 PID_FILE="${AIXODIA_PID_FILE:-aixodia.pid}"
 LOG_FILE="${AIXODIA_LOG_FILE:-engine.log}"
 LOG_MAX_KB="${AIXODIA_LOG_MAX_KB:-8192}"
@@ -179,21 +155,13 @@ cmd_start() {
   rotate_log
   echo "aixodia: starting in the background; state $AIXODIA_HOME"
   AIXODIA_PID_FILE="$file" AIXODIA_LAUNCH_ENGINE="$ENGINE_RESOLVED" \
-  AIXODIA_CHILD_INSTANCE="$INSTANCE" AIXODIA_CHILD_BIND="$BIND" \
     setsid bash -c '
       pid_file="$AIXODIA_PID_FILE"
       engine="$AIXODIA_LAUNCH_ENGINE"
       state_dir="$AIXODIA_HOME"
-      instance="$AIXODIA_CHILD_INSTANCE"
-      bind="$AIXODIA_CHILD_BIND"
       printf "%s\n" "$$" > "$pid_file"
       cd "$state_dir" || exit 1
       while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable AIXODIA_)
-      # The engine is told which state directory and address it owns; any
-      # other AIXODIA_* belongs to this launcher and must not leak into it.
-      export AIXODIA_STATE_DIR="$state_dir"
-      export AIXODIA_BIND="$bind"
-      if [ -n "$instance" ]; then export AIXODIA_INSTANCE="$instance"; fi
       unset HF_TOKEN AUTH_WORKER_URL AUTH_SYNC_SECRET ACCESS_TEAM_DOMAIN ACCESS_APP_AUD \
         ALLOWED_ORIGINS ALLOWED_GITHUB_USERS AIXODIA_MCP_UPSTREAM \
         AIXODIA_DEVICE_TUNNELS AIXODIA_TMUX GITHUB_CLIENT_ID \
@@ -317,22 +285,13 @@ cmd_serve() {
   mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
   cd "$AIXODIA_HOME" || die "cannot enter $AIXODIA_HOME"
   printf '%s\n' "$$" > "$(pid_path)" 2>/dev/null || true
-  export AIXODIA_STATE_DIR="$AIXODIA_HOME"
-  export AIXODIA_BIND="$BIND"
-  if [ -n "$INSTANCE" ]; then export AIXODIA_INSTANCE="$INSTANCE"; fi
   exec "$engine"
 }
 
 # The hook a login shell runs. It lives in profile.d because that is the one
 # directory every shell on a Debian-derived image already reads, whether or not
 # there is an init system — and neither this chroot nor Termux has one.
-autostart_hook() {
-  if [ -n "$INSTANCE" ]; then
-    printf '%s/aixodia-autostart-%s.sh' "$AUTOSTART_DIR" "$INSTANCE"
-  else
-    printf '%s/aixodia-autostart.sh' "$AUTOSTART_DIR"
-  fi
-}
+autostart_hook() { printf '%s/aixodia-autostart.sh' "$AUTOSTART_DIR"; }
 
 autostart_installed() { [ -r "$(autostart_hook)" ]; }
 
@@ -391,19 +350,13 @@ cmd_autostart() {
   fi
 
   mkdir -p "$AUTOSTART_DIR" || die "cannot create $AUTOSTART_DIR"
-  # The hook names the instance it starts: without it the login shell would
-  # check and start the unnamed engine instead of this one.
-  INSTANCE_PREFIX=""
-  if [ -n "$INSTANCE" ]; then
-    INSTANCE_PREFIX="AIXODIA_INSTANCE=$INSTANCE AIXODIA_PORT=$PORT "
-  fi
   cat > "$hook" <<EOF
 # Written by 'aixodia autostart on'. Starts the engine if it is not already up.
 # Silent on purpose: a login should never wait on a dead tunnel, and a shell
 # that opens while the engine is still booting is not made to wait twice.
 if [ -x "$(command -v aixodia 2>/dev/null || echo /usr/local/bin/aixodia)" ]; then
-  if ! ${INSTANCE_PREFIX}aixodia status >/dev/null 2>&1; then
-    ${INSTANCE_PREFIX}aixodia start >/dev/null 2>&1 || true
+  if ! aixodia status >/dev/null 2>&1; then
+    aixodia start >/dev/null 2>&1 || true
   fi
 fi
 EOF
@@ -444,14 +397,6 @@ usage: aixodia <command>
   autostart off  forget it and remove that hook
   autostart      report whether the hook is installed
   serve          run the engine in this process, for a supervisor to own
-
-An instance is a second engine on the same host:
-
-  AIXODIA_INSTANCE=phone AIXODIA_PORT=8788 aixodia start
-
-It keeps its state in ~/.aixodia/instances/<name>, answers on 127.0.0.1:<port>,
-and reads its tunnel credentials from Workers KV under instances/<name>/… — so
-several engines can share one public domain through the gateway.
 
 CF_TOKEN must be set before start. Named Tunnel credentials and URL are read from Cloudflare Workers KV.
 State, pid file (aixodia.pid) and log (engine.log) live in AIXODIA_HOME, by default ~/.aixodia.
