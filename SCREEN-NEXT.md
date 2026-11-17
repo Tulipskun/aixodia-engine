@@ -1,6 +1,6 @@
 # Task: screen stream — verify the earlier fixes, fix what remains, add a window manager (aixodia-app + aixodia-engine/crates/aixodia-screen)
 
-Rewritten against the code currently in /root/aixodia-app and /root/aixodia-engine on this device (localhost). Follow each repo's AGENTS.md. Do the steps in order and report after each. Nothing outside these steps.
+Rewritten against the code currently in /workspace/aixodia-work/aixodia-app and /workspace/aixodia-work/aixodia-engine on this device (localhost). Follow each repo's AGENTS.md. Do the steps in order and report after each. Nothing outside these steps.
 
 Original symptom (phone, JPEG mode, 1280x720 @ 15fps): old terminal windows left as ghosts, black blocks, a 16px full-width stripe near y~176, and stutter on zoom/drag/click.
 

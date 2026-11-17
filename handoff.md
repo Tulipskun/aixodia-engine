@@ -4,8 +4,12 @@
 ใช้เป็นจุดเริ่มต้นของแชทใหม่ — อ่านไฟล์นี้ก่อน แล้วค่อยอ่าน `AGENTS.md`
 
 > **สภาพแวดล้อมที่ handoff นี้ถูกอัปเดตล่าสุด:** เครื่อง `instabox-alpha` (x86_64, 4 cores, 7.5 GB,
-> Debian 13) — ไม่ใช่ RMX3371 aarch64 ใน §10 ที่เป็นเครื่องผู้ใช้ repo อยู่ที่ `/root/aixodia-engine`,
-> `/root/aixodia-app`, `/root/aixodia-web`, `/root/droidime` (ย้ายออกมาจาก `/root/workspace` แล้ว)
+> Debian 13) — ไม่ใช่ RMX3371 aarch64 ใน §10 ที่เป็นเครื่องผู้ใช้
+>
+> repo อยู่ใต้ `/workspace/aixodia-work/` และ **ชื่อโฟลเดอร์ตรงกับชื่อ repo บน GitHub แล้ว**:
+> `/workspace/aixodia-work/aixodia-engine`,
+> `/workspace/aixodia-work/aixodia-app`,
+> `/workspace/aixodia-work/aixodia-web` (`/workspace/aixodia-work/droidime` ไม่มีบนเครื่องนี้)
 > engine ที่รันอยู่คือ build ของ `40d4867` (pid ใน `/root/.aixodia/aixodia.pid`)
 
 ---
@@ -13,8 +17,9 @@
 ## 0. กติกาที่ตกลงกันไว้ (สำคัญ)
 
 - ผู้ใช้สื่อสารภาษาไทย ตอบเป็นไทย
-- **ต้องอ่าน `AGENTS.md` ก่อนแก้โค้ด** — มีไฟล์เดียวกันอยู่ที่ `/root/AGENTS.md` และในแต่ละ repo
-  (`aixodia-engine/AGENTS.md`, `aixodia-app/AGENTS.md`, …) เป็นสำเนา ไม่ใช่ symlink
+- **ต้องอ่าน `AGENTS.md` ก่อนแก้โค้ด** — ในแต่ละ repo มีไฟล์ของตัวเอง
+  (`/workspace/aixodia-work/aixodia-engine/AGENTS.md`, `.../aixodia-app/AGENTS.md`,
+  `.../aixodia-web/AGENTS.md`) เป็นสำเนา ไม่ใช่ symlink (บนเครื่องนี้ไม่มี `/root/AGENTS.md`)
   - §1 โครงสร้างก่อน / อ่านไฟล์เต็ม / ห้าม grep เดาสุ่ม
   - §2 ห้ามเชื่อความจำ ตรวจ ground truth ก่อน
   - §3 ห้ามเพิ่ม dependency เองโดยไม่ได้รับอนุญาต
@@ -153,7 +158,7 @@ alt screen แต่ fg pgrp ตอนนั้นเป็น child ที่ i
 
 ---
 
-## 5. แอป Android (`/root/aixodia-app`)
+## 5. แอป Android (`/workspace/aixodia-work/aixodia-app`)
 
 - package `com.tulipskun.aixodia`, `DEFAULT_DAEMON_URL = https://engine.aixodia.dpdns.org`
 - terminal เป็น native View: `app/src/main/kotlin/.../term/TerminalView.kt`
@@ -169,7 +174,9 @@ alt screen แต่ fg pgrp ตอนนั้นเป็น child ที่ i
 - โครงสร้าง input: `TerminalPanel.kt` ต่อ `inputSink = { socket.send(it) }` →
   `TerminalSocket.TabLink.send` → OkHttp `WebSocket.send`
 - **เทสต์:** `ANDROID_HOME=/opt/android-sdk ./gradlew :app:testDebugUnitTest`
-  - บนเครื่อง `instabox-alpha` **ยังไม่มี Android SDK/gradle** → รันที่นี่ไม่ได้ ให้ CI เป็นคนรัน
+  - เครื่อง `instabox-alpha` มี Android SDK ที่ `/opt/android-sdk` แล้ว → `:app:assembleDebug`
+    ผ่าน (21 MB APK) แต่ `:app:testDebugUnitTest` ยังไม่เคยรันบนเครื่องนี้ (CI เป็นคนรัน)
+  - **`--offline` ใช้ไม่ได้**: `gson-2.8.9.jar` ไม่ได้อยู่ใน cache → ต้อง build ออนไลน์
   - Paparazzi รันในเครื่องนี้ไม่ได้ (`UninitializedPropertyAccessException: sessionParamsBuilder`)
     — **เป็นปัญหาเดิมก่อนการแก้ของเรา** ยืนยันด้วย `git stash` แล้วรันซ้ำ; CI เป็นคนรัน
 
@@ -266,7 +273,7 @@ apt-get install -y cmake clang libclang-dev \
 
 ```bash
 # engine
-cd /root/aixodia-engine
+cd /workspace/aixodia-work/aixodia-engine
 export PATH=$PATH:/root/.cargo/bin
 cargo fmt --all
 cargo clippy -p aixodia-engine --bin aixodia-engine --no-deps -- -D warnings
@@ -287,8 +294,8 @@ cat /root/.aixodia/aixodia.pid
 sed 's/\x1b\[[0-9;]*m//g' /root/.aixodia/engine.log | tail -30
 
 # แอป
-cd /root/aixodia-app
-ANDROID_HOME=/opt/android-sdk ./gradlew :app:testDebugUnitTest --offline
+cd /workspace/aixodia-work/aixodia-app
+ANDROID_HOME=/opt/android-sdk ./gradlew :app:assembleDebug   # ห้ามใช้ --offline (ขาด gson)
 git push origin HEAD     # workflow "Release APK" รันเทสต์ + release.sh เอง
 ```
 
@@ -305,10 +312,14 @@ routes installed
 
 - เครื่องสำหรับพัฒนา/ปล่อย build ในเซสชันล่าสุด (คนละเครื่องกับมือถือผู้ใช้):
 - `instabox-alpha` — x86_64, 4 cores, 7.5 GB RAM, Debian 13, `/` 16 GB (ไม่ต้องมี swap)
-- repo: `/root/aixodia-engine`, `/root/aixodia-app`, `/root/aixodia-web`, `/root/droidime`
+- repo: `/workspace/aixodia-work/aixodia-engine`, `aixodia-app`, `aixodia-web`
+  (ชื่อโฟลเดอร์ = ชื่อ repo บน GitHub; `droidime` ไม่มีบนเครื่องนี้)
+  - เปลี่ยนชื่อจาก `AIxodia` → `aixodia-app` และ `aixodia-dashboard` → `aixodia-web`
+  - `aixodia-dashboard` ที่ยังเหลือใน `aixodia-web` (`package.json`, workflow Pages) เป็นชื่อ
+    Cloudflare Pages project — **ห้ามเปลี่ยน** ไม่ใช่ชื่อโฟลเดอร์
 - engine รันที่ `127.0.0.1:8787` เหมือนกัน, tunnel `cloudflared` → `https://engine.aixodia.dpdns.org`
-- เครื่องนี้มี `gh` ที่ล็อกอินอยู่ และมี `/usr/bin/java` 21 แต่ **ยังไม่มี Android SDK/gradle**
-  → `:app:testDebugUnitTest` รันบนเครื่องนี้ไม่ได้ (CI เป็นคนรัน)
+- เครื่องนี้มี `gh` ที่ล็อกอินอยู่, `/usr/bin/java` 21 และ Android SDK ที่ `/opt/android-sdk`
+  (`:app:assembleDebug` ผ่าน — ต้อง build ออนไลน์ เพราะ `--offline` ขาด `gson-2.8.9`)
 
 เครื่องผู้ใช้ (ข้อมูลเดิม):
 - RMX3371 (Android, chroot Debian 13 trixie, **aarch64**), ~7 cores / 7.5 GB RAM / 4 GB swap, **ไม่มี IPv6**
