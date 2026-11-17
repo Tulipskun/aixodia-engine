@@ -98,8 +98,10 @@ impl Shell {
     fn kick(&self) -> std::io::Result<()> {
         match self {
             Shell::Direct(pty) => pty.kick(),
-            // The holder sends SIGWINCH itself when it applies a resize.
-            Shell::Held(_) => Ok(()),
+            // The holder owns the pty, so the signal has to be asked for over
+            // the socket: this is the only way a reattaching phone can make a
+            // full-screen program paint the screen it left.
+            Shell::Held(h) => h.kick(),
         }
     }
 
@@ -656,7 +658,7 @@ impl Server {
 
         let (tx, mut rx) = broadcast::channel::<Frame>(256);
         let sub_id = session.next_sub.fetch_add(1, Ordering::SeqCst) as u64;
-        let (ring, modes) = {
+        let (ring, modes, alt_screen) = {
             let mut subs = session.subs.lock().unwrap_or_else(|e| e.into_inner());
             subs.push((sub_id, tx));
             let ring = session
@@ -664,12 +666,8 @@ impl Server {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            let modes = session
-                .modes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay();
-            (ring, modes)
+            let tracker = session.modes.lock().unwrap_or_else(|e| e.into_inner());
+            (ring, tracker.replay(), tracker.alt_screen())
         };
         // The ring here is what this engine has watched since it started, which
         // under a holder includes the replay the holder handed over: the output
@@ -680,7 +678,19 @@ impl Server {
         // is emptied as it is sent; otherwise the same history is painted again
         // on every attach and the screen grows a blank gap between an old
         // prompt and the one the shell is actually on.
-        let replay = replay_frame(None, &modes, &ring, eff_rows);
+        //
+        // A full-screen program is the exception. It draws by moving a cursor
+        // rather than by writing lines, so the tail of the ring is not the screen
+        // it is showing and no tail can be cut: this session's ring holds no
+        // newlines at all, so every attach shipped the whole four megabytes of
+        // cursor moves for the phone to parse before it could paint. The screen
+        // that matters is the one the program can draw on demand, so the client
+        // is cleared and the program is asked for it — that ask is the kick below.
+        let replay = if alt_screen {
+            replay_reset(&modes)
+        } else {
+            replay_frame(None, &modes, &ring, eff_rows)
+        };
 
         let (mut reader, writer) = aixodia_wsock::ServerConn::new(stream).split();
         let ready = json!({
@@ -846,10 +856,17 @@ fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8], rows: u16) 
         Some(pane) => pane,
         None => tail_lines(&strip_queries(ring), rows),
     };
-    let mut out = Vec::with_capacity(RIS_RESET.len() + modes.len() + body.len());
+    let mut out = replay_reset(modes);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// The bytes that clear a client's screen and put it in the modes the program
+/// left on, with no output of its own.
+fn replay_reset(modes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RIS_RESET.len() + modes.len());
     out.extend_from_slice(RIS_RESET);
     out.extend_from_slice(modes);
-    out.extend_from_slice(&body);
     out
 }
 
@@ -1095,6 +1112,17 @@ mod tests {
         assert!(
             body.starts_with(b"\x1b[3"),
             "the cut must fall on a line boundary, not mid-sequence"
+        );
+    }
+
+    #[test]
+    fn a_full_screen_session_replays_the_reset_and_not_the_ring() {
+        // A program in the alternate screen draws with cursor moves, so its ring
+        // is not a screen and has no line to cut on: replaying it shipped four
+        // megabytes to the phone on every attach. The repaint is the kick's job.
+        assert_eq!(
+            super::replay_reset(b"\x1b[?1049h"),
+            b"\x1bc\x1b[?1049h".to_vec()
         );
     }
 }

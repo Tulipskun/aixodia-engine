@@ -35,6 +35,8 @@ const RING_CAP: usize = 4 << 20;
 pub const KIND_OUTPUT: u8 = b'o';
 const KIND_INPUT: u8 = b'i';
 const KIND_RESIZE: u8 = b'r';
+/// Ask the shell's program to paint its screen again, at the size it has.
+const KIND_KICK: u8 = b'k';
 pub const KIND_EXIT: u8 = b'x';
 
 /// Where holder sockets and pid files live.
@@ -63,6 +65,15 @@ pub fn socket_path(id: &str) -> PathBuf {
         }
     }
     holder_dir().join(format!("{name}.sock"))
+}
+
+/// The engine connection the shell's output is being handed to.
+struct Attached {
+    /// Tells this connection from the one that replaces it. The old connection
+    /// notices it was closed after the new one is already attached, and must not
+    /// take the slot with it.
+    id: u64,
+    stream: UnixStream,
 }
 
 /// The ring a holder keeps while nobody is attached.
@@ -125,16 +136,16 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
     let reader_pty = pty.clone();
     let reader_ring = ring.clone();
     let reader_dead = dead.clone();
-    let attached: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+    let attached: Arc<Mutex<Option<Attached>>> = Arc::new(Mutex::new(None));
     let writer = attached.clone();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 32 << 10];
         loop {
             if reader_pty.dead() {
                 reader_dead.store(true, Ordering::SeqCst);
-                if let Some(mut stream) = writer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                if let Some(mut att) = writer.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     let _ = frame(
-                        &mut stream,
+                        &mut att.stream,
                         KIND_EXIT,
                         &reader_pty.exit_code().to_le_bytes(),
                     );
@@ -159,8 +170,8 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
                         .unwrap_or_else(|e| e.into_inner())
                         .push(bytes);
                     let mut slot = writer.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(stream) = slot.as_mut() {
-                        if frame(stream, KIND_OUTPUT, bytes).is_err() {
+                    if let Some(att) = slot.as_mut() {
+                        if frame(&mut att.stream, KIND_OUTPUT, bytes).is_err() {
                             *slot = None;
                         }
                     }
@@ -177,8 +188,11 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
     // Accept loop: one engine at a time. A new connection replaces the old one,
     // which is what lets a restarted engine take back a pane the previous one
     // was still holding when it died.
+    let mut next_connection = 0u64;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        next_connection += 1;
+        let mine = next_connection;
         // A connection whose engine died must not stop the next one from being
         // accepted: reading from a socket nobody is writing to blocks forever,
         // and the accept loop cannot wait for it.
@@ -187,7 +201,7 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
         let attached = attached.clone();
         let dead = dead.clone();
         std::thread::spawn(move || {
-            let _ = serve(stream, &pty, &ring, &attached, &dead);
+            let _ = serve(stream, mine, &pty, &ring, &attached, &dead);
         });
     }
     let _ = std::fs::remove_file(&path);
@@ -197,9 +211,10 @@ pub fn run(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>) -> Io
 /// Serves one connected engine until it goes away.
 fn serve(
     stream: UnixStream,
+    mine: u64,
     pty: &Arc<Pty>,
     ring: &Arc<Mutex<Ring>>,
-    attached: &Arc<Mutex<Option<UnixStream>>>,
+    attached: &Arc<Mutex<Option<Attached>>>,
     dead: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     // Whatever happened while nobody was attached is handed over first, so the
@@ -213,7 +228,10 @@ fn serve(
         frame(&mut out, KIND_EXIT, &pty.exit_code().to_le_bytes())?;
         return Ok(());
     }
-    *attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+    *attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(Attached {
+        id: mine,
+        stream: out,
+    });
 
     let mut input = stream;
     let mut header = [0u8; 5];
@@ -241,10 +259,21 @@ fn serve(
                     let _ = pty.kick();
                 }
             }
+            KIND_KICK => {
+                let _ = pty.kick();
+            }
             _ => {}
         }
     }
-    *attached.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Only the connection that is still the attached one may clear the slot. A
+    // new engine attaches the moment its socket opens and this one only notices
+    // its own close when the read fails — often afterwards. Clearing
+    // unconditionally left the holder forwarding the shell to nobody, so the
+    // pane went quiet until the engine itself was restarted.
+    let mut slot = attached.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().map(|att| att.id) == Some(mine) {
+        *slot = None;
+    }
     Ok(())
 }
 
@@ -460,6 +489,17 @@ impl Holder {
         payload[2..4].copy_from_slice(&rows.to_le_bytes());
         let _ = self.stream.set_nonblocking(false);
         let result = frame(&self.stream, KIND_RESIZE, &payload);
+        let _ = self.stream.set_nonblocking(true);
+        result
+    }
+
+    /// Asks the foreground program to paint its screen again, without moving it.
+    ///
+    /// A full-screen program owns its grid: a client that reattaches can only
+    /// get that grid back by having the program draw it.
+    pub fn kick(&self) -> std::io::Result<()> {
+        let _ = self.stream.set_nonblocking(false);
+        let result = frame(&self.stream, KIND_KICK, &[]);
         let _ = self.stream.set_nonblocking(true);
         result
     }
