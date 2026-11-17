@@ -37,6 +37,8 @@ const KIND_INPUT: u8 = b'i';
 const KIND_RESIZE: u8 = b'r';
 /// Ask the shell's program to paint its screen again, at the size it has.
 const KIND_KICK: u8 = b'k';
+/// End the shell, and with it the holder.
+const KIND_END: u8 = b'e';
 pub const KIND_EXIT: u8 = b'x';
 
 /// Where holder sockets and pid files live.
@@ -262,6 +264,14 @@ fn serve(
             KIND_KICK => {
                 let _ = pty.kick();
             }
+            KIND_END => {
+                // The shell is what this holder exists for. Ending it ends the
+                // holder too: one that stayed would answer the next connect with
+                // a pty whose shell is gone, and its pid file would name a pid
+                // that no longer means anything.
+                pty.close();
+                std::process::exit(0);
+            }
             _ => {}
         }
     }
@@ -420,8 +430,8 @@ fn close_inheritable_sockets() {
 /// next list hands back a tab the phone had already closed.
 pub fn close(id: &str) {
     let path = socket_path(id);
-    if let Ok(mut stream) = UnixStream::connect(&path) {
-        let _ = frame(&stream, KIND_EXIT, &[]);
+    if let Ok(stream) = UnixStream::connect(&path) {
+        let _ = frame(&stream, KIND_END, &[]);
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
     let _ = std::fs::remove_file(&path);

@@ -363,7 +363,14 @@ impl Server {
             }
         }
         session.mark_dead();
-        session.pty.close();
+        // Ending a tab has to reach the shell, not only this map. A holder
+        // outlives the engine on purpose, so shutting the socket down is a
+        // detach: the shell would keep running with no engine listing it, which
+        // is how closed tabs left their shells behind for good.
+        match &*session.pty {
+            Shell::Held(_) => holder::close(id),
+            Shell::Direct(_) => session.pty.close(),
+        }
     }
 
     fn shell(&self) -> &str {
