@@ -224,10 +224,14 @@ fn serve(
     let replay = ring.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut out = stream.try_clone()?;
     if !replay.is_empty() {
-        frame(&mut out, KIND_OUTPUT, &replay)?;
+        // A client that connected only to give an order — ending the shell — is
+        // already gone when this lands, so the write fails. That says nothing
+        // about the order, which is still in the socket to be read below; ending
+        // the connection here is what left closed tabs' shells running.
+        let _ = frame(&mut out, KIND_OUTPUT, &replay);
     }
     if dead.load(Ordering::SeqCst) {
-        frame(&mut out, KIND_EXIT, &pty.exit_code().to_le_bytes())?;
+        let _ = frame(&mut out, KIND_EXIT, &pty.exit_code().to_le_bytes());
         return Ok(());
     }
     *attached.lock().unwrap_or_else(|e| e.into_inner()) = Some(Attached {
