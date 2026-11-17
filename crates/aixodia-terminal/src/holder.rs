@@ -261,8 +261,14 @@ fn serve(
                 if payload.len() >= 4 {
                     let cols = u16::from_le_bytes([payload[0], payload[1]]);
                     let rows = u16::from_le_bytes([payload[2], payload[3]]);
+                    // TIOCSWINSZ in resize() already raises SIGWINCH on the
+                    // foreground pgrp. Kicking again sent a second one, and
+                    // readline answered both by repainting the prompt — on a
+                    // phone that lands as a doubled prompt row. The direct
+                    // resize path in acquire() has always skipped the kick;
+                    // the holder now matches it. KIND_KICK stays for the
+                    // deliberate repaint a reattach needs.
                     let _ = pty.resize(cols, rows);
-                    let _ = pty.kick();
                 }
             }
             KIND_KICK => {
