@@ -40,6 +40,21 @@ const IDLE_REAP_AFTER: Duration = Duration::from_secs(30 * 60);
 const RING_CAP: usize = 4 << 20;
 const TICKET_TTL: Duration = Duration::from_secs(90);
 const RIS_RESET: &[u8] = b"\x1bc";
+/// How many lines of a plain shell's output a reattaching client is handed.
+///
+/// The screen only needs the last `rows` of them; the rest scroll into the
+/// client's own scrollback, which is what a phone asks for when it reconnects
+/// and pans history. One screenful was the whole replay, so a client that had
+/// just attached had nothing above the viewport to pan and could not look back
+/// at all until the shell wrote new lines.
+const REPLAY_LINES: usize = 2000;
+/// What that history may cost on the wire, whatever the session printed.
+///
+/// A line count is not a size: one line can carry a progress bar worth a
+/// megabyte, and a session that printed no newline has no line to stop at. The
+/// frame stays well under the socket's frame cap either way, because the phone
+/// parses the replay before it paints anything.
+const REPLAY_BYTES: usize = 256 << 10;
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -861,7 +876,7 @@ pub fn run_holder(id: &str, shell: &str, cols: u16, rows: u16, dir: Option<&str>
 fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8], rows: u16) -> Vec<u8> {
     let body = match history {
         Some(pane) => pane,
-        None => tail_lines(&strip_queries(ring), rows),
+        None => history_tail(&strip_queries(ring), rows),
     };
     let mut out = replay_reset(modes);
     out.extend_from_slice(&body);
@@ -877,23 +892,28 @@ fn replay_reset(modes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The last screenful of a shell's output, cut on a line boundary.
+/// The history of a shell's output a client is given, cut on a line boundary.
 ///
 /// A replay is painted by scrolling a fresh screen, not by restoring one: every
 /// line fed in above the screen's height pushes the earlier ones up and away,
-/// which is what a terminal is supposed to do. Feeding the whole ring therefore
-/// does not restore the screen — it scrolls through the shell's entire history
-/// and leaves the phone showing whatever came last, with the prompt the shell is
-/// actually on sitting below a screenful of older output.
+/// which is what a terminal is supposed to do. That is why the tail is what
+/// goes on the wire — the last `rows` lines end up on the screen, and the ones
+/// before them end up in the client's scrollback, where a reader can pan to
+/// them. Feeding the whole ring instead is what made the phone parse the entire
+/// history of the session before it painted anything.
 ///
-/// Handing over only the tail makes the result the screen: the last `rows` lines
-/// fill the viewport and nothing is pushed out of sight. The cut lands on a
-/// newline so an escape sequence is never split in half.
-fn tail_lines(ring: &[u8], rows: u16) -> Vec<u8> {
-    let want = rows.max(1) as usize;
+/// So the window is bounded twice: by lines, so the frame stays a history and
+/// not a transcript, and by bytes, so a session that printed one enormous line
+/// cannot spend the whole frame on it. Both cuts land on a newline, so an escape
+/// sequence is never split in half. The one case with no boundary to cut on — no
+/// newline in the last [`REPLAY_BYTES`] — keeps the raw tail: the cap is there to
+/// keep the frame small, and that matters more than a mid-sequence cut the client
+/// recovers from at the next reset.
+fn history_tail(ring: &[u8], rows: u16) -> Vec<u8> {
+    let want = (rows as usize).max(REPLAY_LINES);
     let mut seen = 0usize;
-    // Nothing is dropped unless the ring really holds more lines than the screen
-    // can show; a short ring is the whole screen already.
+    // Nothing is dropped unless the ring really holds more lines than the window
+    // wants; a short ring is the whole history already.
     let mut start = 0usize;
     for i in (0..ring.len()).rev() {
         if ring[i] == b'\n' {
@@ -903,6 +923,14 @@ fn tail_lines(ring: &[u8], rows: u16) -> Vec<u8> {
                 break;
             }
         }
+    }
+    if ring.len() - start > REPLAY_BYTES {
+        // Applied second, and only forward, so the line cut still holds.
+        let cut = ring.len() - REPLAY_BYTES;
+        start = match ring[cut..].iter().position(|b| *b == b'\n') {
+            Some(offset) => cut + offset + 1,
+            None => cut,
+        };
     }
     ring[start..].to_vec()
 }
@@ -1085,24 +1113,54 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_is_one_screenful_and_not_the_whole_ring() {
-        // Repainting by scrolling means everything above the viewport is lost,
-        // so the replay must be exactly the lines the screen can hold. Feeding
-        // the whole ring left the phone showing the end of a long history with
-        // the live prompt pushed below it.
+    fn a_replay_ends_on_the_last_screenful_and_keeps_history_above_it() {
+        // Painting by scrolling means the tail of the replay is the screen and
+        // everything before it is the client's scrollback, which is exactly what
+        // a reader who just reattached wants to pan. A replay that stopped at one
+        // screenful left that scrollback empty.
         let mut ring = Vec::new();
         for n in 0..100 {
             ring.extend_from_slice(format!("line {n}\n").as_bytes());
         }
         let replay = replay_frame(None, b"", &ring, 5);
         let body = &replay[super::RIS_RESET.len()..];
+        assert_eq!(body, ring.as_slice(), "the ring is the history");
+        let painted: Vec<&[u8]> = body.split(|b| *b == b'\n').collect();
+        assert!(
+            painted[painted.len() - 6..].starts_with(&[&b"line 95"[..]]),
+            "the last screenful is what the screen ends on"
+        );
+    }
+
+    #[test]
+    fn a_long_history_is_bounded_by_lines_and_not_by_the_ring() {
+        let mut ring = Vec::new();
+        for n in 0..(super::REPLAY_LINES * 3) {
+            ring.extend_from_slice(format!("{n}\n").as_bytes());
+        }
+        let replay = replay_frame(None, b"", &ring, 10);
+        let body = &replay[super::RIS_RESET.len()..];
         assert_eq!(
             body.iter().filter(|b| **b == b'\n').count(),
-            5,
-            "only the last screenful may be painted"
+            super::REPLAY_LINES,
+            "the window is a history, not the transcript"
         );
-        assert!(body.ends_with(b"line 99\n"), "the tail is what is kept");
-        assert!(!body.starts_with(b"line 0\n"), "the head is dropped");
+        assert!(body.ends_with(format!("{}\n", super::REPLAY_LINES * 3 - 1).as_bytes()));
+    }
+
+    #[test]
+    fn a_line_too_wide_for_the_frame_is_cut_by_bytes() {
+        // One line can be worth more than the whole frame; the cap has to bite
+        // even though there is no line boundary to cut on below it.
+        let mut ring = b"first\n".to_vec();
+        ring.extend(std::iter::repeat_n(b'x', super::REPLAY_BYTES * 2));
+        let replay = replay_frame(None, b"", &ring, 10);
+        let body = &replay[super::RIS_RESET.len()..];
+        assert!(
+            body.len() <= super::REPLAY_BYTES,
+            "the frame was {} bytes",
+            body.len()
+        );
     }
 
     #[test]
@@ -1120,6 +1178,15 @@ mod tests {
             body.starts_with(b"\x1b[3"),
             "the cut must fall on a line boundary, not mid-sequence"
         );
+        // The byte cap cuts on a line boundary too.
+        let mut wide = Vec::new();
+        for n in 0..(super::REPLAY_BYTES / 8) {
+            let colour = n % 8;
+            wide.extend_from_slice(format!("\u{1b}[3{colour}mtext\n").as_bytes());
+        }
+        let replay = replay_frame(None, b"", &wide, 3);
+        let body = &replay[super::RIS_RESET.len()..];
+        assert!(body.starts_with(b"\x1b[3"), "a byte cut began mid-sequence");
     }
 
     #[test]
