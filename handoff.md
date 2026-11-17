@@ -33,6 +33,8 @@
 | `/healthz` ระหว่าง boot | ตอบได้ใน **0.40 วินาที** หลัง start |
 | Terminal (holder, ไม่มี tmux) | ✅ shell อยู่รอดข้าม engine ตาย |
 | Terminal scroll (TUI) | ✅ ส่งเป็น wheel/ลูกศร, batching + fling แล้ว (แอป `9580e80`) |
+| Terminal scrollback หลัง reattach | ✅ replay 2,000 บรรทัดท้าย (ไม่เกิน 256 KiB) แทนหนึ่งหน้าจอ |
+| WM | ✅ `_NET_SUPPORTING_WM_CHECK` + เคารพ `WM_NORMAL_HINTS` |
 | Chat / sign-in / screen / undo | ทำงาน (undo ยังไม่เคยทดสอบกับ D1 จริง) |
 
 ---
@@ -130,13 +132,16 @@
 ข้อจำกัดที่ตั้งใจ: SIGWINCH เข้า **foreground pgrp** เท่านั้น (เหมือน tmux) — ถ้าโปรแกรมอยู่ใน
 alt screen แต่ fg pgrp ตอนนั้นเป็น child ที่ ignore SIGWINCH ก็จะไม่ repaint
 
-## 4.1 Replay = หนึ่งหน้าจอ (`replay_frame` / `tail_lines`)
+## 4.1 Replay = หน้าจอ + history ที่มีขอบเขต (`history_tail`)
 เดิม replay ring ทั้งก้อน (300 KB) ทำให้จอเลื่อนและเห็น prompt เก่าซ้อน + ช่องว่าง
-ตอนนี้ `replay_frame(None, modes, ring, rows)` = `RIS + modes + tail_lines(ring, rows)`
+จากนั้นตัดเหลือหนึ่งหน้าจอ (`tail_lines`) ซึ่งแก้อาการจอเพี้ยนได้ แต่ทำให้ scrollback ของ client
+ว่างเปล่า — ผู้ใช้ย้อน history ไม่ได้เลยหลัง attach
 
-**ผลข้างเคียงที่รู้อยู่:** client มี scrollback แทบไม่มีอะไรหลัง attach เพราะได้แค่หนึ่งหน้าจอ
-(แอปต้องมี scrollback ไม่ว่างถึงจะ pan history ได้ — `TerminalEmulator.pansLocalHistory()`)
-— กับ session ที่อยู่ใน alternate screen จะยิ่งเหลือแค่ `RIS + modes` (ดู §4.2)
+ตอนนี้ `history_tail(ring, rows)` = `REPLAY_LINES` (2,000) บรรทัดท้าย และไม่เกิน `REPLAY_BYTES`
+(256 KiB) โดยตัดที่ขอบบรรทัดเสมอ; `rows` คือขั้นต่ำ (จอใหญ่กว่า 2,000 บรรทัดได้)
+การวาดยังลงเอยที่หน้าจอเดิม เพราะบรรทัดที่เกิน viewport ถูกเลื่อนเข้า scrollback ของ client
+
+**ข้อยกเว้นที่ตั้งใจ:** session ที่อยู่ใน alternate screen ยัง replay แค่ `RIS + modes` (ดู §4.2)
 
 ---
 
@@ -185,16 +190,19 @@ D1 round trip (SELECT 1)      6.74 s   ← เพดานที่เหลื�
    - ต้อง scope ด้วย `created_at < started_at` เท่านั้น: เทิร์นที่ถูกรับระหว่าง UPDATE
      กำลังบินอยู่บน tunnel (insert ใช้ ~6.7s เท่ากัน) จะถูก mark ทับเป็น interrupted
    - `MemoryStore`/`D1Store` รับ `created_before` แล้ว, มีเทสต์คุมทั้งสองด้าน
-2. **scrollback หลัง attach ว่าง** — ถ้าต้องการให้ย้อน history ได้ทันที
-   ให้ engine replay history แบบจำกัด (เช่น 2,000 บรรทัดท้าย) แทนหนึ่งหน้าจอ
-   ระวัง: ต้องไม่ทำให้บั๊ก "prompt ซ้อน/ช่องว่าง" กลับมา (ต้นเหตุคือ replay ring ทั้งก้อน)
+2. ~~**scrollback หลัง attach ว่าง**~~ **แก้แล้ว `446d18a`** — replay เป็น history ที่มีขอบเขต
+   (2,000 บรรทัด / 256 KiB) บรรทัดที่เกิน viewport เลื่อนเข้า scrollback ของ client
 3. **TUI scroll latency** — ลดแล้วด้วย batching + fling แต่ยังมี RTT ของ tunnel เป็นพื้น
    (เทียบกับ screen stream ที่ได้ feedback ต่อเนื่อง) ถ้ายังช้า พิจารณา map flick แรง ๆ เป็น PgUp/PgDn
+   — ยังไม่ได้ทำ เพราะต้องทดสอบบนเครื่องที่มี Android SDK
 4. **ยังไม่ได้ทดสอบ**: undo end-to-end กับ D1 จริง (`POST /api/sessions/:id/undo`)
    — และยังไม่มีใครทดสอบ TUI reattach **จากมือถือจริง** (ยืนยันฝั่ง engine ด้วย client ทดสอบแทน)
-5. **ยังไม่ได้แก้**: counter `Backups::owed` ค้าง > 6 นาที (ไม่เคยหาต้นเหตุได้)
+5. ~~**counter `Backups::owed` ค้าง**~~ **แก้แล้ว `a187786`** — decrement ทำใน `Drop` guard
+   job ที่ panic จึงไม่ทำให้ counter ค้าง (ตัว counter ไม่มีใครใช้ตัดสิน update แล้ว — §2 comment ใน
+   `main.rs`; shutdown ก็มี timeout 5 วินาที)
 6. **ยังไม่ได้แก้**: AgentRouter `gpt-6.1-sol` ตอบ `content-blocked` HTTP 400 บาง prompt
-7. **ยังไม่ได้แก้**: minimal WM ไม่ได้ตั้ง `_NET_SUPPORTING_WM_CHECK`, WM frame ไม่สน `WM_NORMAL_HINTS`
+   — ต้องมี body ของ 400 จริงถึงจะรู้ต้นเหตุ (log เครื่องนี้ไม่มีเคสนี้)
+7. ~~**minimal WM ไม่ได้ตั้ง `_NET_SUPPORTING_WM_CHECK`, ไม่สน `WM_NORMAL_HINTS`**~~ **แก้แล้ว `50248dd`**
 8. **ยังไม่ได้แก้**: ความกว้าง Thai cluster ใน terminal (เลือกไม่แก้โดยเจตนา)
 9. **แอปอาจต้อง sign-in ใหม่** — ห้ามทำบนเครื่องผู้ใช้ ให้ผู้ใช้ทำเอง
 
@@ -218,6 +226,15 @@ D1 round trip (SELECT 1)      6.74 s   ← เพดานที่เหลื�
 
 ## 9. คำสั่งที่ใช้บ่อย
 
+เครื่องใหม่ (Debian trixie x86_64) ต้องติดตั้งก่อน build — rustup จะลง toolchain 1.99.1 ตาม
+`rust-toolchain.toml` เอง:
+
+```bash
+rustup component add rustfmt clippy
+apt-get install -y cmake clang libclang-dev \
+    libx11-dev libxext-dev libxtst-dev      # btls-sys (boringssl ผ่าน wreq) และ x11 crate
+```
+
 ```bash
 # engine
 cd /root/aixodia-engine
@@ -225,6 +242,7 @@ export PATH=$PATH:/root/.cargo/bin
 cargo fmt --all
 cargo clippy -p aixodia-engine --bin aixodia-engine --no-deps -- -D warnings
 cargo test -p aixodia-engine            # เทสต์เฉพาะจุดก่อน
+cargo test --workspace -j 2             # ยืนยันครั้งสุดท้าย (363 เทสต์; -j สูง ๆ ทำ disk เต็มตอน link)
 cargo build --release -p aixodia-engine
 
 # ปล่อย release (CI+Release ทำงานเองเมื่อ push)
@@ -276,6 +294,12 @@ routes installed
 
 engine:
 ```
+a187786  Release the owed count when a write ends, however it ends
+50248dd  Be the manager EWMH looks for, and obey the size a client asked for
+446d18a  Hand a reattaching client its history, not just the screen it is on
+```
+
+engine (เซสชันก่อนหน้า):
 d5f1911  Read the order a client sent even when its replay cannot be written
 04f0a34  End the shell when a tab is closed, not just the engine's side of it
 8bd5997  Let a full-screen program paint the screen a reattaching client is missing
