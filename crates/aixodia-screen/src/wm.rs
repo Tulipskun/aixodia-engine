@@ -52,6 +52,106 @@ struct Frame {
     /// The client window, reparented into `frame`.
     client: xlib::Window,
     drag: Drag,
+    /// What the client said about its own size, read once when it was adopted.
+    hints: SizeHints,
+}
+
+/// The parts of `WM_NORMAL_HINTS` a reparenting frame has to respect.
+///
+/// A terminal sets resize increments and a dialog sets a fixed size; a manager
+/// that teleports the pointer size over either of them makes the program's own
+/// grid disagree with the window it is drawing in. Zero means the client said
+/// nothing about that dimension, which is why every field is read behind its own
+/// flag rather than straight out of the struct — the unused members of
+/// `XSizeHints` are not zeroed for every client.
+#[derive(Clone, Copy)]
+struct SizeHints {
+    min_width: i32,
+    min_height: i32,
+    max_width: i32,
+    max_height: i32,
+    width_inc: i32,
+    height_inc: i32,
+    base_width: i32,
+    base_height: i32,
+}
+
+impl Default for SizeHints {
+    fn default() -> Self {
+        Self {
+            min_width: 0,
+            min_height: 0,
+            max_width: 0,
+            max_height: 0,
+            width_inc: 0,
+            height_inc: 0,
+            base_width: 0,
+            base_height: 0,
+        }
+    }
+}
+
+impl SizeHints {
+    /// Reads what the client asked for, or nothing when it asked for nothing.
+    unsafe fn read(display: *mut xlib::Display, client: xlib::Window) -> Self {
+        let mut hints: xlib::XSizeHints = std::mem::zeroed();
+        let mut supplied: std::os::raw::c_long = 0;
+        if xlib::XGetWMNormalHints(display, client, &mut hints, &mut supplied) == 0 {
+            return Self::default();
+        }
+        let mut out = Self::default();
+        if supplied & xlib::PMinSize != 0 {
+            out.min_width = hints.min_width;
+            out.min_height = hints.min_height;
+        }
+        if supplied & xlib::PMaxSize != 0 {
+            out.max_width = hints.max_width;
+            out.max_height = hints.max_height;
+        }
+        if supplied & xlib::PResizeInc != 0 {
+            out.width_inc = hints.width_inc;
+            out.height_inc = hints.height_inc;
+        }
+        if supplied & xlib::PBaseSize != 0 {
+            out.base_width = hints.base_width;
+            out.base_height = hints.base_height;
+        }
+        out
+    }
+
+    /// The size a client asked to be, given the size it is being dragged to.
+    ///
+    /// Steps come first so a drag lands on a boundary the program can draw in,
+    /// then the limits, so a step past the maximum does not overshoot it.
+    fn fit(&self, width: i32, height: i32) -> (i32, i32) {
+        let mut w = step(width, self.base_width, self.width_inc);
+        let mut h = step(height, self.base_height, self.height_inc);
+        w = w.max(self.min_width).max(MIN_W);
+        h = h.max(self.min_height).max(MIN_H);
+        if self.max_width > 0 {
+            w = w.min(self.max_width);
+        }
+        if self.max_height > 0 {
+            h = h.min(self.max_height);
+        }
+        (w, h)
+    }
+
+    /// The size of the frame around a client of that size.
+    fn frame_for(&self, width: i32, height: i32) -> (i32, i32) {
+        let (w, h) = self.fit(width, height);
+        (w + GRIP, h + TITLE_H + GRIP)
+    }
+}
+
+/// Rounds a length to the nearest step above `base`.
+fn step(value: i32, base: i32, increment: i32) -> i32 {
+    if increment <= 1 {
+        return value;
+    }
+    let base = if base > 0 { base } else { 0 };
+    let distance = (value - base).max(0);
+    base + (distance + increment / 2) / increment * increment
 }
 
 /// Runs the window manager on `display_name` until `stop` is set.
@@ -115,6 +215,46 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
         let mut protocols = [atoms.delete_window];
         xlib::XSetWMProtocols(display, root, protocols.as_mut_ptr(), 1);
 
+        // EWMH has one way of asking whether a display is managed at all: a
+        // window named by `_NET_SUPPORTING_WM_CHECK` on the root, pointing at
+        // itself as well. Toolkits read it before they trust any other `_NET_*`
+        // hint, so a manager that never sets it is invisible to them — GTK and
+        // Qt windows would then ignore the hints they set, and `wmctrl` would
+        // report no manager. The window is never mapped or drawn on; it exists
+        // only to be found and to carry the manager's name.
+        let check = xlib::XCreateSimpleWindow(display, root, -1, -1, 1, 1, 0, white, black);
+        let mut self_window = check;
+        xlib::XChangeProperty(
+            display,
+            root,
+            atoms.net_supporting_wm_check,
+            xlib::XA_WINDOW,
+            32,
+            xlib::PropModeReplace,
+            &mut self_window as *mut xlib::Window as *const u8,
+            1,
+        );
+        xlib::XChangeProperty(
+            display,
+            check,
+            atoms.net_supporting_wm_check,
+            xlib::XA_WINDOW,
+            32,
+            xlib::PropModeReplace,
+            &mut self_window as *mut xlib::Window as *const u8,
+            1,
+        );
+        xlib::XChangeProperty(
+            display,
+            check,
+            atoms.net_wm_name,
+            atoms.utf8_string,
+            8,
+            xlib::PropModeReplace,
+            c"aixodia".as_ptr() as *const u8,
+            7,
+        );
+
         let mut frames: Vec<Frame> = Vec::new();
 
         while !stop.load(Ordering::SeqCst) {
@@ -131,21 +271,25 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
                         if let Some(index) = frames.iter().position(|f| f.client == request.window)
                         {
                             // A reparented client's own coordinates mean nothing
-                            // to the frame, so its position is ignored and only
-                            // the size is honoured.
-                            let width = request.width.max(MIN_W) + GRIP;
-                            let height = request.height.max(MIN_H) + TITLE_H + GRIP;
+                            // to the frame, so its position is ignored and only the
+                            // size is honoured — through the client's own limits, so
+                            // a program that asks for a size it said it never wants
+                            // gets the nearest one it does.
+                            let (width, height) =
+                                frames[index].hints.frame_for(request.width, request.height);
                             xlib::XResizeWindow(
                                 display,
                                 frames[index].frame,
                                 width as u32,
                                 height as u32,
                             );
+                            let (client_width, client_height) =
+                                frames[index].hints.fit(request.width, request.height);
                             xlib::XResizeWindow(
                                 display,
                                 frames[index].client,
-                                request.width as u32,
-                                request.height as u32,
+                                client_width as u32,
+                                client_height as u32,
                             );
                         }
                     }
@@ -202,6 +346,10 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
             xlib::XReparentWindow(display, frame.client, root, 0, 0);
             xlib::XDestroyWindow(display, frame.frame);
         }
+        // The manager's own marks go with it; a display nobody manages must not
+        // advertise a manager that is no longer there.
+        xlib::XDeleteProperty(display, root, atoms.net_supporting_wm_check);
+        xlib::XDestroyWindow(display, check);
         xlib::XCloseDisplay(display);
     }
 }
@@ -252,9 +400,10 @@ unsafe fn adopt(
         return;
     }
 
-    let width = attrs.width.max(MIN_W) + GRIP;
-    let height = attrs.height.max(MIN_H) + TITLE_H + GRIP;
-    // Step each new window along so they do not arrive on top of each other.
+    // The client's own size is what it asked to be, brought inside its limits
+    // and on a step it can draw in.
+    let hints = SizeHints::read(display, client);
+    let (width, height) = hints.frame_for(attrs.width, attrs.height); // Step each new window along so they do not arrive on top of each other.
     let step = frames.len() as i32 % 8;
     let x = 40 + step * 28;
     let y = 40 + step * 28;
@@ -294,6 +443,7 @@ unsafe fn adopt(
         frame,
         client,
         drag: Drag::None,
+        hints,
     });
 }
 
@@ -377,8 +527,12 @@ unsafe fn motion(display: *mut xlib::Display, event: &xlib::XMotionEvent, frames
             xlib::XMoveWindow(display, frame.frame, event.x_root - dx, event.y_root - dy);
         }
         Drag::Resize { dx, dy } => {
-            let width = (event.x_root - dx).max(MIN_W + GRIP);
-            let height = (event.y_root - dy).max(MIN_H + TITLE_H + GRIP);
+            // The drag is a frame size; the client and its steps decide what it
+            // becomes, so the pointer only ever proposes.
+            let (width, height) = frame.hints.frame_for(
+                (event.x_root - dx).max(MIN_W),
+                (event.y_root - dy).max(MIN_H),
+            );
             xlib::XResizeWindow(display, frame.frame, width as u32, height as u32);
             xlib::XResizeWindow(
                 display,
@@ -446,6 +600,9 @@ unsafe fn paint(
 struct Atoms {
     wm_protocols: xlib::Atom,
     delete_window: xlib::Atom,
+    net_supporting_wm_check: xlib::Atom,
+    net_wm_name: xlib::Atom,
+    utf8_string: xlib::Atom,
 }
 
 impl Atoms {
@@ -453,6 +610,13 @@ impl Atoms {
         Atoms {
             wm_protocols: xlib::XInternAtom(display, c"WM_PROTOCOLS".as_ptr(), 0),
             delete_window: xlib::XInternAtom(display, c"WM_DELETE_WINDOW".as_ptr(), 0),
+            net_supporting_wm_check: xlib::XInternAtom(
+                display,
+                c"_NET_SUPPORTING_WM_CHECK".as_ptr(),
+                0,
+            ),
+            net_wm_name: xlib::XInternAtom(display, c"_NET_WM_NAME".as_ptr(), 0),
+            utf8_string: xlib::XInternAtom(display, c"UTF8_STRING".as_ptr(), 0),
         }
     }
 }
