@@ -259,6 +259,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     gateway.set_objective_store(objectives.clone() as Arc<dyn aixodia_goals::Store>);
     gateway.set_state_store(Arc::new(db.state()));
     gateway.set_started_at(tunnel::started_at());
+    gateway.set_instance(keys.name());
     gateway.set_log_reader(Arc::new(|limit: i64, level: &str| {
         d1log::recent(limit, level)
             .into_iter()

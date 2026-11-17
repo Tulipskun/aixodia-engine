@@ -152,6 +152,9 @@ pub struct Gateway {
     log_reader: RwLock<Option<LogReader>>,
     pub(crate) probes: crate::api::ProbeCache,
     started_at: AtomicI64,
+    /// The name this machine gave itself, so an operator reading `/healthz` sees
+    /// which engine among several answered.
+    instance: RwLock<String>,
     /// Where attachments are stored, so the agent can read them.
     upload_dir: RwLock<String>,
     /// Where the phone's settings live: D1's `system_state` in production.
@@ -291,6 +294,7 @@ impl Gateway {
             log_reader: RwLock::new(None),
             probes: crate::api::ProbeCache::new(),
             started_at: AtomicI64::new(0),
+            instance: RwLock::new(String::new()),
             upload_dir: RwLock::new(String::new()),
             state: RwLock::new(None),
             objectives: RwLock::new(None),
@@ -356,6 +360,11 @@ impl Gateway {
 
     pub fn started_at(&self) -> i64 {
         self.started_at.load(Ordering::SeqCst)
+    }
+
+    /// Records the name this machine answers under, for `/healthz`.
+    pub fn set_instance(&self, name: &str) {
+        *self.instance.write().unwrap_or_else(|e| e.into_inner()) = name.to_string();
     }
 
     pub fn set_log_reader(&self, reader: LogReader) {
@@ -528,6 +537,7 @@ async fn healthz(State(g): State<Arc<Gateway>>) -> Response {
         StatusCode::OK,
         json!({
             "ok": true,
+            "instance": g.instance.read().unwrap_or_else(|e| e.into_inner()).clone(),
             "version": VERSION,
             "started": g.started_at(),
             "pid": std::process::id(),
