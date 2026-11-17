@@ -169,6 +169,7 @@ alt screen แต่ fg pgrp ตอนนั้นเป็น child ที่ i
 - โครงสร้าง input: `TerminalPanel.kt` ต่อ `inputSink = { socket.send(it) }` →
   `TerminalSocket.TabLink.send` → OkHttp `WebSocket.send`
 - **เทสต์:** `ANDROID_HOME=/opt/android-sdk ./gradlew :app:testDebugUnitTest`
+  - บนเครื่อง `instabox-alpha` **ยังไม่มี Android SDK/gradle** → รันที่นี่ไม่ได้ ให้ CI เป็นคนรัน
   - Paparazzi รันในเครื่องนี้ไม่ได้ (`UninitializedPropertyAccessException: sessionParamsBuilder`)
     — **เป็นปัญหาเดิมก่อนการแก้ของเรา** ยืนยันด้วย `git stash` แล้วรันซ้ำ; CI เป็นคนรัน
 
@@ -186,6 +187,16 @@ listening → routes           0.015 s (เดิม 6.7 s)
 interrupt_stale หลัง routes  6.5 s  (ไม่บล็อกการตอบแล้ว)
 update จริง (swap + exec)    473 × 200, FAIL 1 ครั้ง, pid เดิม
 D1 round trip (SELECT 1)      6.74 s   ← เพดานที่เหลืออยู่
+```
+
+เซสชันล่าสุด (เครื่อง x86_64, `40d4867`):
+
+```
+cargo test --workspace -j 2  363 passed, 0 failed
+aixodia-screen (เทสต์)       41 passed  (ต้องมี libX11/libXext/libXtst)
+aixodia-io (เทสต์)           94 passed
+update จริงบนเครื่องนี้       published=02:24:20Z, exec, pid 83192 เดิม, routes installed
+cargo test --workspace (ครั้งแรก)  disk เต็มตอน link → ต้อง -j 2
 ```
 
 ---
