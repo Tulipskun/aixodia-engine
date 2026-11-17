@@ -338,6 +338,41 @@ routes installed
 
 ---
 
+## 10.1 หลาย engine บนเครื่องเดียว / domain เดียว (ทำแล้ว)
+
+ต่างจากเดิม: engine เคยมีตัวเดียวต่อ host — พอร์ต `127.0.0.1:8787` ฝังในโค้ด, state อยู่ที่
+`$HOME/.aixodia` และอ่าน KV key เปล่า (`tunnel_token`, `tunnel_url`, `daemon/url`)
+
+ตอนนี้ instance หนึ่งตัวแยกจากกันด้วย env 3 ตัว (launcher เป็นคนตั้งให้):
+
+| env | ความหมาย | ค่าเริ่มต้น |
+|---|---|---|
+| `AIXODIA_INSTANCE` | ชื่อ instance (a-z0-9 + hyphen เดี่ยว, ≤32) | ไม่ตั้ง = engine ตัวเดียวแบบเดิม |
+| `AIXODIA_PORT` | พอร์ต (launcher ใช้สร้าง `AIXODIA_BIND`) | 8787 |
+| `AIXODIA_BIND` | ที่อยู่ที่ engine bind จริง | `127.0.0.1:8787` |
+| `AIXODIA_STATE_DIR` | state ของ instance นี้ | `$HOME/.aixodia` |
+
+- KV key ของ instance: `instances/<name>/tunnel_token`, `…/tunnel_url`, `…/daemon/url`,
+  `…/daemon/version` (`crates/aixodia-engine/src/instance.rs::Keys`)
+- state dir มาจาก crate ใหม่ `crates/aixodia-state` — ใช้ร่วมโดย `aixodia-db` (identity/config-cache/
+  schema), `d1log`, `aixodia-selfupdate`, `aixodia-terminal` (terminals/) จึงไม่ปนกันข้าม instance
+- launcher: `AIXODIA_INSTANCE=phone AIXODIA_PORT=8788 aixodia start|stop|status|logs|update`,
+  home ของ instance = `~/.aixodia/instances/<name>`, hook autostart แยกไฟล์ต่อ instance
+- **domain เดียว**: `gateway/` = Cloudflare Worker (`aixodia-engine-gateway`) ที่
+  `https://<host>/<instance>/…` → ตัด segment แรกออก → `<instance>.aixodia.dpdns.org/…`
+  พร้อม Access service token (เหมือน `aixodia-mcp-gateway` ของ droidime ทุกอย่าง)
+  ยังไม่ได้ deploy — ต้องสร้าง KV `ENGINE_ORIGINS` + secret `ACCESS_CLIENT_ID/SECRET` ก่อน
+
+ตรวจแล้วบนเครื่องนี้: `instance probe; state /tmp/inst-probe3; keys instances/probe/…` +
+`listening on 127.0.0.1:8799` แล้วจบด้วย `Workers KV key instances/probe/tunnel_token is missing`
+(ถูกต้อง เพราะยังไม่ได้ provision) — engine ตัวจริงบน 8787 ไม่ถูกแตะ
+
+เทสต์: `gateway: npm test = 9 passed`, `aixodia-state 3`, `instance::* 4`, ของเดิมใน
+db/terminal/selfupdate ผ่านหมด, clippy `-D warnings` ผ่าน (ต้องใช้ rustfmt/clippy จาก toolchain
+`stable` เพราะ toolchain 1.99.1 เป็น profile minimal และ symlink `rustup` ใน `/root/.cargo/bin` เสีย)
+
+---
+
 ## 11. Commit ล่าสุดของเซสชันนี้
 
 engine:

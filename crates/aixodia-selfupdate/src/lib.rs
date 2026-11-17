@@ -188,7 +188,7 @@ pub fn current_sha256() -> Result<String> {
 
 /// Where the last applied release is remembered.
 pub fn state_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".aixodia/selfupdate.state")
+    aixodia_state::path("selfupdate.state")
 }
 
 /// The `updated_at` of the release this engine last applied, empty when none.

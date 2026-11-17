@@ -1,0 +1,11 @@
+name = "aixodia-engine-gateway"
+main = "src/index.js"
+compatibility_date = "2026-11-07"
+
+[[kv_namespaces]]
+binding = "ENGINE_ORIGINS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[[routes]]
+pattern = "engines.aixodia.dpdns.org/*"
+zone_name = "aixodia.dpdns.org"

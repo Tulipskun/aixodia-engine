@@ -12,6 +12,7 @@ mod client_auth;
 mod d1log;
 mod devices;
 mod handover;
+mod instance;
 mod tunnel;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -110,6 +111,18 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         anyhow::bail!("CF_TOKEN is not set");
     }
     let db = DbClient::new();
+    // Which address this engine answers on, and which KV keys are its own: an
+    // instance keeps its tunnel credentials and its published URL apart from any
+    // other engine on the same host.
+    let bind = instance::bind()?;
+    let keys = instance::Keys::from_env()?;
+    if let Some(name) = keys.instance() {
+        tracing::info!(
+            "instance {name}; state {}; keys {}…",
+            aixodia_state::state_dir().display(),
+            keys.prefix()
+        );
+    }
 
     // The socket comes first, before anything that talks to the network.
     //
@@ -119,7 +132,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // the tunnel and costs seconds, and doing them first left the port
     // unaccepted for as long as they took — which the phone saw as the engine
     // being gone, even though the swap itself had no gap at all.
-    let listener = listen();
+    let listener = listen(&bind);
 
     // Start answering on the inherited socket before reading any configuration.
     //
@@ -192,19 +205,36 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // works (see auth_system.md's sync rules).
     client_auth.spawn_sync_task();
     let tunnel_token = db
-        .config_kv_get("tunnel_token")
+        .config_kv_get(&keys.key("tunnel_token"))
         .await?
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Workers KV key tunnel_token is missing or empty"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Workers KV key {} is missing or empty",
+                keys.key("tunnel_token")
+            )
+        })?;
     let tunnel_url = db
-        .config_kv_get("tunnel_url")
+        .config_kv_get(&keys.key("tunnel_url"))
         .await?
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Workers KV key tunnel_url is missing or empty"))?;
-    let parsed_tunnel_url = url::Url::parse(tunnel_url.trim())
-        .map_err(|_| anyhow::anyhow!("Workers KV key tunnel_url is not a valid URL"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Workers KV key {} is missing or empty",
+                keys.key("tunnel_url")
+            )
+        })?;
+    let parsed_tunnel_url = url::Url::parse(tunnel_url.trim()).map_err(|_| {
+        anyhow::anyhow!(
+            "Workers KV key {} is not a valid URL",
+            keys.key("tunnel_url")
+        )
+    })?;
     if parsed_tunnel_url.scheme() != "https" || parsed_tunnel_url.host_str().is_none() {
-        anyhow::bail!("Workers KV key tunnel_url must be an https:// URL");
+        anyhow::bail!(
+            "Workers KV key {} must be an https:// URL",
+            keys.key("tunnel_url")
+        );
     }
 
     d1log::start()?;
@@ -308,6 +338,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let cloudflared =
         which("cloudflared").ok_or_else(|| anyhow::anyhow!("cloudflared is not installed"))?;
     let publisher_db = db.clone();
+    let publisher_keys = keys.clone();
     let publisher_hub = hub.clone();
     let noted = Arc::new(AtomicI64::new(0));
     let keeper = Arc::new(tunnel::Keeper::new(
@@ -316,11 +347,15 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         tunnel_url,
         Some(Arc::new(move |url: String| {
             let db = publisher_db.clone();
+            let keys = publisher_keys.clone();
             let hub = publisher_hub.clone();
             let noted = noted.clone();
             tokio::spawn(async move {
                 let version = version_string();
-                match db.config_kv_put_if_changed("daemon/url", &url).await {
+                match db
+                    .config_kv_put_if_changed(&keys.key("daemon/url"), &url)
+                    .await
+                {
                     Ok(true) => tracing::info!("daemon url updated in Workers KV"),
                     Ok(false) => tracing::debug!("daemon url unchanged in Workers KV"),
                     Err(err) => {
@@ -329,7 +364,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
                     }
                 }
                 if let Err(err) = db
-                    .config_kv_put_if_changed("daemon/version", &version)
+                    .config_kv_put_if_changed(&keys.key("daemon/version"), &version)
                     .await
                 {
                     tracing::warn!("publish daemon version: {err}");
@@ -459,19 +494,19 @@ type SharedRoutes = Arc<tokio::sync::RwLock<Option<Router>>>;
 /// An inherited socket is adopted as-is; otherwise the port is bound here. Called
 /// before the configuration reads so an update's new image is accept-ready
 /// immediately rather than after the network round-trips those reads need.
-fn listen() -> tokio::net::TcpListener {
+fn listen(bind: &str) -> tokio::net::TcpListener {
     let listener = match inherited_listener() {
         Some(listener) => {
-            tracing::info!("listening on 127.0.0.1:8787 (inherited from the previous image)");
+            tracing::info!("listening on {bind} (inherited from the previous image)");
             listener
         }
         None => {
-            let bound = std::net::TcpListener::bind("127.0.0.1:8787")
-                .expect("the engine must own 127.0.0.1:8787");
+            let bound = std::net::TcpListener::bind(bind)
+                .unwrap_or_else(|err| panic!("the engine must own {bind}: {err}"));
             bound
                 .set_nonblocking(true)
                 .expect("a non-blocking listener");
-            tracing::info!("listening on 127.0.0.1:8787");
+            tracing::info!("listening on {bind}");
             tokio::net::TcpListener::from_std(bound).expect("a tokio listener")
         }
     };
@@ -877,10 +912,7 @@ const GOALS_SCHEMA: &str = "1";
 /// The engine's local state directory. The keeper records only its child
 /// cloudflared pid here so an in-place executable update can reap an old tunnel.
 fn home_dir() -> std::path::PathBuf {
-    match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-        Some(home) => std::path::PathBuf::from(home).join(".aixodia"),
-        None => std::path::PathBuf::from("."),
-    }
+    aixodia_state::state_dir()
 }
 
 fn upload_dir() -> String {

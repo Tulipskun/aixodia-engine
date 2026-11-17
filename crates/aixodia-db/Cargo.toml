@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 aixodia-net = { path = "../aixodia-net" }
+aixodia-state = { path = "../aixodia-state" }
 anyhow.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true

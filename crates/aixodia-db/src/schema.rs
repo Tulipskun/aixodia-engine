@@ -13,14 +13,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// The state directory an engine shares with the images that replaced it.
-fn state_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-    Some(PathBuf::from(home).join(".aixodia"))
-}
-
+/// The state directory an engine shares with the images that replaced it, and
+/// with nothing else: a second instance on the same host has its own.
 fn schema_path() -> Option<PathBuf> {
-    state_dir().map(|dir| dir.join("schema.json"))
+    Some(aixodia_state::path("schema.json"))
 }
 
 fn claimed() -> std::collections::HashMap<String, String> {

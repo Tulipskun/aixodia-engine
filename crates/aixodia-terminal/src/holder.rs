@@ -48,12 +48,7 @@ pub const KIND_EXIT: u8 = b'x';
 /// anything else that happens to use the same name. `HOME` is the one variable
 /// the engine and the holder it starts both already have.
 fn holder_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".aixodia")
-        .join("terminals")
+    aixodia_state::path("terminals")
 }
 
 /// Where a holder for `id` advertises itself.

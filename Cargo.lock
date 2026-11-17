@@ -77,6 +77,7 @@ name = "aixodia-db"
 version = "0.1.0"
 dependencies = [
  "aixodia-net",
+ "aixodia-state",
  "anyhow",
  "async-trait",
  "percent-encoding",
@@ -104,6 +105,7 @@ dependencies = [
  "aixodia-screen",
  "aixodia-selfupdate",
  "aixodia-session",
+ "aixodia-state",
  "aixodia-terminal",
  "aixodia-tools",
  "anyhow",
@@ -295,6 +297,7 @@ name = "aixodia-selfupdate"
 version = "0.1.0"
 dependencies = [
  "aixodia-net",
+ "aixodia-state",
  "anyhow",
  "axum",
  "hex",
@@ -328,9 +331,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aixodia-state"
+version = "0.1.0"
+
+[[package]]
 name = "aixodia-terminal"
 version = "0.1.0"
 dependencies = [
+ "aixodia-state",
  "aixodia-wsock",
  "axum",
  "libc",

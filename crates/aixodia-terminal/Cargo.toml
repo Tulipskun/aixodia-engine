@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 aixodia-wsock = { path = "../aixodia-wsock" }
+aixodia-state = { path = "../aixodia-state" }
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

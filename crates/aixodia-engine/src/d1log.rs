@@ -217,15 +217,10 @@ fn json_value(value: ValueRef<'_>) -> Value {
 
 static GLOBAL: OnceLock<LogStore> = OnceLock::new();
 
-/// The default database path: `~/.aixodia/aixodia-logs.db`, or the working
-/// directory when there is no home.
+/// The default database path: `<state dir>/aixodia-logs.db`. Each instance
+/// keeps its own, so `aixodia logs` reads the engine it was pointed at.
 pub fn default_path() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => {
-            PathBuf::from(home).join(".aixodia").join("aixodia-logs.db")
-        }
-        _ => PathBuf::from("./aixodia-logs.db"),
-    }
+    aixodia_state::path("aixodia-logs.db")
 }
 
 /// Starts the process-wide store once, as the Go `sync.Once` does.

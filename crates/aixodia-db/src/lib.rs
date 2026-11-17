@@ -180,14 +180,9 @@ struct DiskIdentity {
 }
 
 impl DiskIdentity {
-    /// `$HOME/.aixodia/identity.json`.
+    /// `<state dir>/identity.json`, beside the engine that wrote it.
     fn path() -> Option<std::path::PathBuf> {
-        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-        Some(
-            std::path::PathBuf::from(home)
-                .join(".aixodia")
-                .join("identity.json"),
-        )
+        Some(aixodia_state::path("identity.json"))
     }
 
     fn load() -> Option<Self> {
@@ -263,14 +258,9 @@ struct DiskConfigCache {
 }
 
 impl DiskConfigCache {
-    /// The cache file: `$HOME/.aixodia/config-cache.json`.
+    /// The cache file: `<state dir>/config-cache.json`.
     fn path() -> Option<std::path::PathBuf> {
-        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
-        Some(
-            std::path::PathBuf::from(home)
-                .join(".aixodia")
-                .join("config-cache.json"),
-        )
+        Some(aixodia_state::path("config-cache.json"))
     }
 
     /// Reads the file, keeping it only when it belongs to `namespace`.
