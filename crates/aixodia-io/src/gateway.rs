@@ -216,12 +216,12 @@ impl Backups {
             return;
         }
         let queue = self.queue_for(session_id);
-        let owed = self.owed.clone();
-        owed.fetch_add(1, Ordering::SeqCst);
+        let owed = Owed(self.owed.clone());
+        self.owed.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
             let _turn = queue.lock().await;
             job.await;
-            owed.fetch_sub(1, Ordering::SeqCst);
+            drop(owed);
         });
     }
 
@@ -250,6 +250,21 @@ impl Backups {
         for queue in queues {
             let _turn = queue.lock().await;
         }
+    }
+}
+
+/// One write in flight, counted until it is over.
+///
+/// The count is released by `Drop` rather than at the end of the future, so a
+/// job that panics — a store that panics on bad input does — cannot leave the
+/// count above zero for the life of the process. A stuck count is not a cosmetic
+/// problem: anything that asks "is this process still writing?" would answer yes
+/// for ever, with no write left to wait for.
+struct Owed(Arc<AtomicI64>);
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
