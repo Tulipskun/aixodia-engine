@@ -391,31 +391,39 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 > ค่าที่ KV: `instances/m-8a7d1192/tunnel_url` = `https://m-8a7d1192.aixodia.dpdns.org` (origin, ไม่ใช่ที่อยู่สาธารณะ)
 > · tunnel ingress มีทั้ง `engine.` และ `m-8a7d1192.` → `localhost:8787` · DNS CNAME ทั้งสองชื่อ
 
+### liveness = lease ที่ engine เขียนเอง (ไม่ใช่ probe)
+
+`engines.heartbeat_at` ถูกเขียนโดย **engine เอง** ทุก 20 วิ (`registry::heartbeat`,
+`crates/aixodia-engine/src/registry.rs`) ส่วน gateway ตอบด้วย
+`heartbeat_at > 0 AND unixepoch() - heartbeat_at <= 60` — รูปแบบ TTL lease แบบเดียวกับ
+Consul TTL check / k8s node lease
+
+เหตุผลที่เปลี่ยนจาก probe มาเป็น lease:
+- probe ตอนตอบ = ผู้เรียกจ่าย round trip ผ่าน Access + tunnel ก่อนได้ลิสต์
+- ต้องมี cron มาคอยยิงเมื่อไม่มีใครถาม (ไม่งั้นเงียบแล้วขึ้น offline ทั้ง fleet)
+- probe วัด "gateway ไปถึงได้ไหม" ไม่ใช่ว่า process ยังอยู่ไหม
+
+สิ่งที่ไม่ต้องมีแล้ว (ลบออกจากโค้ด ไม่ใช่ปิดไว้): cron trigger, probe ใน hot path,
+`system_state.gateway/probe_run_at`, และคอลัมน์ `online_at`/`online_version`
+(แทนด้วย `heartbeat_at`/`version`, migration `002_engine_lease.sql`)
+
+ความสดที่ได้: lease 60 วิ, beat ทุก 20 วิ ⇒ ข้อมูลเก่าไม่เกิน 20 วิ โดยไม่มี traffic เลย
+ส่วน "ตอนนี้ต่อได้ไหม" แอพตัดสินจาก socket ของตัวเอง (`DiscoveryPhase.CONNECTED`) ไม่ใช่จาก registry
+
 ### ความเร็ว (วัดจากเครื่องนี้, 5 ครั้งต่อค่า)
 
 | path | ก่อน | หลัง |
 |---|---|---|
-| `engine.aixodia.dpdns.org/api/engines` | 0.25–0.52 s | **0.04–0.20 s** |
+| `engine.aixodia.dpdns.org/api/engines` | 0.25–0.52 s | **0.06–0.14 s** (D1 read ครั้งเดียว, ไม่มี probe) |
 | `engine.aixodia.dpdns.org/healthz` | 0.33–0.53 s | 0.17–0.21 s |
 | origin + service token (ข้าม Worker) | 0.25–0.31 s | 0.07–0.08 s |
 | engine local `/healthz` | 0.182 s | **0.0007 s** |
 
-ที่มาของความเร็วมาจากสามที่:
+ที่มา: `/healthz` เลิกนอน 180 ms (sample CPU ใน task เบื้องหลัง), registry อ่าน lease
+แทนการ probe, และ `[placement] mode = "smart"` ให้ Worker อยู่ใกล้ origin
 
-1. **`/healthz` ไม่นอน 180 ms แล้ว** (`crates/aixodia-io/src/gateway.rs`) — เดิม `system_metrics()`
-   อ่าน `/proc/stat` สองรอบห่างกัน 180 ms เพื่อคิด CPU% ในrequest ตรง ๆ ⇒ ทุก health check
-   (tunnel, gateway probe, discovery ของแอพ) จ่าย 180 ms ฟรี ๆ · ตอนนี้มี task เบื้องหลัง sample
-   ทุก 1 วิ แล้ว request อ่านค่าล่าสุด (mem/uptime ยังอ่านไฟล์ตรง)
-2. **registry ตอบจาก stamp ไม่รอ probe** (`aixodia-workers/engine-gateway`) — คอลัมน์
-   `online_at`/`online_version` (migration `001_engine_online.sql`), ตอบแล้วค่อย probe ผ่าน
-   `ctx.waitUntil` (ขนาน, timeout 1 วิ, เขียนกลับด้วย `DB.batch` ครั้งเดียว), แถวจาก D1 cache 30 วิ
-   ต่อ isolate + stale-while-revalidate, `[placement] mode = "smart"`
-3. **probe ที่ล้มเหลวไม่เขียนทับ stamp** — เครื่องที่กำลัง compile หนักเคยถูกเขียนเป็น offline
-   ทั้งที่ยังอยู่ ⇒ เขียนเฉพาะผลที่ healthy แล้วให้ stamp เก่าหมดอายุเองใน 60 วิ
-
-ที่ยังเป็นพื้นของ topology นี้: Worker → origin มีสอง edge hop (Worker → hostname ของ origin →
-Access → tunnel) ⇒ ประมาณ +0.1 s เหนือการยิง origin ตรง ๆ ถ้าจะลดอีกต้องเอา Access ออกจาก
-origin hostname (แลกกับ defense-in-depth) — ยังไม่ทำ
+พื้นของ topology นี้: Worker → origin = 2 edge hop + Access ≈ +0.1 s ถ้าจะลดอีกต้องเอา
+Access ออกจาก origin hostname (แลก defense-in-depth) — ยังไม่ทำ
 
 ### สถานะ / สิ่งที่ทำแล้ว
 
