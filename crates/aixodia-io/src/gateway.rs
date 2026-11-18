@@ -549,6 +549,11 @@ async fn healthz(State(g): State<Arc<Gateway>>) -> Response {
             "memory_used_bytes": metrics.memory_used_bytes,
             "memory_total_bytes": metrics.memory_total_bytes,
             "memory_percent": metrics.memory_percent,
+            "disk_used_bytes": metrics.disk_used_bytes,
+            "disk_total_bytes": metrics.disk_total_bytes,
+            "disk_percent": metrics.disk_percent,
+            "io_read_bps": metrics.io_read_bps,
+            "io_write_bps": metrics.io_write_bps,
             "uptime_seconds": metrics.uptime_seconds,
         }),
     )
@@ -560,7 +565,81 @@ struct SystemMetrics {
     memory_used_bytes: Option<u64>,
     memory_total_bytes: Option<u64>,
     memory_percent: Option<f64>,
+    disk_used_bytes: Option<u64>,
+    disk_total_bytes: Option<u64>,
+    disk_percent: Option<f64>,
+    /// This process's own read and write throughput, in bytes per second.
+    io_read_bps: Option<f64>,
+    io_write_bps: Option<f64>,
     uptime_seconds: Option<f64>,
+}
+
+/// The used and total size of the filesystem holding `/`, from `statvfs`.
+///
+/// The engine's own files are what the disk is for — sessions, uploads, backups —
+/// so this is the number worth showing next to CPU and memory, not the size of
+/// every mount on the machine.
+fn disk_usage() -> Option<(u64, u64)> {
+    let path = std::ffi::CString::new("/").ok()?;
+    // SAFETY: `stat` is owned here and only written by statvfs, and the path is a
+    // valid C string that outlives the call.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; statvfs does not retain the path or the struct.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let block = stat.f_frsize as u64;
+    let total = (stat.f_blocks as u64).saturating_mul(block);
+    let available = (stat.f_bavail as u64).saturating_mul(block).min(total);
+    Some((total.saturating_sub(available), total))
+}
+
+/// The bytes this process has read and written, from `/proc/self/io`.
+fn io_bytes(contents: &str) -> Option<(u64, u64)> {
+    let mut read = None;
+    let mut write = None;
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        match fields.next()? {
+            "read_bytes:" => read = fields.next()?.parse::<u64>().ok(),
+            "write_bytes:" => write = fields.next()?.parse::<u64>().ok(),
+            _ => continue,
+        }
+    }
+    Some((read?, write?))
+}
+
+/// The I/O throughput of the last background sample, kept warm once per second.
+///
+/// `/proc/self/io` is cumulative, so a rate needs two reads a second apart. That
+/// wait belongs in a task of its own for the same reason the CPU sample does: a
+/// health check must not sleep.
+fn io_rate() -> (Option<f64>, Option<f64>) {
+    static SHARED: OnceLock<Arc<std::sync::RwLock<(Option<f64>, Option<f64>)>>> = OnceLock::new();
+    let shared = SHARED.get_or_init(|| {
+        let shared = Arc::new(std::sync::RwLock::new((None, None)));
+        let writer = shared.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(rate) = sample_io().await {
+                    *writer.write().unwrap_or_else(|e| e.into_inner()) = rate;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        shared
+    });
+    *shared.read().unwrap_or_else(|e| e.into_inner())
+}
+
+async fn sample_io() -> Option<(Option<f64>, Option<f64>)> {
+    let before = io_bytes(&tokio::fs::read_to_string("/proc/self/io").await.ok()?)?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = io_bytes(&tokio::fs::read_to_string("/proc/self/io").await.ok()?)?;
+    let seconds = 0.5_f64;
+    let read = after.0.saturating_sub(before.0) as f64 / seconds;
+    let write = after.1.saturating_sub(before.1) as f64 / seconds;
+    Some((Some(read), Some(write)))
 }
 
 fn cpu_ticks(contents: &str) -> Option<(u64, u64)> {
@@ -650,6 +729,18 @@ async fn system_metrics() -> SystemMetrics {
             }
         }
     }
+
+    if let Some((used, total)) = disk_usage() {
+        metrics.disk_used_bytes = Some(used);
+        metrics.disk_total_bytes = Some(total);
+        if total > 0 {
+            metrics.disk_percent = Some(used as f64 / total as f64 * 100.0);
+        }
+    }
+
+    let (read, write) = io_rate();
+    metrics.io_read_bps = read;
+    metrics.io_write_bps = write;
 
     if let Ok(uptime) = tokio::fs::read_to_string("/proc/uptime").await {
         metrics.uptime_seconds = uptime
@@ -1034,7 +1125,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 #[cfg(test)]
 mod system_metrics_tests {
-    use super::{cpu_ticks, memory_bytes};
+    use super::{cpu_ticks, io_bytes, memory_bytes};
 
     #[test]
     fn parses_aggregate_cpu_ticks_and_counts_iowait_as_idle() {
@@ -1055,8 +1146,25 @@ mod system_metrics_tests {
     }
 
     #[test]
+    fn reads_this_processes_io_counters() {
+        let (read, write) = io_bytes(
+            "rchar: 1234\nwchar: 5678\nsyscr: 9\nsyscw: 10\nread_bytes: 4096\nwrite_bytes: 8192\n",
+        )
+        .expect("io counters");
+        assert_eq!((read, write), (4096, 8192));
+    }
+
+    #[test]
     fn missing_proc_fields_do_not_create_metrics() {
         assert_eq!(cpu_ticks("btime 123"), None);
         assert_eq!(memory_bytes("MemFree: 100 kB"), None);
+        assert_eq!(io_bytes("rchar: 1"), None);
+    }
+
+    #[test]
+    fn the_disk_is_the_machines_real_root() {
+        let (used, total) = super::disk_usage().expect("statvfs on /");
+        assert!(total > 0, "a root filesystem has size");
+        assert!(used <= total, "used {used} cannot exceed total {total}");
     }
 }
