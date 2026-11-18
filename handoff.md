@@ -363,15 +363,20 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 **domain เดียว**: Worker `aixodia-engine-gateway` — โค้ดย้ายไปอยู่ **repo แยก** แล้ว:
 [Tulipskun/aixodia-workers](https://github.com/Tulipskun/aixodia-workers) → `engine-gateway/`
 (ใน engine repo ไม่มี `gateway/` แล้ว)
+
+> **ไม่มี hostname `engines.aixodia.dpdns.org` แล้ว** (DNS record ถูกลบ, route เปลี่ยน):
+> registry ตอบที่ `https://engine.aixodia.dpdns.org/api/engines` — ใช้ Access bypass ของ `/api/*`
+> ที่มีอยู่แล้ว · ส่วน proxy `<machine>/…` ยังอยู่ในโค้ดและมีเทสต์ แต่ **ยังไม่ผูก route**
+> (มีเครื่องเดียว = ยังไม่ต้องใช้) ถ้ามีเครื่องที่สองค่อยเพิ่ม route + แถวใน D1
 `https://<host>/<machine>/api/…` → ตัด segment แรกออก → `<machine>.aixodia.dpdns.org/api/…`
 พร้อม Access service token, fail-closed (เหมือน `aixodia-mcp-gateway` ของ droidime)
-ตั้ง default route ไว้ที่ `engines.aixodia.dpdns.org/*` — **deploy แล้ว** (`2e0c5595…`)
+route ที่ผูกอยู่ตอนนี้: `engine.aixodia.dpdns.org/api/engines*` — **deploy แล้ว** (`8f4569a2…`)
 
 ### สถานะ / สิ่งที่ทำแล้ว
 
 1. **registry อยู่ใน D1 ไม่ใช่ KV แล้ว** — ตาราง `engines` (`id`, `name`, `url`, `origin_host`,
    `subtitle`, `tag`) ในฐาน `aixodia`, schema อยู่ที่ `aixodia-workers/schema.sql`
-   แถวของเครื่องนี้: `m-8a7d1192` → `https://engines.aixodia.dpdns.org/m-8a7d1192`,
+   แถวของเครื่องนี้: `m-8a7d1192` → url `https://engine.aixodia.dpdns.org`,
    origin `m-8a7d1192.aixodia.dpdns.org`. KV namespace `ENGINE_ORIGINS` **ถูกลบแล้ว**
 2. KV `AIXODIA_CONFIG` มีทั้ง `instances/m-8a7d1192/{tunnel_token,tunnel_url,daemon/url,daemon/version}`
    และ key เปล่าเดิม (engine `ce12b0b` อ่านแต่แบบใหม่)
@@ -381,26 +386,25 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
    ตัวจริงของ Worker อยู่ที่ secret binding `ACCESS_CLIENT_ID`/`ACCESS_CLIENT_SECRET`
 4. Access app `AIxodia engine` (`5fc51df9…`) มี policy เพิ่ม `AIxodia engine gateway (service)`
    (`7ae7036e…`, `non_identity` + `service_token`) — policy เดิมแบบ email allow ยังอยู่
-5. DNS: `engines.aixodia.dpdns.org` (CNAME → `aixodia.dpdns.org`, proxied) และ
-   `m-8a7d1192.aixodia.dpdns.org` (CNAME → `a7c29f86-….cfargotunnel.com`, proxied)
+5. DNS: `m-8a7d1192.aixodia.dpdns.org` (CNAME → `a7c29f86-….cfargotunnel.com`, proxied) —
+   CNAME ของ `engines.` ถูกลบแล้ว, registry อยู่ที่ `engine.aixodia.dpdns.org/api/engines`
 6. tunnel `aixodia` ingress: `engine.` → `localhost:8787`, `alpha-ssh.` → `ssh://localhost:22`,
    `m-8a7d1192.` → `http://localhost:8787`, ปิดท้าย `http_status:404`
 
 ยืนยันแล้ว:
 ```
 GET https://m-8a7d1192.aixodia.dpdns.org/healthz          200  instance=m-8a7d1192
-GET https://engines.aixodia.dpdns.org/m-8a7d1192/healthz 200  instance=m-8a7d1192
-GET https://engines.aixodia.dpdns.org/nope/healthz       {"error":"Unknown instance"}
-GET https://engines.aixodia.dpdns.org/engines            {"engines":[{"id":"m-8a7d1192",…}]}  (จาก D1)
+GET https://engine.aixodia.dpdns.org/api/sessions        401 (engine ตอบเอง ไม่โดน Worker บัง)
+GET gateway proxy (ยังไม่ผูก route)                      ทดสอบใน `npm test` ของ repo workers
+GET https://engine.aixodia.dpdns.org/api/engines         {"engines":[{"id":"m-8a7d1192",…}]}  (จาก D1)
 GET …/m-8a7d1192/api/sessions                            401 (เหมือนยิงตรง)
 GET https://engine.aixodia.dpdns.org/healthz             200 (tunnel ไม่พัง)
 ```
 
 ### สิ่งที่ยังค้าง
 
-1. **`engines.aixodia.dpdns.org` ยังไม่มี Access app ของตัวเอง** — เข้าถึงได้จากอินเทอร์เน็ต
-   (แต่ปลายทางยังต้องผ่าน Access/engine token เหมือน `engine.` ทุกประการ) ถ้าต้องการให้ปิดที่ gateway
-   ด้วย ต้องสร้าง Access app + policy (email allow หรือ service token)
+1. ~~`engines.aixodia.dpdns.org` ไม่มี Access app~~ — ไม่มี hostname นั้นแล้ว registry อยู่ใต้ `/api/*`
+   ของ `engine.` ซึ่งมี bypass app อยู่แล้ว
 2. **เครื่องอื่น** ยังไม่ได้ provision — ต่อเครื่อง: tunnel ingress + CNAME + `INSERT` แถวใน `engines`
    + `instances/<machine>/{tunnel_token,tunnel_url}` ใน KV `AIXODIA_CONFIG`
 3. เพิ่มเครื่องใหม่ = `INSERT` แถวเดียว ไม่ต้อง deploy Worker (gateway อ่านตารางทุก request)
@@ -420,7 +424,7 @@ launcher suite `bash aixodia_test.sh` ผ่านหมด (ไฟล์ `aixod
 | Worker | โค้ดอยู่ที่ | route | KV | secret | ทำอะไร |
 |---|---|---|---|---|---|
 | `aixodia-auth` | `auth/` | `aixodia-auth.aixodia.workers.dev` (Pages `/engine/auth/*` proxy ไป) | `CONFIG` = `AIXODIA_CONFIG` (`b9159aba…`) | — | sign-in / device code / session / token / Access JWT verify |
-| `aixodia-engine-gateway` | `engine-gateway/` | `engines.aixodia.dpdns.org/*` | D1 `engines` (ไม่มี KV) | `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | registry ของเครื่อง engine (`GET /engines`) + proxy `<machine>/…` พร้อม service token |
+| `aixodia-engine-gateway` | `engine-gateway/` | `engine.aixodia.dpdns.org/api/engines*` | D1 `engines` (ไม่มี KV) | `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | registry ของเครื่อง engine (`GET /engines`) + proxy `<machine>/…` พร้อม service token |
 | `aixodia-mcp-gateway` | `mcp-gateway/` | `mcp.aixodia.dpdns.org/*` | `DEVICE_TUNNELS` (`9c094dd9…`) | `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | registry ของ device ที่รัน MCP server + proxy `<device>/…` |
 
 ทั้งสามตัวอยู่ใน repo เดียว: **`Tulipskun/aixodia-workers`** (แยกออกมาจาก
