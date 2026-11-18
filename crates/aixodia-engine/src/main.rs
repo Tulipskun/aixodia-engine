@@ -103,31 +103,6 @@ async fn async_main() {
     d1log::info("engine stopped");
 }
 
-/// Serves `<public name>/…` as if the name were not there.
-async fn strip_public_name(
-    State(prefix): State<Arc<String>>,
-    mut request: axum::extract::Request,
-    next: middleware::Next,
-) -> axum::response::Response {
-    if let Some(rest) = registry::strip_name(&prefix, request.uri().path()) {
-        let query = request
-            .uri()
-            .query()
-            .map(|query| format!("?{query}"))
-            .unwrap_or_default();
-        let mut parts = request.uri().clone().into_parts();
-        if let Ok(path_and_query) =
-            format!("{rest}{query}").parse::<axum::http::uri::PathAndQuery>()
-        {
-            parts.path_and_query = Some(path_and_query);
-            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
-                *request.uri_mut() = uri;
-            }
-        }
-    }
-    next.run(request).await
-}
-
 async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let token = std::env::var("CF_TOKEN")
         .unwrap_or_default()
@@ -169,10 +144,18 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let routes: SharedRoutes = Arc::new(tokio::sync::RwLock::new(None));
     let booting = routes.clone();
     let boot_instance = keys.name().to_string();
-    let boot = Router::new().fallback(move |request: axum::extract::Request| {
+    // Filled in once the registry has given this engine its public name; until
+    // then the engine answers on its own routes only.
+    let public_name: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
+    let boot_name = public_name.clone();
+    let boot = Router::new().fallback(move |mut request: axum::extract::Request| {
         let booting = booting.clone();
         let boot_instance = boot_instance.clone();
+        let boot_name = boot_name.clone();
         async move {
+            if let Some(name) = boot_name.get() {
+                registry::take_name(name, &mut request);
+            }
             if let Some(router) = booting.read().await.clone() {
                 return router
                     .oneshot(request)
@@ -270,8 +253,12 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("tunnel_url has no host"))?
         .to_string();
-    let public_name = Arc::new(registry::claim(&db, &origin_host, keys.name()).await?);
-    tracing::info!("public name {public_name}");
+    let name = registry::claim(&db, &origin_host, keys.name()).await?;
+    tracing::info!("public name {name}");
+    // From here on every request is also served under `/name/…`, which is the
+    // address a client is given: it survives a rename and needs no hostname of
+    // its own.
+    let _ = public_name.set(name);
 
     d1log::start()?;
     d1log::info("engine started");
@@ -368,13 +355,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     mux = mux.layer(middleware::from_fn_with_state(
         client_auth.clone(),
         client_auth::client_guard,
-    ));
-    // Everything this engine serves is also reachable under its public name:
-    // `/work/api/...` is `/api/...`. That is the address a client is given, and
-    // it stays the same when the machine is renamed.
-    mux = mux.layer(middleware::from_fn_with_state(
-        public_name.clone(),
-        strip_public_name,
     ));
 
     // Publish the stable Named Tunnel URL only after cloudflared has registered

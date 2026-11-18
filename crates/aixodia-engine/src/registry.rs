@@ -88,6 +88,34 @@ pub fn strip_name<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
     }
 }
 
+/// Takes the public name off a request that carries it.
+///
+/// This is done before the router is asked, not as a layer on it: axum decides
+/// which route a request belongs to from the path it arrives with, so a layer
+/// that rewrites the path after that decision changes nothing. The engine is
+/// served through one fallback that holds the real router, and that is where
+/// the rewrite belongs.
+pub fn take_name(name: &str, request: &mut axum::extract::Request) {
+    let prefix = format!("/{name}");
+    let Some(rest) = strip_name(&prefix, request.uri().path()) else {
+        return;
+    };
+    let query = request
+        .uri()
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    let mut parts = request.uri().clone().into_parts();
+    let Ok(path_and_query) = format!("{rest}{query}").parse::<axum::http::uri::PathAndQuery>()
+    else {
+        return;
+    };
+    parts.path_and_query = Some(path_and_query);
+    if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+        *request.uri_mut() = uri;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +127,31 @@ mod tests {
         assert_eq!(strip_name("/work", "/worked/api"), None);
         assert_eq!(strip_name("/work", "/api/chat"), None);
         assert_eq!(strip_name("/work", "/work/"), Some("/"));
+    }
+
+    fn request(uri: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn the_name_is_gone_before_the_router_asks_which_route_it_is() {
+        let mut named = request("/work/api/chat?stream=1");
+        take_name("work", &mut named);
+        assert_eq!(named.uri().path(), "/api/chat");
+        assert_eq!(named.uri().query(), Some("stream=1"));
+    }
+
+    #[test]
+    fn a_router_without_the_name_is_left_alone() {
+        let mut plain = request("/api/chat");
+        take_name("work", &mut plain);
+        assert_eq!(plain.uri().path(), "/api/chat");
+
+        let mut similar = request("/worked/api");
+        take_name("work", &mut similar);
+        assert_eq!(similar.uri().path(), "/worked/api");
     }
 }
