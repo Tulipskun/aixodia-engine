@@ -391,6 +391,32 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 > ค่าที่ KV: `instances/m-8a7d1192/tunnel_url` = `https://m-8a7d1192.aixodia.dpdns.org` (origin, ไม่ใช่ที่อยู่สาธารณะ)
 > · tunnel ingress มีทั้ง `engine.` และ `m-8a7d1192.` → `localhost:8787` · DNS CNAME ทั้งสองชื่อ
 
+### ความเร็ว (วัดจากเครื่องนี้, 5 ครั้งต่อค่า)
+
+| path | ก่อน | หลัง |
+|---|---|---|
+| `engine.aixodia.dpdns.org/api/engines` | 0.25–0.52 s | **0.04–0.20 s** |
+| `engine.aixodia.dpdns.org/healthz` | 0.33–0.53 s | 0.17–0.21 s |
+| origin + service token (ข้าม Worker) | 0.25–0.31 s | 0.07–0.08 s |
+| engine local `/healthz` | 0.182 s | **0.0007 s** |
+
+ที่มาของความเร็วมาจากสามที่:
+
+1. **`/healthz` ไม่นอน 180 ms แล้ว** (`crates/aixodia-io/src/gateway.rs`) — เดิม `system_metrics()`
+   อ่าน `/proc/stat` สองรอบห่างกัน 180 ms เพื่อคิด CPU% ในrequest ตรง ๆ ⇒ ทุก health check
+   (tunnel, gateway probe, discovery ของแอพ) จ่าย 180 ms ฟรี ๆ · ตอนนี้มี task เบื้องหลัง sample
+   ทุก 1 วิ แล้ว request อ่านค่าล่าสุด (mem/uptime ยังอ่านไฟล์ตรง)
+2. **registry ตอบจาก stamp ไม่รอ probe** (`aixodia-workers/engine-gateway`) — คอลัมน์
+   `online_at`/`online_version` (migration `001_engine_online.sql`), ตอบแล้วค่อย probe ผ่าน
+   `ctx.waitUntil` (ขนาน, timeout 1 วิ, เขียนกลับด้วย `DB.batch` ครั้งเดียว), แถวจาก D1 cache 30 วิ
+   ต่อ isolate + stale-while-revalidate, `[placement] mode = "smart"`
+3. **probe ที่ล้มเหลวไม่เขียนทับ stamp** — เครื่องที่กำลัง compile หนักเคยถูกเขียนเป็น offline
+   ทั้งที่ยังอยู่ ⇒ เขียนเฉพาะผลที่ healthy แล้วให้ stamp เก่าหมดอายุเองใน 60 วิ
+
+ที่ยังเป็นพื้นของ topology นี้: Worker → origin มีสอง edge hop (Worker → hostname ของ origin →
+Access → tunnel) ⇒ ประมาณ +0.1 s เหนือการยิง origin ตรง ๆ ถ้าจะลดอีกต้องเอา Access ออกจาก
+origin hostname (แลกกับ defense-in-depth) — ยังไม่ทำ
+
 ### สถานะ / สิ่งที่ทำแล้ว
 
 1. **registry อยู่ใน D1 ไม่ใช่ KV แล้ว** — ตาราง `engines` (`id`, `name`, `url`, `origin_host`,
