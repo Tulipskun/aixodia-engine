@@ -253,12 +253,16 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("tunnel_url has no host"))?
         .to_string();
-    let name = registry::claim(&db, &origin_host, keys.name()).await?;
-    tracing::info!("public name {name}");
+    let claim = registry::claim(&db, &origin_host, keys.name()).await?;
+    tracing::info!("public name {} at {}", claim.name, claim.url);
     // From here on every request is also served under `/name/…`, which is the
     // address a client is given: it survives a rename and needs no hostname of
     // its own.
-    let _ = public_name.set(name);
+    let _ = public_name.set(claim.name);
+    // What the app is told. The tunnel's own hostname is only the Worker's way
+    // in, so announcing it would hand a client an address it may not use.
+    let daemon_url = Arc::new(claim.url);
+    let published_url = daemon_url.clone();
 
     d1log::start()?;
     d1log::info("engine started");
@@ -370,11 +374,14 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         tunnel_token,
         tunnel_url,
         Some(Arc::new(move |url: String| {
+            let published_url = published_url.clone();
             let db = publisher_db.clone();
             let keys = publisher_keys.clone();
             let hub = publisher_hub.clone();
             let noted = noted.clone();
             tokio::spawn(async move {
+                tracing::debug!("tunnel announced {url}");
+                let url = published_url.to_string();
                 let version = version_string();
                 match db
                     .config_kv_put_if_changed(&keys.key("daemon/url"), &url)

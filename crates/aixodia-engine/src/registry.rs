@@ -16,10 +16,21 @@ use serde_json::Value;
 /// How many numbered names to try before giving up.
 const ATTEMPTS: u32 = 64;
 
+/// What a client should call, and the name it should call it under.
+///
+/// `url` is the address the registry already publishes for this row. It is not
+/// derived from `origin_host`: an engine behind the gateway's front door answers
+/// on a hostname only the Worker may use, and a client handed that one would be
+/// stopped by the Access application in front of it.
+pub struct Claim {
+    pub name: String,
+    pub url: String,
+}
+
 /// The public name of this engine, claiming a row the first time it starts.
-pub async fn claim(db: &DbClient, origin_host: &str, desired: &str) -> anyhow::Result<String> {
-    if let Some(name) = owner(db, origin_host).await? {
-        return Ok(name);
+pub async fn claim(db: &DbClient, origin_host: &str, desired: &str) -> anyhow::Result<Claim> {
+    if let Some(claim) = owner(db, origin_host).await? {
+        return Ok(claim);
     }
 
     for attempt in 0..ATTEMPTS {
@@ -42,21 +53,29 @@ pub async fn claim(db: &DbClient, origin_host: &str, desired: &str) -> anyhow::R
             ],
         )
         .await?;
-        return Ok(candidate);
+        return Ok(Claim {
+            name: candidate.clone(),
+            url,
+        });
     }
 
     anyhow::bail!("no free engine name within {ATTEMPTS} tries for {desired}")
 }
 
-/// The name this machine already has, if any.
-async fn owner(db: &DbClient, origin_host: &str) -> anyhow::Result<Option<String>> {
+/// The name and address this machine already has, if any.
+async fn owner(db: &DbClient, origin_host: &str) -> anyhow::Result<Option<Claim>> {
     let rows = db
         .query(
-            "SELECT id FROM engines WHERE origin_host = ?1 LIMIT 1",
+            "SELECT id, url FROM engines WHERE origin_host = ?1 LIMIT 1",
             &[Value::from(origin_host)],
         )
         .await?;
-    Ok(rows.first().and_then(name_of))
+    Ok(rows.first().and_then(|row| {
+        Some(Claim {
+            name: name_of(row)?,
+            url: row.get("url")?.as_str()?.to_string(),
+        })
+    }))
 }
 
 async fn free(db: &DbClient, candidate: &str) -> anyhow::Result<bool> {
