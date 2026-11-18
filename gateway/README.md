@@ -46,14 +46,36 @@ The Worker fails closed: no origin credential, no answer.
 
 ## Deploy
 
+The namespace already exists and its id is in `wrangler.toml`; so does one KV entry
+(`m-8a7d1192`). A fresh account needs:
+
 ```bash
-npx wrangler kv namespace create ENGINE_ORIGINS
-# put the returned id in wrangler.toml
-npx wrangler secret put ACCESS_CLIENT_ID
-npx wrangler secret put ACCESS_CLIENT_SECRET
-npx wrangler deploy
-npx wrangler kv key put --binding=ENGINE_ORIGINS m-8a7d1192 m-8a7d1192.aixodia.dpdns.org
+npx wrangler kv namespace create ENGINE_ORIGINS   # then put the id in wrangler.toml
 ```
+
+The Worker needs a service token to reach an Access-protected origin. Its secret is
+shown once, when it is created, so keep a copy where the next session can find it:
+this Worker's own KV namespace (`ENGINE_ORIGINS`) holds `gateway/access_client_id`
+and `gateway/access_client_secret`, next to the Worker's `ACCESS_CLIENT_ID` /
+`ACCESS_CLIENT_SECRET` secrets. Nothing auth-related is written here, and this
+Worker reads nothing from the auth Worker's namespace.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $CF_TOKEN" -H 'content-type: application/json' \
+  -d '{"name":"aixodia-engine-gateway","duration":"87600h"}' \
+  "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/access/service_tokens"
+# client_id and client_secret above -> KV, then:
+printf '%s' "$CLIENT_ID"     | npx wrangler secret put ACCESS_CLIENT_ID
+printf '%s' "$CLIENT_SECRET" | npx wrangler secret put ACCESS_CLIENT_SECRET
+npx wrangler deploy
+npx wrangler kv key put --binding=ENGINE_ORIGINS --remote m-8a7d1192 m-8a7d1192.aixodia.dpdns.org
+```
+
+The token also has to be allowed by the origin's Access application: add a
+`non_identity` policy whose include is `service_token.token_id` = that token.
+
+`engines.aixodia.dpdns.org` needs a proxied DNS record (a CNAME to `aixodia.dpdns.org`
+is enough) or the route has no name to answer on.
 
 ## Provisioning a machine
 
@@ -64,6 +86,8 @@ returns it as `instance`. Nothing on the machine needs configuring.
 1. Create a remotely-managed Named Tunnel for the machine.
 2. Point its public hostname `<machine>.aixodia.dpdns.org` at
    `http://localhost:8787` — the engine's port is the same on every machine.
+   A machine that already runs a tunnel only needs one more ingress rule and a
+   proxied CNAME to the tunnel's `…cfargotunnel.com` target.
 3. Protect that hostname with the Access service-token policy.
 4. Write the KV entry: `ENGINE_ORIGINS <machine>` = `<machine>.aixodia.dpdns.org`.
 5. Write the engine's own two keys: `instances/<machine>/tunnel_token` (the
