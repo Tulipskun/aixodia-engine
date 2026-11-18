@@ -161,11 +161,12 @@ An operator who wants a readable name in the public URL sets `AIXODIA_INSTANCE`
 (lower-case letters, digits and single hyphens, at most 32 characters). It is an
 override, never a requirement.
 
-One hostname serves them all through `gateway/`: the Worker resolves
-`https://<host>/<machine>/…` to that machine's tunnel and strips the segment, so
-each engine keeps serving its usual paths. See
-[gateway/README.md](gateway/README.md) for the KV entries, the Access service
-token and the per-machine tunnel steps.
+One hostname serves them all through the `aixodia-engine-gateway` Worker, which
+lives with the other Workers in [Tulipskun/aixodia-workers](https://github.com/Tulipskun/aixodia-workers)
+(`engine-gateway/`): it resolves `https://<host>/<machine>/…` to that machine's
+tunnel and strips the segment, so each engine keeps serving its usual paths. See
+that repository's `engine-gateway/README.md` for the KV entries, the Access
+service token and the per-machine tunnel steps.
 
 `AIXODIA_STATE_DIR` optionally moves an engine's local state (pid, log database,
 schema version, terminal sockets, self-update state) out of `$HOME/.aixodia`; an

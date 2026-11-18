@@ -360,7 +360,9 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 | `/healthz` | เพิ่มฟิลด์ `instance` = ชื่อเครื่อง |
 | `AIXODIA_STATE_DIR` | มี แต่ **ไม่บังคับ** (ค่าเริ่มต้น `$HOME/.aixodia`) มาจาก crate ใหม่ `crates/aixodia-state` ที่ db/d1log/schema/selfupdate/terminal ใช้ร่วมกัน |
 
-**domain เดียว**: `gateway/` = Cloudflare Worker `aixodia-engine-gateway`
+**domain เดียว**: Worker `aixodia-engine-gateway` — โค้ดย้ายไปอยู่ **repo แยก** แล้ว:
+[Tulipskun/aixodia-workers](https://github.com/Tulipskun/aixodia-workers) → `engine-gateway/`
+(ใน engine repo ไม่มี `gateway/` แล้ว)
 `https://<host>/<machine>/api/…` → ตัด segment แรกออก → `<machine>.aixodia.dpdns.org/api/…`
 พร้อม Access service token, fail-closed (เหมือน `aixodia-mcp-gateway` ของ droidime)
 ตั้ง default route ไว้ที่ `engines.aixodia.dpdns.org/*` — **deploy แล้ว** (`2e0c5595…`)
@@ -368,7 +370,7 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 ### สถานะ / สิ่งที่ทำแล้ว
 
 1. KV namespace `ENGINE_ORIGINS` = `012725f44b8d4791a3f987e80f9ad843` (อยู่ใน
-   `gateway/wrangler.toml`), key `m-8a7d1192` → `m-8a7d1192.aixodia.dpdns.org`
+   `engine-gateway/wrangler.toml` ของ repo `aixodia-workers`), key `m-8a7d1192` → `m-8a7d1192.aixodia.dpdns.org`
 2. KV `AIXODIA_CONFIG` มีทั้ง `instances/m-8a7d1192/{tunnel_token,tunnel_url,daemon/url,daemon/version}`
    และ key เปล่าเดิม (engine `ce12b0b` อ่านแต่แบบใหม่)
 3. **service token** `aixodia-engine-gateway` (`bd03acdc-a3eb-44d1-a777-e91ce4f233a0`,
@@ -402,8 +404,8 @@ GET https://engine.aixodia.dpdns.org/healthz             200 (tunnel ไม่�
 
 ตรวจแล้ว: `cargo test` (instance 3, aixodia-state 3, db/terminal/selfupdate ของเดิม),
 launcher suite `bash aixodia_test.sh` ผ่านหมด (ไฟล์ `aixodia` / `aixodia_test.sh` **เหมือน commit
-`6d980ca` ทุกไบต์** — ไม่มีการแก้ launcher ในงานนี้), `gateway: npm test = 9 passed`,
-clippy `-D warnings` ผ่าน
+`6d980ca` ทุกไบต์** — ไม่มีการแก้ launcher ในงานนี้), `aixodia-workers: npm test`
+(auth 15, engine-gateway 9, mcp-gateway 5), clippy `-D warnings` ผ่าน
 
 ---
 
@@ -414,9 +416,14 @@ clippy `-D warnings` ผ่าน
 
 | Worker | โค้ดอยู่ที่ | route | KV | secret | ทำอะไร |
 |---|---|---|---|---|---|
-| `aixodia-auth` | `aixodia-web/workers/auth` | `aixodia-auth.aixodia.workers.dev` (Pages `/engine/auth/*` proxy ไป) | `CONFIG` = `AIXODIA_CONFIG` (`b9159aba…`) | — | sign-in / device code / session / token / Access JWT verify |
-| `aixodia-engine-gateway` | `aixodia-engine/gateway` | `engines.aixodia.dpdns.org/*` | `ENGINE_ORIGINS` (`012725f4…`) | `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | registry ของเครื่อง engine + proxy `<machine>/…` พร้อม service token |
-| `aixodia-mcp-gateway` | `droidime/gateway` | `mcp.aixodia.dpdns.org/*` | `DEVICE_TUNNELS` (`9c094dd9…`) | `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | registry ของ device ที่รัน MCP server + proxy `<device>/…` |
+| `aixodia-auth` | `auth/` | `aixodia-auth.aixodia.workers.dev` (Pages `/engine/auth/*` proxy ไป) | `CONFIG` = `AIXODIA_CONFIG` (`b9159aba…`) | — | sign-in / device code / session / token / Access JWT verify |
+| `aixodia-engine-gateway` | `engine-gateway/` | `engines.aixodia.dpdns.org/*` | `ENGINE_ORIGINS` (`012725f4…`) | `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | registry ของเครื่อง engine + proxy `<machine>/…` พร้อม service token |
+| `aixodia-mcp-gateway` | `mcp-gateway/` | `mcp.aixodia.dpdns.org/*` | `DEVICE_TUNNELS` (`9c094dd9…`) | `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | registry ของ device ที่รัน MCP server + proxy `<device>/…` |
+
+ทั้งสามตัวอยู่ใน repo เดียว: **`Tulipskun/aixodia-workers`** (แยกออกมาจาก
+`aixodia-web/workers/auth`, `aixodia-engine/gateway`, `droidime/gateway` — ย้ายพร้อม git history)
+แต่ละโฟลเดอร์มี `wrangler.toml` / `package.json` / `npm test` ของตัวเอง
+CI ของ repo นั้นรันทั้งสามตัว (matrix)
 
 งานที่แยกแล้วในรอบนี้:
 
