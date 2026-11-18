@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aixodia_provider::{Message, Registry};
@@ -528,9 +528,11 @@ impl Gateway {
 }
 
 async fn healthz(State(g): State<Arc<Gateway>>) -> Response {
-    // Sample CPU over a short interval instead of reporting a made-up or stale
-    // value. The endpoint is intentionally open for tunnel health checks; the
-    // extra fields contain host resource counters only, never secrets.
+    // The endpoint is open for tunnel health checks and is polled by the
+    // gateway, the app and this tunnel: the answer has to be immediate. CPU is
+    // therefore reported from a sample taken in the background — a fresh one
+    // would mean sleeping 180ms in the request, which is the whole latency of
+    // every health check anybody makes. Memory and uptime are file reads.
     let metrics = system_metrics().await;
     let idle = g.turns.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     write_json(
@@ -596,24 +598,48 @@ fn memory_bytes(contents: &str) -> Option<(u64, u64)> {
     Some((total.saturating_sub(available), total))
 }
 
-async fn system_metrics() -> SystemMetrics {
-    let mut metrics = SystemMetrics::default();
-
-    if let Ok(first) = tokio::fs::read_to_string("/proc/stat").await {
-        if let Some(before) = cpu_ticks(&first) {
-            tokio::time::sleep(Duration::from_millis(180)).await;
-            if let Ok(second) = tokio::fs::read_to_string("/proc/stat").await {
-                if let Some(after) = cpu_ticks(&second) {
-                    let total = after.0.saturating_sub(before.0);
-                    let idle = after.1.saturating_sub(before.1).min(total);
-                    if total > 0 {
-                        metrics.cpu_percent =
-                            Some(((total - idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0));
-                    }
+/// The CPU percentage of the last background sample, kept warm once per second.
+///
+/// The sample costs a 180ms wait (two reads of `/proc/stat`), which belongs in a
+/// task of its own, not in the request that asks for it. `None` until the first
+/// sample lands.
+fn cpu_percent() -> Option<f64> {
+    static SHARED: OnceLock<Arc<std::sync::RwLock<Option<f64>>>> = OnceLock::new();
+    let shared = SHARED.get_or_init(|| {
+        let shared = Arc::new(std::sync::RwLock::new(None));
+        let writer = shared.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(percent) = sample_cpu().await {
+                    *writer.write().unwrap_or_else(|e| e.into_inner()) = Some(percent);
                 }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        }
+        });
+        shared
+    });
+    *shared.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Reads `/proc/stat` twice, 180ms apart, so the percentage is measured rather
+/// than guessed.
+async fn sample_cpu() -> Option<f64> {
+    let before = cpu_ticks(&tokio::fs::read_to_string("/proc/stat").await.ok()?)?;
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    let after = cpu_ticks(&tokio::fs::read_to_string("/proc/stat").await.ok()?)?;
+    let total = after.0.saturating_sub(before.0);
+    let idle = after.1.saturating_sub(before.1).min(total);
+    if total == 0 {
+        return None;
     }
+    Some(((total - idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+}
+
+async fn system_metrics() -> SystemMetrics {
+    let mut metrics = SystemMetrics {
+        cpu_percent: cpu_percent(),
+        ..SystemMetrics::default()
+    };
 
     if let Ok(memory) = tokio::fs::read_to_string("/proc/meminfo").await {
         if let Some((used, total)) = memory_bytes(&memory) {
