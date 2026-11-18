@@ -609,13 +609,16 @@ fn io_bytes(contents: &str) -> Option<(u64, u64)> {
     Some((read?, write?))
 }
 
+/// Read and write throughput of this process, in bytes per second.
+type IoRate = (Option<f64>, Option<f64>);
+
 /// The I/O throughput of the last background sample, kept warm once per second.
 ///
 /// `/proc/self/io` is cumulative, so a rate needs two reads a second apart. That
 /// wait belongs in a task of its own for the same reason the CPU sample does: a
 /// health check must not sleep.
-fn io_rate() -> (Option<f64>, Option<f64>) {
-    static SHARED: OnceLock<Arc<std::sync::RwLock<(Option<f64>, Option<f64>)>>> = OnceLock::new();
+fn io_rate() -> IoRate {
+    static SHARED: OnceLock<Arc<std::sync::RwLock<IoRate>>> = OnceLock::new();
     let shared = SHARED.get_or_init(|| {
         let shared = Arc::new(std::sync::RwLock::new((None, None)));
         let writer = shared.clone();
@@ -632,7 +635,7 @@ fn io_rate() -> (Option<f64>, Option<f64>) {
     *shared.read().unwrap_or_else(|e| e.into_inner())
 }
 
-async fn sample_io() -> Option<(Option<f64>, Option<f64>)> {
+async fn sample_io() -> Option<IoRate> {
     let before = io_bytes(&tokio::fs::read_to_string("/proc/self/io").await.ok()?)?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let after = io_bytes(&tokio::fs::read_to_string("/proc/self/io").await.ok()?)?;
