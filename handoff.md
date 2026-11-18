@@ -364,20 +364,31 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 [Tulipskun/aixodia-workers](https://github.com/Tulipskun/aixodia-workers) → `engine-gateway/`
 (ใน engine repo ไม่มี `gateway/` แล้ว)
 
-> **ไม่มี hostname `engines.aixodia.dpdns.org` แล้ว** (DNS record ถูกลบ, route เปลี่ยน):
-> registry ตอบที่ `https://engine.aixodia.dpdns.org/api/engines` — ใช้ Access bypass ของ `/api/*`
-> ที่มีอยู่แล้ว · ส่วน proxy `<machine>/…` ยังอยู่ในโค้ดและมีเทสต์ แต่ **ยังไม่ผูก route**
-> (มีเครื่องเดียว = ยังไม่ต้องใช้) ถ้ามีเครื่องที่สองค่อยเพิ่ม route + แถวใน D1
-`https://<host>/<machine>/api/…` → ตัด segment แรกออก → `<machine>.aixodia.dpdns.org/api/…`
-พร้อม Access service token, fail-closed (เหมือน `aixodia-mcp-gateway` ของ droidime)
-route ที่ผูกอยู่ตอนนี้: `engine.aixodia.dpdns.org/api/engines*` — **deploy แล้ว** (`8f4569a2…`)
+> **ที่อยู่ของ engine คือ path ไม่ใช่ hostname**: `https://engine.aixodia.dpdns.org/<name>/…`
+> (รูปเดียวกับ droidime: `mcp.aixodia.dpdns.org/<device>/…`) — ไม่มี DNS record, ไม่มี Access app
+> และไม่มี ingress ต่อเครื่องอีกแล้ว
+>
+> ชื่อ (`<name>`) เป็นของ **registry** ไม่ใช่ของเครื่อง: engine ขอจองแถวในตาราง `engines` ตอนบูต
+> (`crates/aixodia-engine/src/registry.rs`), หาแถวเดิมด้วย `origin_host` (= host ของ tunnel ที่เครื่องนี้
+> ตอบ) ไม่ใช่ด้วยชื่อ → restart ไม่สร้างชื่อใหม่ และเปลี่ยนชื่อเครื่องแล้วแถวเดิมยังเป็นของมัน
+> ชื่อที่ชนกันได้ `name-1`, `name-2`, … (สูงสุด 64 ครั้ง)
+>
+> engine ตัด `/<name>` ออกให้เอง **ก่อน** router เลือก route (จุดเดียวใน `main.rs` ที่เสิร์ฟ
+> `SharedRoutes`) เพราะ `Router::layer` ตัดสิน route ไปแล้วก่อน middleware จะได้แก้ path
+> → `/m-8a7d1192/healthz` = `/healthz` และ `/worked/...` ไม่ถูกตัด
+>
+> Worker `aixodia-engine-gateway` (repo `aixodia-workers`, `engine-gateway/`) ยังรับงานสองอย่าง:
+> `GET /api/engines` (route `engine.aixodia.dpdns.org/api/engines*`, อ่าน D1) และ proxy
+> `<name>/…` ไปยัง origin ของเครื่องนั้นด้วย service token (fail-closed) — proxy ยัง **ไม่ผูก route**
+> เพราะมีเครื่องเดียว ถ้ามีเครื่องที่สองค่อยเพิ่ม route `engine.aixodia.dpdns.org/*` + ingress/CNAME
+> ของเครื่องนั้น
 
 ### สถานะ / สิ่งที่ทำแล้ว
 
 1. **registry อยู่ใน D1 ไม่ใช่ KV แล้ว** — ตาราง `engines` (`id`, `name`, `url`, `origin_host`,
    `subtitle`, `tag`) ในฐาน `aixodia`, schema อยู่ที่ `aixodia-workers/schema.sql`
-   แถวของเครื่องนี้: `m-8a7d1192` → url `https://engine.aixodia.dpdns.org`,
-   origin `m-8a7d1192.aixodia.dpdns.org`. KV namespace `ENGINE_ORIGINS` **ถูกลบแล้ว**
+   แถวของเครื่องนี้: `m-8a7d1192` → url `https://engine.aixodia.dpdns.org/m-8a7d1192`,
+   origin `engine.aixodia.dpdns.org`. KV namespace `ENGINE_ORIGINS` **ถูกลบแล้ว**
 2. KV `AIXODIA_CONFIG` มีทั้ง `instances/m-8a7d1192/{tunnel_token,tunnel_url,daemon/url,daemon/version}`
    และ key เปล่าเดิม (engine `ce12b0b` อ่านแต่แบบใหม่)
 3. **service token** `aixodia-engine-gateway` (`bd03acdc-a3eb-44d1-a777-e91ce4f233a0`,
@@ -386,28 +397,33 @@ route ที่ผูกอยู่ตอนนี้: `engine.aixodia.dpdns.or
    ตัวจริงของ Worker อยู่ที่ secret binding `ACCESS_CLIENT_ID`/`ACCESS_CLIENT_SECRET`
 4. Access app `AIxodia engine` (`5fc51df9…`) มี policy เพิ่ม `AIxodia engine gateway (service)`
    (`7ae7036e…`, `non_identity` + `service_token`) — policy เดิมแบบ email allow ยังอยู่
-5. DNS: `m-8a7d1192.aixodia.dpdns.org` (CNAME → `a7c29f86-….cfargotunnel.com`, proxied) —
-   CNAME ของ `engines.` ถูกลบแล้ว, registry อยู่ที่ `engine.aixodia.dpdns.org/api/engines`
-6. tunnel `aixodia` ingress: `engine.` → `localhost:8787`, `alpha-ssh.` → `ssh://localhost:22`,
-   `m-8a7d1192.` → `http://localhost:8787`, ปิดท้าย `http_status:404`
+5. **DNS/ingress ต่อเครื่องถูกลบหมด**: `m-8a7d1192.aixodia.dpdns.org` (record + ingress) ไม่มีแล้ว,
+   `engines.` ก็ไม่มี · tunnel `aixodia` เหลือ ingress `engine.` → `localhost:8787`,
+   `alpha-ssh.` → `ssh://localhost:22`, ปิดท้าย `http_status:404`
+6. Access bypass ของ path ที่มีชื่อ ต้องมี **ต่อชื่อ** (Access ไม่รองรับ wildcard กลาง path):
+   `engine.aixodia.dpdns.org/m-8a7d1192/api` (`510f0d35…`) และ `…/healthz` (`c3c3ab93…`)
+   ไม่งั้น console (`/engine/by/<id>/…` ของ Pages function) จะโดน 302 login แทนที่จะถึง engine
 
 ยืนยันแล้ว:
 ```
-GET https://m-8a7d1192.aixodia.dpdns.org/healthz          200  instance=m-8a7d1192
-GET https://engine.aixodia.dpdns.org/api/sessions        401 (engine ตอบเอง ไม่โดน Worker บัง)
-GET gateway proxy (ยังไม่ผูก route)                      ทดสอบใน `npm test` ของ repo workers
-GET https://engine.aixodia.dpdns.org/api/engines         {"engines":[{"id":"m-8a7d1192",…}]}  (จาก D1)
-GET …/m-8a7d1192/api/sessions                            401 (เหมือนยิงตรง)
-GET https://engine.aixodia.dpdns.org/healthz             200 (tunnel ไม่พัง)
+GET https://engine.aixodia.dpdns.org/m-8a7d1192/healthz        200  instance=m-8a7d1192
+GET https://engine.aixodia.dpdns.org/m-8a7d1192/api/sessions   401 (engine ตอบเอง ไม่ใช่ 404)
+GET https://engine.aixodia.dpdns.org/api/sessions              401 (path เดิมยังใช้ได้)
+GET https://engine.aixodia.dpdns.org/healthz                   200 (path เดิมยังใช้ได้)
+GET https://engine.aixodia.dpdns.org/api/engines               {"engines":[{"id":"m-8a7d1192",…}]}  (จาก D1)
+GET https://aixodia.dpdns.org/engine/api/sessions              401 JSON ของ engine (ไม่ใช่ 302)
+GET https://m-8a7d1192.aixodia.dpdns.org/healthz               000 (hostname ถูกลบแล้ว)
 ```
 
 ### สิ่งที่ยังค้าง
 
 1. ~~`engines.aixodia.dpdns.org` ไม่มี Access app~~ — ไม่มี hostname นั้นแล้ว registry อยู่ใต้ `/api/*`
    ของ `engine.` ซึ่งมี bypass app อยู่แล้ว
-2. **เครื่องอื่น** ยังไม่ได้ provision — ต่อเครื่อง: tunnel ingress + CNAME + `INSERT` แถวใน `engines`
-   + `instances/<machine>/{tunnel_token,tunnel_url}` ใน KV `AIXODIA_CONFIG`
-3. เพิ่มเครื่องใหม่ = `INSERT` แถวเดียว ไม่ต้อง deploy Worker (gateway อ่านตารางทุก request)
+2. **เครื่องอื่น** ยังไม่ได้ provision — ต่อเครื่อง: tunnel ingress + CNAME ของเครื่องนั้น
+   (ชื่ออะไรก็ได้) + `instances/<machine>/{tunnel_token,tunnel_url}` ใน KV `AIXODIA_CONFIG`
+   แล้วเครื่องจะจองแถว `engines` เองตอนบูต (ไม่ต้อง INSERT มือ)
+3. ยังไม่มี Access bypass สำหรับ path ที่มีชื่อของเครื่องในอนาคต — ตอน provision เพิ่ม 2 app ต่อชื่อ
+   (`…/<name>/api`, `…/<name>/healthz`) แล้วก็ผูก route `engine.aixodia.dpdns.org/*` ให้ gateway proxy
 
 ตรวจแล้ว: `cargo test` (instance 3, aixodia-state 3, db/terminal/selfupdate ของเดิม),
 launcher suite `bash aixodia_test.sh` ผ่านหมด (ไฟล์ `aixodia` / `aixodia_test.sh` **เหมือน commit
