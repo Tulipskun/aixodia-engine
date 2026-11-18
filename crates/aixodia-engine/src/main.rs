@@ -264,7 +264,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     tokio::spawn(registry::heartbeat(
         db.clone(),
         claim.name,
-        version_string(),
+        aixodia_io::gateway::VERSION.to_string(),
         cancel.clone(),
     ));
     // What the app is told. The tunnel's own hostname is only the Worker's way
