@@ -48,7 +48,7 @@
 | WM | ✅ `_NET_SUPPORTING_WM_CHECK` + เคารพ `WM_NORMAL_HINTS` |
 | Chat / sign-in / screen / undo | ทำงาน (undo ยังไม่เคยทดสอบกับ D1 จริง) |
 | Build/เทสต์บนเครื่องนี้ | ✅ rust 1.99.1, `cargo test --workspace -j 2` = 363 passed, clippy `-D warnings` ผ่าน |
-| Release ที่ deploy อยู่ | ✅ `40d4867` (CI + Release engine success, `aixodia update` swap แล้ว pid เดิม) |
+| Release ที่ deploy อยู่ | ✅ `ce12b0b` (`v1.177`, pid 70943, `update: signal:USR1`, `/healthz` คืน `instance: m-8a7d1192`) |
 
 ---
 
@@ -363,20 +363,27 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 **domain เดียว**: `gateway/` = Cloudflare Worker `aixodia-engine-gateway`
 `https://<host>/<machine>/api/…` → ตัด segment แรกออก → `<machine>.aixodia.dpdns.org/api/…`
 พร้อม Access service token, fail-closed (เหมือน `aixodia-mcp-gateway` ของ droidime)
-ตั้ง default route ไว้ที่ `engines.aixodia.dpdns.org/*` — **ยังไม่ deploy**
+ตั้ง default route ไว้ที่ `engines.aixodia.dpdns.org/*` — **Worker ยังไม่ deploy**
 
-### สถานะ / สิ่งที่ต้องทำต่อ
+### สถานะ / สิ่งที่ต้องทำต่อ (ตรวจเมื่อ `ce12b0b`)
 
-1. deploy gateway: `npx wrangler kv namespace create ENGINE_ORIGINS` → ใส่ id ใน `gateway/wrangler.toml`
-   → `wrangler secret put ACCESS_CLIENT_ID` / `ACCESS_CLIENT_SECRET` (ค่า secret ของ Worker เดิม
-   **อ่านกลับไม่ได้**) → `wrangler deploy`
-2. provision ต่อเครื่อง: tunnel ของเครื่องนั้น + CNAME `<machine>.aixodia.dpdns.org` →
-   `http://localhost:8787` + Access service-token policy + KV `ENGINE_ORIGINS <machine>` =
-   `<machine>.aixodia.dpdns.org` + `instances/<machine>/tunnel_token` และ `…/tunnel_url`
-3. **เครื่องนี้ (`instabox-alpha`) ยังใช้ key เปล่า** — ชื่อเครื่องคือ `m-8a7d1192`
-   ถ้าจะย้ายมาใช้รูปแบบใหม่ต้อง copy ค่า `tunnel_token`/`tunnel_url` (และ `daemon/*`) ไปไว้ใต้
-   `instances/m-8a7d1192/` **ก่อน** update engine ไม่งั้น engine จะฟ้อง
-   `Workers KV key instances/m-8a7d1192/tunnel_token is missing or empty`
+1. ~~KV namespace~~ **ทำแล้ว** — `ENGINE_ORIGINS` = `012725f44b8d4791a3f987e80f9ad843`
+   อยู่ใน `gateway/wrangler.toml` และมี key `m-8a7d1192` → `m-8a7d1192.aixodia.dpdns.org`
+   (`npm test` = 9 passed)
+2. ~~เครื่องนี้ยังใช้ key เปล่า~~ **ทำแล้ว** — KV `AIXODIA_CONFIG` มีทั้ง `instances/m-8a7d1192/{tunnel_token,
+   tunnel_url,daemon/url,daemon/version}` และ key เปล่าเดิม (engine `ce12b0b` อ่านแต่แบบใหม่)
+3. **ยังค้าง: deploy Worker** — ต้องมี `ACCESS_CLIENT_ID` / `ACCESS_CLIENT_SECRET`
+   service token ของ Access ซึ่ง **secret ของ token เดิมอ่านกลับไม่ได้** (มี token อยู่ 2 ตัว:
+   `aixodia`, `aixodia-mcp-gateway-origin`) → ต้องสร้าง token ใหม่ (`aixodia-engine-gateway`)
+   แล้วเอาไปใส่ใน policy ของ Access app `AIxodia engine` (`5fc51df9…`; ตอนนี้มีแต่ policy
+   email allow ไม่มี service-token rule) จากนั้น `wrangler secret put` ทั้งสองค่า + `wrangler deploy`
+4. **ยังค้าง: origin ต่อเครื่อง** — ยังไม่มี DNS `m-8a7d1192.aixodia.dpdns.org` และ ingress ของ
+   tunnel `aixodia` (`a7c29f86…`) มีแค่ `engine.` + `alpha-ssh.` → ต้องเพิ่ม ingress
+   `m-8a7d1192.aixodia.dpdns.org → http://localhost:8787` + CNAME ไปที่
+   `a7c29f86-045e-4f18-a6ff-13fc487287d0.cfargotunnel.com`
+
+> ⚠️ ข้อ 3–4 แตะ production ของ `engine.aixodia.dpdns.org` (Access app เดียวกัน + tunnel เดียวกัน)
+> — ต้องได้รับอนุญาตก่อนทำ
 
 ตรวจแล้ว: `cargo test` (instance 3, aixodia-state 3, db/terminal/selfupdate ของเดิม),
 launcher suite `bash aixodia_test.sh` ผ่านหมด (ไฟล์ `aixodia` / `aixodia_test.sh` **เหมือน commit
@@ -396,6 +403,8 @@ clippy `-D warnings` ผ่าน
 
 engine:
 ```
+ce12b0b  Report the machine name from /healthz after the routes are up
+e5032ff  Name each machine, not each process, so engines can share one domain
 9a15204  Test the launcher's half of running several engines
 acfab3d  Let one host run several engines, and give them one public address
 6d980ca  Docs: point the handoff at the folders the repos actually live in
