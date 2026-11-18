@@ -13,6 +13,7 @@ mod d1log;
 mod devices;
 mod handover;
 mod instance;
+mod registry;
 mod tunnel;
 
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -100,6 +101,31 @@ async fn async_main() {
 
     cancel.cancelled().await;
     d1log::info("engine stopped");
+}
+
+/// Serves `<public name>/…` as if the name were not there.
+async fn strip_public_name(
+    State(prefix): State<Arc<String>>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if let Some(rest) = registry::strip_name(&prefix, request.uri().path()) {
+        let query = request
+            .uri()
+            .query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default();
+        let mut parts = request.uri().clone().into_parts();
+        if let Ok(path_and_query) =
+            format!("{rest}{query}").parse::<axum::http::uri::PathAndQuery>()
+        {
+            parts.path_and_query = Some(path_and_query);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *request.uri_mut() = uri;
+            }
+        }
+    }
+    next.run(request).await
 }
 
 async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
@@ -237,6 +263,16 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         );
     }
 
+    // The public name this engine answers under: `https://<tunnel host>/<name>/…`.
+    // It is claimed in the shared `engines` table, so a second machine with the
+    // same desired name gets `-1` rather than a second row with one id.
+    let origin_host = parsed_tunnel_url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("tunnel_url has no host"))?
+        .to_string();
+    let public_name = Arc::new(registry::claim(&db, &origin_host, keys.name()).await?);
+    tracing::info!("public name {public_name}");
+
     d1log::start()?;
     d1log::info("engine started");
     tracing::info!("engine started");
@@ -332,6 +368,13 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     mux = mux.layer(middleware::from_fn_with_state(
         client_auth.clone(),
         client_auth::client_guard,
+    ));
+    // Everything this engine serves is also reachable under its public name:
+    // `/work/api/...` is `/api/...`. That is the address a client is given, and
+    // it stays the same when the machine is renamed.
+    mux = mux.layer(middleware::from_fn_with_state(
+        public_name.clone(),
+        strip_public_name,
     ));
 
     // Publish the stable Named Tunnel URL only after cloudflared has registered
