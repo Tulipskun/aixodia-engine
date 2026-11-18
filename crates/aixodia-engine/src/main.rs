@@ -258,7 +258,15 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // From here on every request is also served under `/name/…`, which is the
     // address a client is given: it survives a rename and needs no hostname of
     // its own.
-    let _ = public_name.set(claim.name);
+    let _ = public_name.set(claim.name.clone());
+    // From this moment the registry knows this engine is alive, and keeps
+    // knowing for as long as the task runs.
+    tokio::spawn(registry::heartbeat(
+        db.clone(),
+        claim.name,
+        version_string(),
+        cancel.clone(),
+    ));
     // What the app is told. The tunnel's own hostname is only the Worker's way
     // in, so announcing it would hand a client an address it may not use.
     let daemon_url = Arc::new(claim.url);

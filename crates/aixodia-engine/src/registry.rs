@@ -10,11 +10,18 @@
 //! answers on — and never by the name, so renaming the machine keeps the row it
 //! already owns.
 
+use std::time::Duration;
+
 use aixodia_db::{Client as DbClient, Row};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 /// How many numbered names to try before giving up.
 const ATTEMPTS: u32 = 64;
+
+/// How often this engine says it is alive. The gateway's lease is three beats,
+/// so two lost writes in a row are still not a death.
+const BEAT: Duration = Duration::from_secs(20);
 
 /// What a client should call, and the name it should call it under.
 ///
@@ -60,6 +67,37 @@ pub async fn claim(db: &DbClient, origin_host: &str, desired: &str) -> anyhow::R
     }
 
     anyhow::bail!("no free engine name within {ATTEMPTS} tries for {desired}")
+}
+
+/// Keeps this engine's lease alive in the `engines` table.
+///
+/// Liveness is the engine's own statement, written where every gateway and
+/// client reads it — the standard TTL-lease shape. The alternative, a prober
+/// asking `/healthz` on the way to an answer, measures the prober's reach rather
+/// than this process, needs a timer to stay fresh when nobody asks, and puts a
+/// round trip through the tunnel in front of every list.
+///
+/// The first beat is immediate, so an engine that has just claimed its name is
+/// online before the task loops.
+pub async fn heartbeat(db: DbClient, id: String, version: String, cancel: CancellationToken) {
+    loop {
+        match db
+            .query(
+                "UPDATE engines SET heartbeat_at = unixepoch(), version = ?1 WHERE id = ?2",
+                &[Value::from(version.as_str()), Value::from(id.as_str())],
+            )
+            .await
+        {
+            Ok(_) => tracing::debug!("heartbeat: {id} at {version}"),
+            // A missed beat is not fatal: the lease is three beats long and the
+            // next one comes in twenty seconds.
+            Err(err) => tracing::warn!("heartbeat: {err}"),
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(BEAT) => {}
+        }
+    }
 }
 
 /// The name and address this machine already has, if any.
