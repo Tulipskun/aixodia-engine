@@ -364,23 +364,32 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
 [Tulipskun/aixodia-workers](https://github.com/Tulipskun/aixodia-workers) → `engine-gateway/`
 (ใน engine repo ไม่มี `gateway/` แล้ว)
 
-> **ที่อยู่ของ engine คือ path ไม่ใช่ hostname**: `https://engine.aixodia.dpdns.org/<name>/…`
-> (รูปเดียวกับ droidime: `mcp.aixodia.dpdns.org/<device>/…`) — ไม่มี DNS record, ไม่มี Access app
-> และไม่มี ingress ต่อเครื่องอีกแล้ว
+> **ที่อยู่เดียวที่ client ใช้คือ `https://engine.aixodia.dpdns.org`** — Worker `aixodia-engine-gateway`
+> เป็นเจ้าของ hostname นี้ทั้งอัน (route `engine.aixodia.dpdns.org/*`, repo `aixodia-workers`)
 >
-> ชื่อ (`<name>`) เป็นของ **registry** ไม่ใช่ของเครื่อง: engine ขอจองแถวในตาราง `engines` ตอนบูต
-> (`crates/aixodia-engine/src/registry.rs`), หาแถวเดิมด้วย `origin_host` (= host ของ tunnel ที่เครื่องนี้
-> ตอบ) ไม่ใช่ด้วยชื่อ → restart ไม่สร้างชื่อใหม่ และเปลี่ยนชื่อเครื่องแล้วแถวเดิมยังเป็นของมัน
-> ชื่อที่ชนกันได้ `name-1`, `name-2`, … (สูงสุด 64 ครั้ง)
+> | request ที่ถึง Worker | เกิดอะไร |
+> |---|---|
+> | `GET /api/engines` | registry จาก D1 + `online`/`version` ของแต่ละเครื่อง (ยิง `/healthz` ขนาน 2 วิ timeout) |
+> | `/<name>/…` ที่ `<name>` เป็น engine | forward ไป `origin_host` ของเครื่องนั้น **path เดิมไม่ตัด** |
+> | อย่างอื่น (`/healthz`, `/api/…`) | forward ไปเครื่องแรก (client ที่รู้แค่ hostname ยังใช้ได้) |
 >
-> engine ตัด `/<name>` ออกให้เอง **ก่อน** router เลือก route (จุดเดียวใน `main.rs` ที่เสิร์ฟ
-> `SharedRoutes`) เพราะ `Router::layer` ตัดสิน route ไปแล้วก่อน middleware จะได้แก้ path
-> → `/m-8a7d1192/healthz` = `/healthz` และ `/worked/...` ไม่ถูกตัด
+> engine ตัด `/<name>` ออกเองก่อน router (`main.rs` จุดที่เสิร์ฟ `SharedRoutes`) — Worker ไม่ตัดซ้ำ
+> จะได้มี rewrite ที่เดียว · `Router::layer` ใช้ไม่ได้เพราะ axum เลือก route ไปก่อน middleware
 >
-> Worker `aixodia-engine-gateway` (repo `aixodia-workers`, `engine-gateway/`) เหลืองานเดียว:
-> `GET /api/engines` (route `engine.aixodia.dpdns.org/api/engines*`, อ่าน D1) — **ไม่มี proxy แล้ว**
-> เพราะแต่ละเครื่องมี tunnel ของตัวเองและเสิร์ฟชื่อของตัวเองได้เอง (proxy + service token + route
-> `/*` ถูกลบทั้งหมด: ไม่มีโค้ดที่ไม่มีใครเรียก)
+> **origin hostname ไม่เปิดให้ใคร**: `m-8a7d1192.aixodia.dpdns.org` มี Access app
+> `AIxodia engine origin (worker only)` (`6f700e27…`) policy เดียวคือ service token
+> (`non_identity`, token `aixodia-engine-gateway-origin` `4328a48c…`) → ยิงตรงโดยไม่ใส่ token ได้ 403
+> Worker ใส่ token นี้ให้เองทั้งตอน probe และตอน forward (`ACCESS_CLIENT_ID`/`ACCESS_CLIENT_SECRET`)
+>
+> engine ไม่ได้ประกาศ URL ของ tunnel แล้ว: `daemon/url` = `url` ของแถวตัวเองใน registry
+> (ที่อยู่สาธารณะ) ไม่ใช่ hostname ที่ cloudflared dial — ไม่งั้นแอพจะได้ที่อยู่ที่ Access บล็อก
+>
+> **ชื่อ (`<name>`) เป็นของ registry**: engine จองแถวในตาราง `engines` ตอนบูต
+> (`crates/aixodia-engine/src/registry.rs`) หาแถวเดิมด้วย `origin_host` (host ของ `tunnel_url` ใน KV)
+> ไม่ใช่ด้วยชื่อ → restart ไม่สร้างชื่อใหม่, ชื่อชนกันได้ `-1`, `-2`
+>
+> ค่าที่ KV: `instances/m-8a7d1192/tunnel_url` = `https://m-8a7d1192.aixodia.dpdns.org` (origin, ไม่ใช่ที่อยู่สาธารณะ)
+> · tunnel ingress มีทั้ง `engine.` และ `m-8a7d1192.` → `localhost:8787` · DNS CNAME ทั้งสองชื่อ
 
 ### สถานะ / สิ่งที่ทำแล้ว
 
@@ -395,22 +404,22 @@ Workers KV namespace `AIXODIA_CONFIG` → เครื่องที่สอ�
    `system_state` key `gateway/access_client_*` ลบแล้ว: ไม่มีอะไร forward ไป origin อีก
 4. Access app `AIxodia engine` (`5fc51df9…`) เหลือ policy เดียว `Owner only allow` (`2598f19…`)
    — policy `non_identity` ของ service token (`7ae7036e…`) ถูกลบไปพร้อม token
-5. **DNS/ingress ต่อเครื่องถูกลบหมด**: `m-8a7d1192.aixodia.dpdns.org` (record + ingress) ไม่มีแล้ว,
-   `engines.` ก็ไม่มี · tunnel `aixodia` เหลือ ingress `engine.` → `localhost:8787`,
-   `alpha-ssh.` → `ssh://localhost:22`, ปิดท้าย `http_status:404`
+5. **DNS/ingress**: `engine.aixodia.dpdns.org` (Worker) + `m-8a7d1192.aixodia.dpdns.org`
+   (CNAME → tunnel, origin ของ Worker) · tunnel `aixodia` ingress: `engine.`, `m-8a7d1192.`
+   → `localhost:8787`, `alpha-ssh.` → `ssh://localhost:22`, ปิดท้าย `http_status:404`
 6. Access bypass ของ path ที่มีชื่อ ต้องมี **ต่อชื่อ** (Access ไม่รองรับ wildcard กลาง path):
    `engine.aixodia.dpdns.org/m-8a7d1192/api` (`510f0d35…`) และ `…/healthz` (`c3c3ab93…`)
-   ไม่งั้น console (`/engine/by/<id>/…` ของ Pages function) จะโดน 302 login แทนที่จะถึง engine
+   ไม่งั้นคำขอไปโดน 302 login ก่อนถึง Worker
 
 ยืนยันแล้ว:
 ```
-GET https://engine.aixodia.dpdns.org/m-8a7d1192/healthz        200  instance=m-8a7d1192
-GET https://engine.aixodia.dpdns.org/m-8a7d1192/api/sessions   401 (engine ตอบเอง ไม่ใช่ 404)
-GET https://engine.aixodia.dpdns.org/api/sessions              401 (path เดิมยังใช้ได้)
-GET https://engine.aixodia.dpdns.org/healthz                   200 (path เดิมยังใช้ได้)
-GET https://engine.aixodia.dpdns.org/api/engines               {"engines":[{"id":"m-8a7d1192",…}]}  (จาก D1)
-GET https://aixodia.dpdns.org/engine/api/sessions              401 JSON ของ engine (ไม่ใช่ 302)
-GET https://m-8a7d1192.aixodia.dpdns.org/healthz               000 (hostname ถูกลบแล้ว)
+GET https://engine.aixodia.dpdns.org/api/engines    200 {"engines":[{"id":"m-8a7d1192",…,"online":true,"version":"v1.177"}]}
+GET https://engine.aixodia.dpdns.org/healthz        200 (Worker → origin → engine)
+GET https://engine.aixodia.dpdns.org/api/sessions   401 (engine ตอบเอง)
+GET https://engine.aixodia.dpdns.org/m-8a7d1192/healthz      200 (forward path เดิม, engine ตัดชื่อเอง)
+GET https://engine.aixodia.dpdns.org/m-8a7d1192/api/sessions 401
+GET https://m-8a7d1192.aixodia.dpdns.org/healthz    403 (Access: เฉพาะ service token ของ Worker)
+GET https://aixodia.dpdns.org/engine/api/sessions   401 JSON ของ engine (ไม่ใช่ 302)
 ```
 
 ### สิ่งที่ยังค้าง
