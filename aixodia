@@ -393,7 +393,6 @@ usage: aixodia <command>
                  engine log file when the engine is not answering
   stop           send SIGTERM to the running engine and clear the pid file
   update         update the running engine in place, or install when stopped
-  auth login     sign in this CLI (also: auth status, auth token, auth logout)
   autostart on   remember CF_TOKEN and start the engine whenever a shell opens
   autostart off  forget it and remove that hook
   autostart      report whether the hook is installed
@@ -410,7 +409,6 @@ case "${1:-start}" in
   logs) cmd_logs "${2:-40}" ;;
   stop) cmd_stop ;;
   update) cmd_update ;;
-  auth) exec "$(engine_path)" auth "${@:2}" ;;
   autostart) cmd_autostart "${2:-}" ;;
   serve) cmd_serve ;;
   help|-h|--help) usage ;;

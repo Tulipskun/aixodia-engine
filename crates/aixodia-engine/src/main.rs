@@ -5,7 +5,6 @@
 //! `127.0.0.1:8787`, put a Cloudflare Named Tunnel in front, and publish its
 //! stable endpoint through Workers KV.
 
-mod auth_cli;
 mod auth_gate;
 mod client_auth;
 mod d1log;
@@ -66,13 +65,6 @@ async fn async_main() {
 
     if std::env::args().nth(1).as_deref() == Some("update") {
         std::process::exit(update_once().await);
-    }
-
-    // The CLI's sign-in runs before the engine starts: no CF_TOKEN, no D1 and
-    // no listener are needed to obtain a token from the auth Worker.
-    if std::env::args().nth(1).as_deref() == Some("auth") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        std::process::exit(auth_cli::run(&args).await);
     }
 
     // The shell holder: the engine starts this binary again to own a terminal's
