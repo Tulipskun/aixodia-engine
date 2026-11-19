@@ -5,8 +5,7 @@
 //! `127.0.0.1:8787`, put a Cloudflare Named Tunnel in front, and publish its
 //! stable endpoint through Workers KV.
 
-#[allow(dead_code)]
-mod auth_exchange;
+mod auth_cli;
 mod auth_gate;
 mod client_auth;
 mod d1log;
@@ -67,6 +66,13 @@ async fn async_main() {
 
     if std::env::args().nth(1).as_deref() == Some("update") {
         std::process::exit(update_once().await);
+    }
+
+    // The CLI's sign-in runs before the engine starts: no CF_TOKEN, no D1 and
+    // no listener are needed to obtain a token from the auth Worker.
+    if std::env::args().nth(1).as_deref() == Some("auth") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(auth_cli::run(&args).await);
     }
 
     // The shell holder: the engine starts this binary again to own a terminal's
@@ -208,7 +214,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // Browser clients no longer go through the dashboard Worker: the engine
     // issues its own short-lived token and answers CORS preflights itself.
     // ALLOWED_* fall back to Workers KV AIXODIA_CONFIG, so verify the db first.
-    let client_auth = client_auth::ClientAuth::from_kv(token.clone(), &db).await?;
+    let client_auth = client_auth::ClientAuth::from_kv(&db).await?;
     // Pulls the Worker's live token set before answering requests, then keeps it
     // current every minute so a token issued while this process was down still
     // works (see auth_system.md's sync rules).

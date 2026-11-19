@@ -13,9 +13,9 @@
 //! authorised them. Nothing here calls GitHub, and nothing here needs the
 //! engine to be reachable to *obtain* a session.
 //!
-//! `CF_TOKEN` (the master token) is still honoured: the local CLI and the
-//! in-process tools have no Access cookie to present, and the engine also uses
-//! it as a bearer over loopback.
+//! `CF_TOKEN` is the engine's own credential for the Cloudflare API and the
+//! internal socket hubs; it is never a client credential. Every caller — the
+//! console, the phone and the CLI — presents a token minted by the auth Worker.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -97,11 +97,8 @@ pub struct ClientAuth {
     /// audiences differ, and rejecting either one turned a valid sign-in into
     /// `ACCESS_JWT_REJECTED`. Comma-separated so one deployment serves both.
     app_aud: Vec<String>,
-    /// Master token; still accepted as `Authorization: Bearer`.
-    cf_token: String,
     allowed_origins: Vec<String>,
     cache: tokio::sync::Mutex<KeyCache>,
-    exchange: crate::auth_exchange::Exchange,
     /// Base URL of the auth Worker, e.g. `https://aixodia-auth.example.workers.dev`.
     auth_worker: String,
     /// Recently confirmed tokens, so one page load costs one Worker lookup rather
@@ -181,8 +178,8 @@ async fn resolve_scalar(kv_key: &str, db: &DbClient) -> anyhow::Result<String> {
 impl ClientAuth {
     /// Access team and audience are read from Workers KV `AIXODIA_CONFIG`
     /// (`access/team_domain` and `access/app_aud`). When either is missing,
-    /// the Access path fails closed and only the master token works.
-    pub async fn from_kv(cf_token: String, db: &DbClient) -> anyhow::Result<Arc<Self>> {
+    /// the Access path fails closed and only the Worker token works.
+    pub async fn from_kv(db: &DbClient) -> anyhow::Result<Arc<Self>> {
         let team_domain = resolve_scalar("access/team_domain", db)
             .await?
             .trim_start_matches("https://")
@@ -199,7 +196,7 @@ impl ClientAuth {
             resolve_allowed("client/allowed_origins", db, Some(DEFAULT_ALLOWED_ORIGINS)).await?;
         if team_domain.is_empty() || app_aud.is_empty() {
             tracing::warn!(
-                "Workers KV keys access/team_domain or access/app_aud are missing: Cloudflare Access sign-in is disabled; only the master token works"
+                "Workers KV keys access/team_domain or access/app_aud are missing: Cloudflare Access sign-in is disabled; only Worker tokens work"
             );
         }
         let auth_worker = resolve_scalar("auth/worker_url", db).await?;
@@ -220,10 +217,8 @@ impl ClientAuth {
         Ok(Arc::new(Self {
             team_domain,
             app_aud,
-            cf_token,
             allowed_origins,
             cache: tokio::sync::Mutex::new(KeyCache::new()),
-            exchange: crate::auth_exchange::Exchange::try_new()?,
             auth_worker,
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
@@ -340,36 +335,17 @@ impl ClientAuth {
         }
     }
 
-    /// The sign-in exchange state, used by the native-app auth routes.
-    pub fn exchange(&self) -> &crate::auth_exchange::Exchange {
-        &self.exchange
-    }
-
-    /// The Access subject this request proves, for the callback handler.
-    pub async fn access_subject(&self, headers: &HeaderMap) -> Option<String> {
-        self.verify_access_jwt(access_jwt(headers)).await
-    }
-
-    /// Every route is guarded by `client_guard`; the sign-in routes opt out
-    /// because the caller has no credential yet (see `is_public_auth_path`).
+    /// Every route is guarded by `client_guard`; the sync routes opt out because
+    /// their caller is a machine with a shared secret, not a browser session.
     ///
-    /// There is no `/v1/auth/request|confirm|status` here. Issuing and confirming
-    /// tokens is the auth Worker's job, and it serves those from its own origin:
-    /// leaving a second copy in the engine meant sign-in still depended on this
-    /// process being up, which is exactly the dependence that was the problem.
-    ///
-    /// What remains under `/api/auth/` describes the caller and their engine
-    /// credential — asking for a token by name, and the GitHub-bound exchange for
-    /// the native app — which can only be answered by the process that holds them.
+    /// No sign-in route lives here. Issuing tokens is the auth Worker's job on
+    /// its own origin: leaving a second authority in the engine meant sign-in
+    /// depended on this process being up, which was the original problem. What
+    /// remains under `/api/auth/` describes the caller and holds the sync
+    /// endpoints only the Worker can reach.
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
             .route("/api/auth/whoami", get(whoami))
-            .route("/api/auth/authorize", post(crate::auth_exchange::authorize))
-            .route("/api/auth/callback", get(crate::auth_exchange::callback))
-            .route(
-                "/api/auth/exchange",
-                post(crate::auth_exchange::exchange_code),
-            )
             .route("/auth/sessions/sync", post(sync_handler))
             .route("/auth/sessions/active", get(active_handler))
             .with_state(self.clone())
@@ -479,10 +455,6 @@ impl ClientAuth {
 
     fn access_enabled(&self) -> bool {
         !self.team_domain.is_empty() && !self.app_aud.is_empty()
-    }
-
-    fn master_matches(&self, presented: &str) -> bool {
-        !self.cf_token.is_empty() && !presented.is_empty() && presented == self.cf_token
     }
 
     /// CORS headers for a preflight or a normal response. An unknown Origin
@@ -610,8 +582,8 @@ const VERIFIED_HEADER: &str = "x-aixodia-verified";
 /// Marks a request whose credential this middleware has already accepted.
 ///
 /// The terminal, relay and mobile handlers each re-check the bearer against the
-/// master token, which would refuse a Worker-issued token that the middleware
-/// just approved. The stamp is set here and only here, after verification, and
+/// engine's own token, which would refuse a Worker-issued token that the
+/// middleware just approved. The stamp is set here and only here, after verification, and
 /// is stripped from anything arriving from outside (see `strip_verified`).
 fn vouched(mut request: Request) -> Request {
     request
@@ -713,31 +685,21 @@ async fn sync_handler(
         .into_response()
 }
 
-/// Sign-in routes the caller must reach *before* holding a credential.
+/// Routes a machine caller must reach without a browser credential.
 ///
-/// `/api/auth/authorize` and `/api/auth/exchange` are guarded by PKCE plus a
-/// single-use code, and `/api/auth/callback` is guarded by the Access JWT that
-/// Cloudflare puts on it — requiring a token to reach them would make sign-in
-/// impossible.
-///
-/// `/v1/auth/request` is the email gate's entry point: it has to be reachable
-/// before a token exists. `/v1/auth/confirm` is the page and post that activate
-/// the token, and `/v1/auth/status` takes the token itself as the credential, so
-/// none of them can require the guard.
+/// The Worker pushes activations and revocations and pulls the live hashes with
+/// a shared secret checked inside the handlers; requiring a Worker token to
+/// reach those handlers would deadlock the sync that delivers the token.
 fn is_public_auth_path(path: &str) -> bool {
     matches!(
         path,
-        "/api/auth/authorize"
-            | "/api/auth/callback"
-            | "/api/auth/exchange"
-            // The Worker is a machine caller with no browser session; the shared
-            // secret is the credential, checked inside the handlers.
-            | "/auth/sessions/sync"
-            | "/auth/sessions/active"
+        // The Worker is a machine caller with no browser session; the shared
+        // secret is the credential, checked inside the handlers.
+        |"/auth/sessions/sync"| "/auth/sessions/active"
     )
 }
 
-/// Rejects any request that carries neither an Access JWT nor the master token.
+/// Rejects any request that carries neither a Worker token nor an Access JWT.
 ///
 /// How long a Worker verdict is reused.
 ///
@@ -803,9 +765,6 @@ pub async fn client_guard(
     }
 
     let master = bearer(request.headers());
-    if auth.master_matches(master) {
-        return with_cors(next.run(vouched(request)).await, &cors);
-    }
 
     // A token the Worker has pushed or this process pulled. Checked first because
     // it costs one hash and a set lookup; a synced set is authoritative for
@@ -814,22 +773,13 @@ pub async fn client_guard(
         return with_cors(next.run(vouched(request)).await, &cors);
     }
 
-    // A session token this engine issued to the native app through the PKCE
-    // exchange. Its signing key is persisted in the state directory, so a
-    // restart does not sign the app out. Verified locally — no Worker round
-    // trip — and the issuer check keeps an Access JWT from being confused with
-    // one of ours.
-    if !master.is_empty() && auth.exchange().verify_session(master).is_some() {
-        return with_cors(next.run(vouched(request)).await, &cors);
-    }
-
     // A token from the email gate. The authority is the auth Worker, not this
     // process: it holds the sessions and the allowlist, so a session revoked there
     // is revoked here on the next request, and an engine restart does not
     // invalidate anyone's sign-in.
     //
-    // "unknown" is not conclusive — the token might be the master token, which was
-    // already checked above — so it falls through rather than being reported.
+    // "unknown" is conclusive enough to fall through to the Access path: this
+    // token was not in the synced set, so no Worker session vouches for it.
     if !master.is_empty() {
         match auth.gate_check(master).await {
             crate::auth_gate::GateVerdict::Active => {
@@ -913,10 +863,8 @@ async fn whoami(State(auth): State<Arc<ClientAuth>>, headers: HeaderMap) -> Resp
             .into_response();
     }
 
-    let master = auth.master_matches(bearer(&headers));
     let subject = auth.verify_access_jwt(access_jwt(&headers)).await;
     Json(json!({
-        "master": master,
         "access_subject": subject,
         "access_enabled": auth.access_enabled(),
         "host": auth.team_domain,
@@ -932,7 +880,6 @@ mod dashboard_url_tests {
         let auth = crate::client_auth::ClientAuth {
             team_domain: String::new(),
             app_aud: Vec::new(),
-            cf_token: String::new(),
             allowed_origins: vec![
                 // Plain-HTTP origins exist for local development and must not be
                 // chosen: a redirect there would break a real sign-in.
@@ -940,7 +887,6 @@ mod dashboard_url_tests {
                 "https://aixodia.dpdns.org".to_string(),
             ],
             cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
-            exchange: crate::auth_exchange::Exchange::new(),
             auth_worker: String::new(),
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
@@ -956,10 +902,8 @@ mod dashboard_url_tests {
         let auth = crate::client_auth::ClientAuth {
             team_domain: String::new(),
             app_aud: Vec::new(),
-            cf_token: String::new(),
             allowed_origins: Vec::new(),
             cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
-            exchange: crate::auth_exchange::Exchange::new(),
             auth_worker: String::new(),
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
@@ -978,10 +922,8 @@ mod token_sync_tests {
         Arc::new(crate::client_auth::ClientAuth {
             team_domain: String::new(),
             app_aud: Vec::new(),
-            cf_token: String::new(),
             allowed_origins: Vec::new(),
             cache: tokio::sync::Mutex::new(crate::client_auth::KeyCache::new()),
-            exchange: crate::auth_exchange::Exchange::new(),
             auth_worker: String::new(),
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
