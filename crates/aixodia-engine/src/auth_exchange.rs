@@ -95,18 +95,68 @@ pub struct ExchangeResponse {
 
 /// The signing key for engine-issued session tokens.
 ///
-/// Held in memory only: sessions are short-lived in practice (the app refreshes
-/// by redoing the browser hand-off), and persisting it would put a secret next
-/// to the database it protects. A restart invalidates every session, which the
-/// app already handles by signing in again.
+/// Persisted under the engine's state directory so a restart — a crash, an
+/// `execve` self-update, or a sandbox wake — keeps every session the app is
+/// still holding. Without this the key changed on every start and the app's
+/// token was rejected until the user signed in again. The file is private to
+/// the instance, exactly like the pid and log files beside it.
 struct TokenSigner {
     key: EncodingKey,
     secret: Vec<u8>,
 }
 
 impl TokenSigner {
+    /// The signing key file, inside this engine's state directory.
+    fn key_path() -> std::path::PathBuf {
+        aixodia_state::path("session.key")
+    }
+
+    /// Load the persisted key at `path`, creating it on first run.
+    ///
+    /// The key is 32 random bytes from the OS, base64url-encoded on disk. It is
+    /// never shipped in the APK and never leaves this machine. The file is
+    /// created mode 600 so only the engine's own uid can read it. A failure to
+    /// read or write a key we already rely on is fatal: minting a fresh one
+    /// would silently invalidate every outstanding session.
+    fn load_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let bytes = match std::fs::read_to_string(path) {
+            Ok(encoded) => {
+                let decoded = URL_SAFE_NO_PAD.decode(encoded.trim()).map_err(|err| {
+                    anyhow::anyhow!("invalid session key in {}: {err}", path.display())
+                })?;
+                let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+                    anyhow::anyhow!("invalid session key length in {}", path.display())
+                })?;
+                bytes.to_vec()
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut fresh = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut fresh);
+                let encoded = URL_SAFE_NO_PAD.encode(fresh);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", path.display()))?;
+                file.write_all(encoded.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+                fresh.to_vec()
+            }
+            Err(err) => return Err(anyhow::anyhow!("cannot read {}: {err}", path.display())),
+        };
+        Ok(Self {
+            key: EncodingKey::from_secret(&bytes),
+            secret: bytes,
+        })
+    }
+
+    /// Test-only in-memory signer: two instances must not share a key.
+    #[cfg(test)]
     fn new() -> Self {
-        // 32 random bytes from the OS; no secret is ever shipped in the APK.
         let mut bytes = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
         Self {
@@ -130,6 +180,23 @@ impl TokenSigner {
         let token = encode(&Header::default(), &claims, &self.key).unwrap_or_default();
         (token, exp)
     }
+
+    /// Verify a token this engine issued and return its subject.
+    ///
+    /// The same key that signs sessions verifies them here, in the guard. Only
+    /// HS256 tokens carrying our issuer are accepted; an Access JWT or a token
+    /// from another engine cannot be mistaken for one of ours.
+    pub fn verify(&self, token: &str) -> Option<String> {
+        use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&["aixodia-engine"]);
+        validation.validate_exp = true;
+        let data =
+            decode::<SessionClaims>(token, &DecodingKey::from_secret(&self.secret), &validation)
+                .ok()?;
+        Some(data.claims.sub).filter(|sub| !sub.is_empty())
+    }
 }
 
 /// Signs codes and session tokens for the exchange flow.
@@ -139,22 +206,33 @@ pub struct Exchange {
 }
 
 impl Exchange {
-    pub fn new() -> Self {
+    /// Build the exchange with its persisted signing key. Fails if the key
+    /// cannot be read or created, since every session depends on it.
+    pub fn try_new() -> anyhow::Result<Self> {
+        Ok(Self {
+            signer: TokenSigner::load_or_create(&TokenSigner::key_path())?,
+            pending: tokio::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// In-memory exchange for tests, where no on-disk key is wanted.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self {
             signer: TokenSigner::new(),
             pending: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
+    /// Verify a session token issued by this engine. Shared with the guard so
+    /// app sign-ins survive a restart without a new browser hand-off.
+    pub fn verify_session(&self, token: &str) -> Option<String> {
+        self.signer.verify(token)
+    }
+
     fn sweep(pending: &mut HashMap<String, PendingCode>) {
         let now = Instant::now();
         pending.retain(|_, entry| entry.expires_at > now);
-    }
-}
-
-impl Default for Exchange {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -498,6 +576,53 @@ mod tests {
             &validation,
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_persisted_key_survives_a_restart_and_keeps_tokens_valid() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.key");
+
+        let first = TokenSigner::load_or_create(&path).expect("create key");
+        let (token, _) = first.issue("phone@example.com");
+        assert_eq!(first.verify(&token).as_deref(), Some("phone@example.com"));
+
+        // A second load — as after a restart or an execve update — gets the
+        // same key, so the token the app still holds keeps working.
+        let second = TokenSigner::load_or_create(&path).expect("reload key");
+        assert_eq!(second.verify(&token).as_deref(), Some("phone@example.com"));
+
+        // A different key cannot verify it.
+        let other = TokenSigner::load_or_create(&dir.path().join("other.key")).expect("other key");
+        assert_eq!(other.verify(&token), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the key file must be private");
+        }
+    }
+
+    #[test]
+    fn verify_rejects_a_token_from_another_issuer_even_with_the_same_key() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let signer = TokenSigner::load_or_create(&dir.path().join("session.key")).expect("key");
+        let claims = serde_json::json!({
+            "sub": "attacker@example.com",
+            "iss": "someone-else",
+            "exp": 9_999_999_999u64,
+            "iat": 1u64,
+        });
+        let foreign = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(&signer.secret),
+        )
+        .expect("encode");
+        assert_eq!(signer.verify(&foreign), None);
     }
 
     #[test]

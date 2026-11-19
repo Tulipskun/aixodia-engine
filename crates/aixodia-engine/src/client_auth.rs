@@ -223,7 +223,7 @@ impl ClientAuth {
             cf_token,
             allowed_origins,
             cache: tokio::sync::Mutex::new(KeyCache::new()),
-            exchange: crate::auth_exchange::Exchange::new(),
+            exchange: crate::auth_exchange::Exchange::try_new()?,
             auth_worker,
             gate_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_tokens: std::sync::RwLock::new(std::collections::HashSet::new()),
@@ -811,6 +811,15 @@ pub async fn client_guard(
     // it costs one hash and a set lookup; a synced set is authoritative for
     // tokens it contains (revocations arrive by push or the next pull).
     if !master.is_empty() && auth.token_is_active(master) {
+        return with_cors(next.run(vouched(request)).await, &cors);
+    }
+
+    // A session token this engine issued to the native app through the PKCE
+    // exchange. Its signing key is persisted in the state directory, so a
+    // restart does not sign the app out. Verified locally — no Worker round
+    // trip — and the issuer check keeps an Access JWT from being confused with
+    // one of ours.
+    if !master.is_empty() && auth.exchange().verify_session(master).is_some() {
         return with_cors(next.run(vouched(request)).await, &cors);
     }
 
