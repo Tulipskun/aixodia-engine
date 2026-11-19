@@ -9,10 +9,18 @@
 //! The row is found again by `origin_host` — the tunnel hostname this engine
 //! answers on — and never by the name, so renaming the machine keeps the row it
 //! already owns.
+//!
+//! One host must have exactly one live owner. Two machines cloned from one image
+//! share a machine id, hence the same KV keys and the same tunnel, and would both
+//! find that one row and start serving it. Each engine therefore carries a random
+//! uid, kept in its state directory and written onto the row it owns; a second
+//! live process with a different uid is refused rather than silently sharing the
+//! row and making the gateway's route flap between two pids.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aixodia_db::{Client as DbClient, Row};
+use rand::RngCore;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +30,81 @@ const ATTEMPTS: u32 = 64;
 /// How often this engine says it is alive. The gateway's lease is three beats,
 /// so two lost writes in a row are still not a death.
 const BEAT: Duration = Duration::from_secs(20);
+
+/// A heartbeat older than this means the previous owner is gone and its row may
+/// be taken over. Matches the gateway's three-beat lease.
+const LEASE_SECS: i64 = 60;
+
+/// The file, inside this engine's state directory, holding its persistent uid.
+const UID_FILE: &str = "instance.uid";
+
+/// This engine's stable identity, generated once and reused across restarts.
+///
+/// Two cloned machines share a machine id and KV keys but own separate state
+/// directories, so a random uid created on first start tells them apart. An
+/// `execve` update and a normal restart keep the same file and therefore the
+/// same uid, so neither loses its own row.
+pub fn local_uid() -> anyhow::Result<String> {
+    let path = aixodia_state::path(UID_FILE);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let uid = text.trim();
+        if !uid.is_empty() {
+            return Ok(uid.to_string());
+        }
+    }
+
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let uid: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(&path, uid.as_bytes())?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(uid)
+}
+
+/// Whether a live row with `held_uid` may be claimed by `my_uid`.
+///
+/// The decision is pure so the split-brain rule can be tested without a D1.
+/// `age` is seconds since the row's last heartbeat; a fresh heartbeat from a
+/// different uid is another live engine and must never be shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Takeover {
+    /// The row is mine (same uid), or its owner is gone: reclaim it.
+    Allow,
+    /// A different engine is keeping this row alive: refuse to start.
+    Refuse,
+}
+
+fn decide(held_uid: &str, my_uid: &str, age_secs: i64) -> Takeover {
+    if held_uid.is_empty() || held_uid == my_uid {
+        return Takeover::Allow;
+    }
+    // No heartbeat yet, or one older than the lease: the writer is gone.
+    if !(0..=LEASE_SECS).contains(&age_secs) {
+        return Takeover::Allow;
+    }
+    Takeover::Refuse
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn uid_of(row: &Row) -> &str {
+    row.get("instance_uid")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
+fn beat_of(row: &Row) -> i64 {
+    row.get("heartbeat_at")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+}
 
 /// What a client should call, and the name it should call it under.
 ///
@@ -35,11 +118,19 @@ pub struct Claim {
 }
 
 /// The public name of this engine, claiming a row the first time it starts.
-pub async fn claim(db: &DbClient, origin_host: &str, desired: &str) -> anyhow::Result<Claim> {
-    if let Some(claim) = owner(db, origin_host).await? {
+pub async fn claim(
+    db: &DbClient,
+    origin_host: &str,
+    desired: &str,
+    my_uid: &str,
+) -> anyhow::Result<Claim> {
+    if let Some(claim) = owner(db, origin_host, my_uid).await? {
         return Ok(claim);
     }
 
+    // Claim the row atomically: a plain INSERT would let two engines that start
+    // together each see no owner and both write a row. `INSERT ... ON CONFLICT
+    // DO NOTHING RETURNING id` yields a row only to the writer that wins.
     for attempt in 0..ATTEMPTS {
         let candidate = if attempt == 0 {
             desired.to_string()
@@ -50,16 +141,23 @@ pub async fn claim(db: &DbClient, origin_host: &str, desired: &str) -> anyhow::R
             continue;
         }
         let url = format!("https://{origin_host}/{candidate}");
-        db.query(
-            "INSERT INTO engines (id, name, url, origin_host) VALUES (?1, ?2, ?3, ?4)",
-            &[
-                Value::from(candidate.as_str()),
-                Value::from(candidate.as_str()),
-                Value::from(url.as_str()),
-                Value::from(origin_host),
-            ],
-        )
-        .await?;
+        let inserted = db
+            .query(
+                "INSERT INTO engines (id, name, url, origin_host, instance_uid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING RETURNING id",
+                &[
+                    Value::from(candidate.as_str()),
+                    Value::from(candidate.as_str()),
+                    Value::from(url.as_str()),
+                    Value::from(origin_host),
+                    Value::from(my_uid),
+                ],
+            )
+            .await?;
+        if inserted.is_empty() {
+            // Another engine took this id between `free` and `INSERT`.
+            continue;
+        }
         return Ok(Claim {
             name: candidate.clone(),
             url,
@@ -79,12 +177,23 @@ pub async fn claim(db: &DbClient, origin_host: &str, desired: &str) -> anyhow::R
 ///
 /// The first beat is immediate, so an engine that has just claimed its name is
 /// online before the task loops.
-pub async fn heartbeat(db: DbClient, id: String, version: String, cancel: CancellationToken) {
+pub async fn heartbeat(
+    db: DbClient,
+    id: String,
+    uid: String,
+    version: String,
+    cancel: CancellationToken,
+) {
     loop {
         match db
             .query(
-                "UPDATE engines SET heartbeat_at = unixepoch(), version = ?1 WHERE id = ?2",
-                &[Value::from(version.as_str()), Value::from(id.as_str())],
+                "UPDATE engines SET heartbeat_at = unixepoch(), version = ?1 \
+                 WHERE id = ?2 AND instance_uid = ?3",
+                &[
+                    Value::from(version.as_str()),
+                    Value::from(id.as_str()),
+                    Value::from(uid.as_str()),
+                ],
             )
             .await
         {
@@ -100,20 +209,67 @@ pub async fn heartbeat(db: DbClient, id: String, version: String, cancel: Cancel
     }
 }
 
-/// The name and address this machine already has, if any.
-async fn owner(db: &DbClient, origin_host: &str) -> anyhow::Result<Option<Claim>> {
+/// The row this tunnel host already owns, if any.
+///
+/// A row held by a different uid with a fresh heartbeat is another live engine —
+/// the split-brain a cloned pair produces — so starting here would make the
+/// gateway flip between two processes. Refuse in that case instead of silently
+/// sharing the row. An empty uid is a row written before this rule existed and
+/// is adopted once; a stale heartbeat means its owner is gone and may be
+/// replaced.
+async fn owner(db: &DbClient, origin_host: &str, my_uid: &str) -> anyhow::Result<Option<Claim>> {
     let rows = db
         .query(
-            "SELECT id, url FROM engines WHERE origin_host = ?1 LIMIT 1",
+            "SELECT id, url, instance_uid, heartbeat_at FROM engines \
+             WHERE origin_host = ?1 LIMIT 1",
             &[Value::from(origin_host)],
         )
         .await?;
-    Ok(rows.first().and_then(|row| {
-        Some(Claim {
-            name: name_of(row)?,
-            url: row.get("url")?.as_str()?.to_string(),
-        })
-    }))
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+
+    let held = uid_of(row);
+    let age = now_secs() - beat_of(row);
+    if decide(held, my_uid, age) == Takeover::Refuse {
+        anyhow::bail!(
+            "tunnel host {origin_host} is already served by another live engine \
+             (instance {}, heartbeat {age}s ago). Two machines cloned from one image \
+             share this tunnel and would make the gateway route flip between them. \
+             Stop the other engine, or give this machine its own tunnel and instance \
+             name, before starting.",
+            if held.is_empty() { "unknown" } else { held }
+        );
+    }
+
+    // Ours or abandoned: stamp our uid onto the row so an old owner's lingering
+    // heartbeat cannot refresh it. The compare on the old uid keeps a concurrent
+    // takeover from both of us believing we won.
+    if held != my_uid {
+        let id = name_of(row).ok_or_else(|| anyhow::anyhow!("engine row has no id"))?;
+        db.query(
+            "UPDATE engines SET instance_uid = ?1, heartbeat_at = unixepoch() \
+             WHERE id = ?2 AND instance_uid = ?3",
+            &[
+                Value::from(my_uid),
+                Value::from(id.as_str()),
+                Value::from(held),
+            ],
+        )
+        .await?;
+    }
+
+    Ok(Some(claim_from(row)?))
+}
+
+fn claim_from(row: &Row) -> anyhow::Result<Claim> {
+    let name = name_of(row).ok_or_else(|| anyhow::anyhow!("engine row has no id"))?;
+    let url = row
+        .get("url")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("engine row has no url"))?
+        .to_string();
+    Ok(Claim { name, url })
 }
 
 async fn free(db: &DbClient, candidate: &str) -> anyhow::Result<bool> {
@@ -170,6 +326,44 @@ pub fn take_name(name: &str, request: &mut axum::extract::Request) {
     parts.path_and_query = Some(path_and_query);
     if let Ok(uri) = axum::http::Uri::from_parts(parts) {
         *request.uri_mut() = uri;
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_uid_row_can_be_adopted() {
+        // Rows written before instance_uid existed carry no owner; the first
+        // upgraded engine adopts them, however fresh their heartbeat looks.
+        assert_eq!(decide("", "me", 1), Takeover::Allow);
+    }
+
+    #[test]
+    fn our_own_row_is_always_reclaimed() {
+        // A restart or an execve update keeps the same uid and must never be
+        // refused, even with a heartbeat from a second ago.
+        assert_eq!(decide("me", "me", 1), Takeover::Allow);
+        assert_eq!(decide("me", "me", 600), Takeover::Allow);
+    }
+
+    #[test]
+    fn a_live_foreign_owner_is_refused() {
+        // This is the cloned-machine case: another process keeps the row alive
+        // and we must not share it.
+        assert_eq!(decide("other", "me", 0), Takeover::Refuse);
+        assert_eq!(decide("other", "me", 30), Takeover::Refuse);
+        assert_eq!(decide("other", "me", LEASE_SECS), Takeover::Refuse);
+    }
+
+    #[test]
+    fn a_dead_foreign_owner_can_be_replaced() {
+        // Past the three-beat lease the old process is gone; take its row over.
+        assert_eq!(decide("other", "me", LEASE_SECS + 1), Takeover::Allow);
+        assert_eq!(decide("other", "me", 10_000), Takeover::Allow);
+        // A clock skew putting the heartbeat in the future is not a live owner.
+        assert_eq!(decide("other", "me", -1), Takeover::Allow);
     }
 }
 

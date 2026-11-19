@@ -251,7 +251,11 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("tunnel_url has no host"))?
         .to_string();
-    let claim = registry::claim(&db, &origin_host, keys.name()).await?;
+    // A stable per-installation uid distinguishes this engine from a clone that
+    // shares the same machine id, KV keys and tunnel. claim() refuses to start
+    // if another live uid already owns this host.
+    let uid = registry::local_uid()?;
+    let claim = registry::claim(&db, &origin_host, keys.name(), &uid).await?;
     tracing::info!("public name {} at {}", claim.name, claim.url);
     // From here on every request is also served under `/name/…`, which is the
     // address a client is given: it survives a rename and needs no hostname of
@@ -262,6 +266,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     tokio::spawn(registry::heartbeat(
         db.clone(),
         claim.name,
+        uid,
         aixodia_io::gateway::VERSION.to_string(),
         cancel.clone(),
     ));
