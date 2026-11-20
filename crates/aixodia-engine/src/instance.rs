@@ -140,7 +140,10 @@ mod tests {
         assert_eq!(sanitize_name("work").as_deref(), Some("work"));
         assert_eq!(sanitize_name("Work-Laptop").as_deref(), Some("work-laptop"));
         assert_eq!(sanitize_name("work.example.lan").as_deref(), Some("work"));
-        assert_eq!(sanitize_name("  studio mac  ").as_deref(), Some("studio-mac"));
+        assert_eq!(
+            sanitize_name("  studio mac  ").as_deref(),
+            Some("studio-mac")
+        );
         assert_eq!(sanitize_name("a__b--c").as_deref(), Some("a-b-c"));
         assert_eq!(sanitize_name("---"), None);
         assert_eq!(sanitize_name(""), None);
