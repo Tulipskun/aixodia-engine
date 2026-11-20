@@ -6,12 +6,13 @@
 //! over the first one and both would dial the same tunnel.
 //!
 //! The engine therefore names itself, and names itself the same way every time
-//! it starts on that machine: the device's own name, the hostname it answers to,
-//! reduced to what a path segment may carry. Nothing has to be configured —
-//! `CF_TOKEN` remains the only variable an install needs — and two machines that
-//! answer to the same name are told apart by the registry's suffix (`-1`, `-2`),
-//! never by a hash of their machine id: a name a person can read is worth more
-//! than a name that cannot collide.
+//! it starts on that machine: a short tag derived from the machine's own
+//! `/etc/machine-id`. Nothing has to be configured — `CF_TOKEN` remains the only
+//! variable an install needs — and two machines can never pick the same tag
+//! unless they were cloned from one another. The machine id is used instead of
+//! the hostname because a hostname can be reassigned (a VM is restarted with a
+//! new one), which would strand the KV keys and tunnel provisioned under the
+//! old name; the machine id stays with the disk.
 //!
 //! An operator who wants a readable name in the public URL sets
 //! `AIXODIA_INSTANCE` (lower-case letters, digits, single hyphens). It is an
@@ -54,7 +55,8 @@ pub fn machine_name() -> anyhow::Result<String> {
     if let Some(override_name) = override_name()? {
         return Ok(override_name);
     }
-    device_name()
+    let tag = machine_tag()?;
+    Ok(format!("m-{tag}"))
 }
 
 /// `AIXODIA_INSTANCE`, when the operator set it.
@@ -74,44 +76,40 @@ fn override_name() -> anyhow::Result<Option<String>> {
     Ok(Some(name))
 }
 
-/// The device's own name: the short hostname this machine answers to, in the
-/// alphabet a path segment and a KV key allow.
+/// Eight hex digits of the machine id: stable across reboots, boots of the same
+/// disk, engine updates, and different for every machine.
 ///
-/// The same machine names itself the same thing every boot, and a person reading
-/// the URL recognises the machine. Two devices that were given one name are not
-/// this function's problem — the registry hands out `-1`, `-2` and so on.
-fn device_name() -> anyhow::Result<String> {
-    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
-        if let Some(name) = read_first_line(path).as_deref().and_then(sanitize_name) {
-            return Ok(name);
+/// The machine id is a uuid; hashing it keeps the name from looking like one and
+/// keeps it inside the 32-character path segment the gateway accepts.
+fn machine_tag() -> anyhow::Result<String> {
+    if let Some(mid) = read_first_line("/etc/machine-id") {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(mid.as_bytes());
+        let hex = digest
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        return Ok(hex);
+    }
+    // No machine id: a host that never had one (some chroots) still needs a
+    // name, and the kernel's hostname is the only stable thing left. It is hashed
+    // for the same reason as above and because a hostname is not a path segment.
+    if let Some(host) = read_first_line("/proc/sys/kernel/hostname") {
+        if !host.is_empty() {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(host.as_bytes());
+            let hex = digest
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            return Ok(hex);
         }
     }
     Err(anyhow!(
-        "this machine has no hostname to name itself by; set AIXODIA_INSTANCE"
+        "this machine has no /etc/machine-id and no hostname to name itself by; set AIXODIA_INSTANCE"
     ))
-}
-
-/// A hostname reduced to a name: lower case, one hyphen where a separator was,
-/// no hyphen at either end, at most thirty-two characters, and only the part
-/// before the first dot — a device is `work`, not `work.example.lan`.
-fn sanitize_name(raw: &str) -> Option<String> {
-    let short = raw.trim().split('.').next().unwrap_or_default();
-    let mut name = String::with_capacity(short.len());
-    let mut separator = false;
-    for character in short.chars() {
-        let lowered = character.to_ascii_lowercase();
-        if lowered.is_ascii_alphanumeric() {
-            name.push(lowered);
-            separator = false;
-        } else if !name.is_empty() && !separator {
-            name.push('-');
-            separator = true;
-        }
-    }
-    let name = name.trim_matches('-');
-    let name: String = name.chars().take(32).collect();
-    let name = name.trim_end_matches('-');
-    (!name.is_empty() && aixodia_state::valid_instance_name(name)).then(|| name.to_string())
 }
 
 fn read_first_line(path: &str) -> Option<String> {
@@ -127,28 +125,15 @@ mod tests {
     #[test]
     fn the_key_is_this_machines_own() {
         let keys = Keys {
-            name: "work".to_string(),
+            name: "m-8a7d1192".to_string(),
         };
-        assert_eq!(keys.key("tunnel_token"), "instances/work/tunnel_token");
-        assert_eq!(keys.key("daemon/url"), "instances/work/daemon/url");
-        assert_eq!(keys.name(), "work");
-        assert_eq!(keys.key("tunnel_url"), "instances/work/tunnel_url");
-    }
-
-    #[test]
-    fn the_name_is_the_device_name_in_the_alphabet_a_url_allows() {
-        assert_eq!(sanitize_name("work").as_deref(), Some("work"));
-        assert_eq!(sanitize_name("Work-Laptop").as_deref(), Some("work-laptop"));
-        assert_eq!(sanitize_name("work.example.lan").as_deref(), Some("work"));
         assert_eq!(
-            sanitize_name("  studio mac  ").as_deref(),
-            Some("studio-mac")
+            keys.key("tunnel_token"),
+            "instances/m-8a7d1192/tunnel_token"
         );
-        assert_eq!(sanitize_name("a__b--c").as_deref(), Some("a-b-c"));
-        assert_eq!(sanitize_name("---"), None);
-        assert_eq!(sanitize_name(""), None);
-        let long = sanitize_name(&"a".repeat(60)).expect("still a name");
-        assert_eq!(long.len(), 32);
+        assert_eq!(keys.key("daemon/url"), "instances/m-8a7d1192/daemon/url");
+        assert_eq!(keys.name(), "m-8a7d1192");
+        assert_eq!(keys.key("tunnel_url"), "instances/m-8a7d1192/tunnel_url");
     }
 
     #[test]
@@ -161,10 +146,29 @@ mod tests {
             machine_name().expect("stable"),
             "the name must be stable"
         );
-        let host = super::read_first_line("/proc/sys/kernel/hostname")
-            .and_then(|raw| sanitize_name(&raw))
-            .expect("the kernel names this machine");
-        assert_eq!(name, host, "the name is the device's, not a hash of it");
+        if name.starts_with("m-") {
+            assert_eq!(name.len(), 10, "eight hex digits after the prefix: {name}");
+            assert!(name[2..].chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_name_follows_the_machine_id_not_the_hostname() {
+        std::env::remove_var("AIXODIA_INSTANCE");
+        let Some(mid) = read_first_line("/etc/machine-id") else {
+            return; // a host with no machine id falls back to the hostname
+        };
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(mid.as_bytes());
+        let expected = format!(
+            "m-{}",
+            digest.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        assert_eq!(
+            machine_name().unwrap(),
+            expected,
+            "the name is derived from /etc/machine-id, not a reassignable hostname"
+        );
     }
 
     #[test]
