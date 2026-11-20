@@ -27,6 +27,39 @@ use tokio_util::sync::CancellationToken;
 /// How many numbered names to try before giving up.
 const ATTEMPTS: u32 = 64;
 
+/// The gateway's front door. Clients must be handed this host with the engine's
+/// public name as a path segment, never the tunnel's own hostname: the origin
+/// sits behind a Cloudflare Access application that stops a phone's request.
+/// The console and the phone app use the same address as their default, so a
+/// plain install needs no extra environment variable. An operator running a
+/// different deployment can override it without changing the binary.
+const DEFAULT_GATEWAY_BASE: &str = "https://engine.aixodia.dpdns.org";
+
+/// The public base a client should call, from `AIXODIA_GATEWAY_URL` when set.
+///
+/// Like `CF_TOKEN`, this is not required: the default matches every other
+/// component of this deployment. The trailing slash is removed so the name can
+/// always be appended as one path segment.
+pub fn gateway_base() -> String {
+    let configured = std::env::var("AIXODIA_GATEWAY_URL")
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if configured.starts_with("https://") || configured.starts_with("http://") {
+        configured
+    } else {
+        DEFAULT_GATEWAY_BASE.to_string()
+    }
+}
+
+/// The address a client is given for one engine: the gateway front door plus
+/// the engine's public name. Kept pure so the gateway form can be tested
+/// without a D1 or a tunnel.
+pub fn public_url(gateway_base: &str, name: &str) -> String {
+    format!("{}/{name}", gateway_base.trim_end_matches('/'))
+}
+
 /// How often this engine says it is alive. The gateway's lease is three beats,
 /// so two lost writes in a row are still not a death.
 const BEAT: Duration = Duration::from_secs(20);
@@ -121,6 +154,7 @@ pub struct Claim {
 pub async fn claim(
     db: &DbClient,
     origin_host: &str,
+    gateway_base: &str,
     desired: &str,
     my_uid: &str,
 ) -> anyhow::Result<Claim> {
@@ -140,7 +174,11 @@ pub async fn claim(
         if !free(db, &candidate).await? {
             continue;
         }
-        let url = format!("https://{origin_host}/{candidate}");
+        // The client's address is the gateway front door plus the public name,
+        // not the tunnel hostname this process dials. A phone handed the origin
+        // would be stopped by the Access app in front of it; the Worker is the
+        // only caller allowed to reach the origin directly.
+        let url = public_url(gateway_base, &candidate);
         let inserted = db
             .query(
                 "INSERT INTO engines (id, name, url, origin_host, instance_uid) \
@@ -404,5 +442,20 @@ mod tests {
         let mut similar = request("/worked/api");
         take_name("work", &mut similar);
         assert_eq!(similar.uri().path(), "/worked/api");
+    }
+
+    #[test]
+    fn a_client_is_given_the_gateway_front_door_not_the_origin() {
+        // The origin host is only for the Worker. A client handed it would be
+        // rejected by the Access app; the name belongs on the gateway host.
+        assert_eq!(
+            public_url("https://engine.aixodia.dpdns.org", "vm-26-251-tencentos"),
+            "https://engine.aixodia.dpdns.org/vm-26-251-tencentos"
+        );
+        // A trailing slash in an override must not produce a double slash.
+        assert_eq!(
+            public_url("https://other.example.test/", "work"),
+            "https://other.example.test/work"
+        );
     }
 }

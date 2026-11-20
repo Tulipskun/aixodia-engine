@@ -255,7 +255,10 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // shares the same machine id, KV keys and tunnel. claim() refuses to start
     // if another live uid already owns this host.
     let uid = registry::local_uid()?;
-    let claim = registry::claim(&db, &origin_host, keys.name(), &uid).await?;
+    // The row's url is the gateway front door, not this tunnel's hostname: a
+    // client that dials the origin is stopped by the Access app in front of it.
+    let gateway = registry::gateway_base();
+    let claim = registry::claim(&db, &origin_host, &gateway, keys.name(), &uid).await?;
     tracing::info!("public name {} at {}", claim.name, claim.url);
     // From here on every request is also served under `/name/…`, which is the
     // address a client is given: it survives a rename and needs no hostname of
