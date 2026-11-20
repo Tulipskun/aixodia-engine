@@ -162,7 +162,11 @@ mod tests {
         let digest = sha2::Sha256::digest(mid.as_bytes());
         let expected = format!(
             "m-{}",
-            digest.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()
+            digest
+                .iter()
+                .take(4)
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         );
         assert_eq!(
             machine_name().unwrap(),
