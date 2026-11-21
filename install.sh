@@ -12,7 +12,7 @@
 #   cloudflared     the tunnel helper, if it is not already installed
 #
 # When CF_TOKEN is exported for the install, the launcher is also set to start
-the engine on its own:
+# the engine on its own:
 #   aixodia autostart on   remembers the token and starts the engine at login
 #
 #

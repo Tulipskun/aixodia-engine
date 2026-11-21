@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::pty::Pty;
+use crate::pty::{process_alive, Pty};
 
 /// How much output a holder keeps for a client that has not attached yet.
 const RING_CAP: usize = 4 << 20;
@@ -101,10 +101,34 @@ fn survivors_in(dir: &Path) -> Vec<String> {
         };
         if UnixStream::connect(&path).is_ok() {
             out.push(id.to_string());
+            continue;
+        }
+        // Nothing answers on it. A holder that has finished leaves both files
+        // behind, and the socket is what makes the next bind for that id fail —
+        // `run` clears it, but only if the same id is ever asked for again, so
+        // the files of every tab ever opened would otherwise stay here for good.
+        // The pid file names the shell the holder ran, so a dead pid is proof the
+        // pair is garbage. A live pid with a quiet socket is left alone: the two
+        // are separate processes and this must never delete the socket of a shell
+        // that is still running.
+        if !shell_is_alive(&path.with_extension("pid")) {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("pid"));
         }
     }
     out.sort();
     out
+}
+
+/// Whether the shell a pid file names is still running.
+fn shell_is_alive(pid_path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(pid_path) else {
+        return false;
+    };
+    match text.trim().parse::<i32>() {
+        Ok(pid) => pid > 0 && process_alive(pid, 0),
+        Err(_) => false,
+    }
 }
 
 /// The engine connection the shell's output is being handed to.
@@ -627,13 +651,23 @@ mod tests {
 
         let live = socket_in(&dir, "t-live01");
         let _listener = UnixListener::bind(&live).unwrap();
-        // A socket file whose holder has gone: nothing answers on it.
+        // This process is a shell that is certainly running.
+        std::fs::write(
+            dir.join("t-live01.pid"),
+            std::process::id().to_string().as_bytes(),
+        )
+        .unwrap();
+        // A socket whose holder and shell have both gone: nothing answers on it,
+        // and its pid file names a process that cannot exist.
         let dead = socket_in(&dir, "t-dead02");
         drop(UnixListener::bind(&dead).unwrap());
-        // Anything else in the directory is not a shell.
-        std::fs::write(dir.join("t-live01.pid"), b"1234").unwrap();
+        std::fs::write(dir.join("t-dead02.pid"), b"2147483646").unwrap();
 
         assert_eq!(survivors_in(&dir), vec!["t-live01".to_string()]);
+        // The dead pair is cleared so the id is free again; the live one is not.
+        assert!(!dead.exists(), "a dead holder's socket must be cleared");
+        assert!(!dir.join("t-dead02.pid").exists(), "nor its pid file");
+        assert!(live.exists(), "a live holder's socket must be left alone");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
