@@ -53,6 +53,12 @@ fn holder_dir() -> PathBuf {
 
 /// Where a holder for `id` advertises itself.
 pub fn socket_path(id: &str) -> PathBuf {
+    socket_in(&holder_dir(), id)
+}
+
+/// [`socket_path`] in a given directory, so the naming can be checked without
+/// touching the engine's real state.
+fn socket_in(dir: &Path, id: &str) -> PathBuf {
     let mut name = String::new();
     for c in id.chars() {
         if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -61,7 +67,44 @@ pub fn socket_path(id: &str) -> PathBuf {
             name.push('_');
         }
     }
-    holder_dir().join(format!("{name}.sock"))
+    dir.join(format!("{name}.sock"))
+}
+
+/// The shells a previous engine left running, by id.
+///
+/// A holder outlives the engine on purpose, which means the list a restarted
+/// engine serves has to be built from the sockets the last one left behind. An
+/// engine that only knows the shells it started itself answers "none", the phone
+/// prunes the tab to match, and the shell keeps running with nobody able to reach
+/// it — the one thing this design exists to prevent.
+///
+/// Connecting is the only honest test of a socket file: one left by a holder that
+/// has since died is not a shell. It is left in place rather than removed, because
+/// a holder that has just bound but not yet listened would look the same, and
+/// deleting its socket would let a second holder take the same id.
+pub fn survivors() -> Vec<String> {
+    survivors_in(&holder_dir())
+}
+
+fn survivors_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if UnixStream::connect(&path).is_ok() {
+            out.push(id.to_string());
+        }
+    }
+    out.sort();
+    out
 }
 
 /// The engine connection the shell's output is being handed to.
@@ -567,5 +610,31 @@ mod tests {
         let path = socket_path("../../etc/passwd");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(!name.contains('/'), "{name} must not escape the holder dir");
+    }
+
+    #[test]
+    fn a_surviving_holder_is_listed_and_a_dead_socket_is_not() {
+        // The engine after a restart has to find the shells its predecessor left,
+        // or the phone is told there are none and forgets the tabs. Only a socket
+        // something is actually listening on is a shell.
+        let dir = std::env::temp_dir().join(format!(
+            "aixodia-survivors-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let live = socket_in(&dir, "t-live01");
+        let _listener = UnixListener::bind(&live).unwrap();
+        // A socket file whose holder has gone: nothing answers on it.
+        let dead = socket_in(&dir, "t-dead02");
+        drop(UnixListener::bind(&dead).unwrap());
+        // Anything else in the directory is not a shell.
+        std::fs::write(dir.join("t-live01.pid"), b"1234").unwrap();
+
+        assert_eq!(survivors_in(&dir), vec!["t-live01".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

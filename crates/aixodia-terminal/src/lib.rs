@@ -33,6 +33,9 @@ const DEFAULT_LIMIT: usize = 16;
 const DEFAULT_PING_EVERY: Duration = Duration::from_secs(30);
 const READ_CHUNK: usize = 32 << 10;
 const MIN_SIZE: u16 = 1;
+/// The grid a shell is opened at before a phone has said what its screen is.
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
 const MAX_SIZE: u16 = 1000;
 const MIN_WIRE_COLS: i64 = 10;
 const MIN_WIRE_ROWS: i64 = 2;
@@ -267,6 +270,53 @@ impl Server {
         *self.logf.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
     }
 
+    /// Takes back the shells a previous engine left running.
+    ///
+    /// A holder owns its pty, so an engine restart does not reach the shell — but
+    /// this engine's own map is empty after one, and a shell nobody lists is a
+    /// shell the phone cannot reattach to: it prunes the tab, starts a new shell,
+    /// and the old one runs on with nobody able to reach it. Adopting the
+    /// survivors at startup is what makes a restart invisible to a tab.
+    ///
+    /// Each is adopted at the default size, because the holder is not asked: the
+    /// phone's first attach carries its own grid and a resize makes a full-screen
+    /// program repaint by itself, exactly as it does on a cold start.
+    pub fn resume(self: &Arc<Self>) {
+        let dir = Self::dir();
+        let shell = self.shell().to_string();
+        for id in holder::survivors() {
+            if self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&id)
+            {
+                continue;
+            }
+            let held =
+                match holder::connect_or_start(&id, &shell, DEFAULT_COLS, DEFAULT_ROWS, Some(&dir))
+                {
+                    Ok(held) => held,
+                    Err(err) => {
+                        self.logf(format!("terminal {id}: leftover holder not adopted: {err}"));
+                        continue;
+                    }
+                };
+            let p = Arc::new(Shell::Held(Arc::new(held)));
+            match self.adopt(
+                &id,
+                shell.clone(),
+                dir.clone(),
+                DEFAULT_COLS,
+                DEFAULT_ROWS,
+                p,
+            ) {
+                Ok(_) => self.logf(format!("terminal {id}: adopted from a previous engine")),
+                Err(err) => self.logf(format!("terminal {id}: adopt failed: {err}")),
+            }
+        }
+    }
+
     fn logf(&self, message: String) {
         let f = self.logf.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(f) = f {
@@ -452,8 +502,8 @@ impl Server {
             }
         }
 
-        let cols = if cols == 0 { 80 } else { cols };
-        let rows = if rows == 0 { 24 } else { rows };
+        let cols = if cols == 0 { DEFAULT_COLS } else { cols };
+        let rows = if rows == 0 { DEFAULT_ROWS } else { rows };
         let dir = Self::dir();
         let shell = self.shell().to_string();
         // A shell is started in a holder, which keeps it across an engine

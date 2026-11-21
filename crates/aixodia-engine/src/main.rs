@@ -330,6 +330,10 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         d1log::info(message.clone());
         tracing::info!("{message}");
     }));
+    // The shells a previous engine left in their holders are still running: take
+    // them back before serving, so a phone's tab reattaches to the shell it had
+    // instead of being told the engine holds nothing.
+    terminal.resume();
 
     // The relay dispatches rpc frames through this in-process mux, exactly as
     // the phone's direct HTTP calls reach the same routes.
