@@ -28,6 +28,10 @@ pub const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 pub const KV_NAMESPACE_TITLE: &str = "aixodia-providers";
 pub const CONFIG_KV_NAMESPACE_TITLE: &str = "AIXODIA_CONFIG";
 
+/// Cloudflare allows up to 1,000 namespaces per account, so one page never
+/// covers every account and both namespace lookups walk all of them.
+const NAMESPACE_PER_PAGE: u64 = 100;
+
 /// One D1 row. D1 numbers arrive as `f64`, so columns are dynamically typed.
 pub type Row = Map<String, Value>;
 
@@ -66,6 +70,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 // --- Cloudflare envelope -------------------------------------------------
 
+/// Page metadata from the Cloudflare v4 envelope. Only `total_count` is used:
+/// the namespace listing is the one place that has to walk every page.
+#[derive(Debug, Default, Deserialize)]
+struct ResultInfo {
+    #[serde(default)]
+    total_count: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
     #[serde(default)]
@@ -74,6 +86,8 @@ struct ApiResponse {
     errors: Vec<ApiError>,
     #[serde(default)]
     result: Value,
+    #[serde(default)]
+    result_info: ResultInfo,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -588,10 +602,24 @@ impl Client {
         if let Some(namespaces) = cached {
             return Ok(namespaces);
         }
-        let path = format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100");
-        let namespaces: Vec<KvNamespaceResult> = self.get(&path, &token).await?;
-        *self.inner.kv_namespaces.write().await = Some(namespaces.clone());
-        Ok(namespaces)
+        let mut page = 1u64;
+        let mut all = Vec::new();
+        loop {
+            let path = format!(
+                "/accounts/{account_id}/storage/kv/namespaces?per_page={NAMESPACE_PER_PAGE}&page={page}"
+            );
+            let (mut names, info) = self
+                .get_page::<Vec<KvNamespaceResult>>(&path, &token)
+                .await?;
+            let empty = names.is_empty();
+            all.append(&mut names);
+            if !more_namespace_pages(page, info.total_count, empty) {
+                break;
+            }
+            page += 1;
+        }
+        *self.inner.kv_namespaces.write().await = Some(all.clone());
+        Ok(all)
     }
 
     /// Whether [`verify_kv`](Self::verify_kv) has found the namespace.
@@ -911,7 +939,13 @@ impl Client {
         headers
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str, cred: &str) -> Result<T> {
+    /// A GET that also returns the envelope's page metadata, for the one
+    /// endpoint whose answer can span several pages.
+    async fn get_page<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        cred: &str,
+    ) -> Result<(T, ResultInfo)> {
         let response = self
             .inner
             .http
@@ -925,10 +959,15 @@ impl Client {
         if !(200..300).contains(&status) || !envelope.success {
             return Err(api_error_message(path, status as i32, &envelope.errors));
         }
-        serde_json::from_value(envelope.result).map_err(|e| Error::Decode {
+        let value = serde_json::from_value(envelope.result).map_err(|e| Error::Decode {
             what: path.to_string(),
             source: e.into(),
-        })
+        })?;
+        Ok((value, envelope.result_info))
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str, cred: &str) -> Result<T> {
+        self.get_page(path, cred).await.map(|(value, _)| value)
     }
 }
 
@@ -938,6 +977,13 @@ async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u
     let bytes = response.bytes().await?;
     let end = bytes.len().min(limit);
     Ok(bytes[..end].to_vec())
+}
+
+/// Whether another page of namespaces must be fetched. An empty page ends the
+/// walk even when Cloudflare reports a larger total, so an account whose list
+/// changed mid-walk cannot spin forever.
+fn more_namespace_pages(page: u64, total: u64, empty: bool) -> bool {
+    !empty && total > 0 && page.saturating_mul(NAMESPACE_PER_PAGE) < total
 }
 
 fn api_error_message(operation: &str, status: i32, errors: &[ApiError]) -> Error {
@@ -1107,8 +1153,7 @@ impl Client {
         if token.is_empty() || account_id.is_empty() {
             return Err(Error::NotVerified);
         }
-        let ns_path = format!("/accounts/{account_id}/storage/kv/namespaces?per_page=100");
-        let namespaces: Vec<KvNamespaceResult> = self.get(&ns_path, &token).await?;
+        let namespaces = self.kv_namespaces().await?;
         let Some(namespace) = namespaces
             .into_iter()
             .find(|ns| ns.title == DEVICE_KV_NAMESPACE_TITLE)
@@ -1177,6 +1222,26 @@ mod tests {
         let results: Vec<QueryResult> =
             serde_json::from_value(envelope.result).expect("query results");
         assert_eq!(results.first().expect("statement").rows.len(), 2);
+    }
+
+    #[test]
+    fn namespace_listing_walks_every_page() {
+        assert!(more_namespace_pages(1, 250, false));
+        assert!(more_namespace_pages(2, 250, false));
+        assert!(!more_namespace_pages(3, 250, false));
+        assert!(!more_namespace_pages(1, 250, true));
+        // An envelope without `result_info` describes a single page.
+        assert!(!more_namespace_pages(1, 0, false));
+    }
+
+    #[test]
+    fn a_namespace_page_carries_its_total() {
+        let envelope: ApiResponse = serde_json::from_str(
+            r#"{"success":true,"result":[],
+                "result_info":{"count":100,"page":1,"per_page":100,"total_count":250}}"#,
+        )
+        .expect("envelope");
+        assert_eq!(envelope.result_info.total_count, 250);
     }
 
     #[test]
