@@ -39,6 +39,31 @@ struct Owned {
     wm_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+impl Drop for Owned {
+    /// Stops the display this process started.
+    ///
+    /// A display number is a shared resource: leaving a server behind on `:90`
+    /// makes the next engine start find the number taken, so it manages nothing
+    /// and every restart leaves another dead display to clean up.
+    fn drop(&mut self) {
+        // The window manager first: it holds an X connection, and killing the
+        // server under it leaves it retrying a display that is gone.
+        self.wm_stop.store(true, Ordering::SeqCst);
+        // Not joined: this runs on the path that noticed the display had already
+        // died, where a join would wait on a thread that cannot answer.
+        self.wm_thread.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Xvfb removes these itself when it exits cleanly, but it is killed
+        // here, and a leftover socket is worse than untidy: the next start sees
+        // it, believes a display is up on that number, adopts it, and finds the
+        // number taken, so no window manager is possible and every restart
+        // leaves another dead display behind.
+        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{}", self.number));
+        let _ = std::fs::remove_file(format!("/tmp/.X{}-lock", self.number));
+    }
+}
+
 /// Why the display could not be brought up, in the words the app shows.
 pub struct DisplayError(pub String);
 
@@ -82,23 +107,16 @@ pub fn owned_display() -> Option<String> {
 /// Stops the display the engine started, if any. Called on shutdown so a
 /// restart does not leave a server behind holding the number.
 pub fn shutdown() {
+    // One path for stopping a display, in `Drop`, so a shutdown and a restart
+    // cannot disagree about what "stopped" leaves behind.
     let mut guard = OWNED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut owned) = guard.take() {
-        // The window manager first: it holds an X connection, and killing the
-        // server under it leaves it retrying a display that is gone.
         owned.wm_stop.store(true, Ordering::SeqCst);
         if let Some(thread) = owned.wm_thread.take() {
             let _ = thread.join();
         }
-        let _ = owned.child.kill();
-        let _ = owned.child.wait();
-        // Xvfb removes these itself when it exits cleanly, but it is killed
-        // here, and a leftover socket is worse than untidy: the next start sees
-        // it, believes a display is up on that number, adopts it, and finds the
-        // number taken — so no window manager is possible and every restart
-        // leaves another dead display behind.
-        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{}", owned.number));
-        let _ = std::fs::remove_file(format!("/tmp/.X{}-lock", owned.number));
+        // Dropping it does the rest.
+        drop(owned);
     }
 }
 
@@ -136,8 +154,7 @@ fn name(number: u32) -> String {
     format!(":{number}")
 }
 
-/// An X server that already answers, if there is one.
-/** Whether an X server answers on this display name. */
+/// Whether an X server answers on this display name.
 fn working_display_is(display: &str) -> bool {
     use std::os::raw::c_char;
     let Ok(name) = std::ffi::CString::new(display) else {
@@ -157,6 +174,9 @@ fn working_display_is(display: &str) -> bool {
     true
 }
 
+/// The display this process was pointed at, if a server answers on it.
+///
+/// An operator who set `$DISPLAY` meant it, so it wins over starting one.
 fn working_display() -> Option<String> {
     let current = std::env::var("DISPLAY")
         .ok()
@@ -246,7 +266,7 @@ fn start() -> Result<Owned, DisplayError> {
         let deadline = Instant::now() + START_TIMEOUT;
         while Instant::now() < deadline {
             if socket_exists(&display) {
-                let (wm_stop, wm_thread) = start_window_manager(&display);
+                let (wm_stop, wm_thread) = start_window_manager(&display, child.id());
                 return Ok(Owned {
                     number,
                     child,
@@ -285,13 +305,16 @@ fn start() -> Result<Owned, DisplayError> {
 /// crate already links Xlib for capture, and the work is a frame, a bar and three
 /// drags. A display that cannot take one still streams — the windows just carry
 /// no title bar.
-fn start_window_manager(display: &str) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>) {
+fn start_window_manager(
+    display: &str,
+    owner: u32,
+) -> (Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>) {
     let stop = Arc::new(AtomicBool::new(false));
     let theirs = Arc::clone(&stop);
     let name = display.to_string();
     let thread = std::thread::Builder::new()
         .name("aixodia-wm".to_string())
-        .spawn(move || crate::wm::run(&name, theirs))
+        .spawn(move || crate::wm::run(&name, theirs, owner))
         .ok();
     (stop, thread)
 }
@@ -361,7 +384,7 @@ mod tests {
     fn the_window_manager_is_a_thread_not_a_program() {
         // It needs no package: the crate links Xlib already, and this is what
         // keeps an engine install from requiring a desktop environment.
-        let (stop, thread) = start_window_manager(":0");
+        let (stop, thread) = start_window_manager(":0", std::process::id());
         stop.store(true, Ordering::SeqCst);
         if let Some(thread) = thread {
             let _ = thread.join();

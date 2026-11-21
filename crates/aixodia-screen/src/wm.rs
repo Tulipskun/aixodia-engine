@@ -189,10 +189,16 @@ fn step(value: i32, base: i32, increment: i32) -> i32 {
 
 /// Runs the window manager on `display_name` until `stop` is set.
 ///
-/// Every failure is quiet by design: a display without decorations still
+/// `owner` is the pid of the server this display belongs to. It is watched
+/// because a manager whose server has died is worse than one that stops: the
+/// next X call on that connection is an IO error, and Xlib's answer to an IO
+/// error is to end the process. That would take the whole engine down over a
+/// display nobody is looking at any more, so the thread leaves first.
+///
+/// Every other failure is quiet by design: a display without decorations still
 /// streams, so a window manager that cannot start is not worth refusing the
 /// picture over. The caller logs once that windows will be plain instead.
-pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
+pub fn run(display_name: &str, stop: Arc<AtomicBool>, owner: u32) {
     unsafe {
         let Ok(name) = std::ffi::CString::new(display_name) else {
             return;
@@ -300,19 +306,26 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
         // The desktop itself: the root painted, and the strip along the bottom.
         // Both are best-effort — a display that refuses them still streams, it
         // just looks like the bare server it is.
-        paint_root(display, root, display_width, display_height, white);
-        let mut bar = Panel::create(display, root, display_width);
-        if let Some(bar) = bar.as_mut() {
-            xlib::XMoveWindow(
-                display,
-                bar.window(),
-                0,
-                display_height - crate::panel::HEIGHT,
-            );
-        }
+        let chrome = match Chrome::new(display, root) {
+            Some(chrome) => chrome,
+            // No GC means nothing can be drawn on this connection at all. The
+            // picture still streams: the capture path opens its own connection,
+            // and this one only ever carried decorations.
+            None => {
+                xlib::XCloseDisplay(display);
+                return;
+            }
+        };
+        paint_root(display, root, display_width, display_height, &chrome);
+        let mut bar = Panel::create(
+            display,
+            root,
+            display_width,
+            display_height - crate::panel::HEIGHT,
+        );
         repaint_panel(display, &mut bar, &frames);
 
-        while !stop.load(Ordering::SeqCst) {
+        while !stop.load(Ordering::SeqCst) && alive(owner) {
             while xlib::XPending(display) > 0 {
                 let mut event: xlib::XEvent = std::mem::zeroed();
                 xlib::XNextEvent(display, &mut event);
@@ -320,7 +333,7 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
                     xlib::MapRequest => {
                         let client = event.map_request.window;
                         let asked = pending.remove(&client);
-                        adopt(display, root, client, &mut frames, white, black, asked);
+                        adopt(display, root, client, &mut frames, asked, &atoms, &chrome);
                         // A new window is a new button on the strip.
                         repaint_panel(display, &mut bar, &frames);
                     }
@@ -393,11 +406,11 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
                     xlib::Expose => {
                         let shown = event.expose.window;
                         if shown == root {
-                            paint_root(display, root, display_width, display_height, white);
+                            paint_root(display, root, display_width, display_height, &chrome);
                         } else if bar.as_ref().is_some_and(|strip| strip.window() == shown) {
                             repaint_panel(display, &mut bar, &frames);
                         } else {
-                            paint(display, &event.expose, &frames, white, black);
+                            paint(display, &event.expose, &frames, &chrome);
                         }
                     }
                     xlib::PropertyNotify => {
@@ -410,8 +423,8 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
                             || event.property.atom == xlib::XA_WM_NAME
                         {
                             if let Some(index) = frames.iter().position(|f| f.client == client) {
-                                frames[index].title = window_title(display, client);
-                                paint_frame_bar(display, &frames[index], white, black);
+                                frames[index].title = window_title(display, client, &atoms);
+                                paint_frame_bar(display, &frames[index], &chrome);
                                 repaint_panel(display, &mut bar, &frames);
                             }
                         }
@@ -428,6 +441,9 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
                     }
                     xlib::DestroyNotify => {
                         let gone = event.destroy_window.window;
+                        // A size remembered for a window that never mapped must
+                        // not outlive it.
+                        pending.remove(&gone);
                         if let Some(index) = frames.iter().position(|f| f.client == gone) {
                             let frame = frames.remove(index);
                             xlib::XDestroyWindow(display, frame.frame);
@@ -461,11 +477,18 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
 
+        // The server died under this connection, so there is nothing to put back
+        // and no call left that would not be an IO error.
+        if !alive(owner) {
+            return;
+        }
         // Leave the display as it was found: frames go, clients stay.
         for frame in frames.drain(..) {
             xlib::XReparentWindow(display, frame.client, root, 0, 0);
             xlib::XDestroyWindow(display, frame.frame);
         }
+        let mut chrome = chrome;
+        chrome.destroy(display);
         if let Some(mut strip) = bar.take() {
             strip.destroy(display);
         }
@@ -477,19 +500,29 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>) {
     }
 }
 
-/// Swallows an X protocol error, which is routine for a window manager.
-/// Set once the root selection has been accepted, and set back to 0 by a
-/// refusal. Read after `XSync` so the verdict is known before the loop starts.
+/// Whether the process whose display this is still exists.
+///
+/// The server is a child of the engine, so its pid is the honest answer to "is
+/// this display still there"; `/proc` is a directory listing rather than a call
+/// that can fail on a dead socket the way every other check here would.
+fn alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
 /// `BadAccess`: the selection this manager needs is already somebody else's.
 const BAD_ACCESS: i32 = 10;
 
-/// Whether this process already answered a `BadAccess` on this display.
+/// Set while the root selection has not been refused, and cleared by a refusal.
 ///
-/// It is one flag for the process, so it has to be cleared by the manager that
-/// sets up a *new* display connection: an engine that restarts keeps the flag
-/// from the previous run and would sit out a display nobody else manages.
+/// It is one flag for the process, so it has to be set by the manager that opens
+/// a *new* display connection: an engine that restarts keeps the flag from the
+/// previous run and would sit out a display nobody else manages.
 static MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+/// Swallows an X protocol error, which is routine for a window manager: a client
+/// dying mid-request, a window already unmapped, a frame drawn after its client
+/// left. `BadAccess` on the root selection is the one that carries a verdict, so
+/// it is the one recorded.
 unsafe extern "C" fn ignore_x_error(
     _display: *mut xlib::Display,
     event: *mut xlib::XErrorEvent,
@@ -498,6 +531,64 @@ unsafe extern "C" fn ignore_x_error(
         MAIN.store(0, Ordering::SeqCst);
     }
     0
+}
+
+/// The pen the desktop is drawn with.
+///
+/// A GC and the `fixed` font, made once when the manager starts. Repeating that
+/// work on every exposure — and freeing a font a GC still refers to, which is
+/// what per-paint loading invites — is both slower and wrong: `fixed` is what
+/// every label here is measured and drawn in, so exactly one of it must own the
+/// GC for as long as the manager runs.
+struct Chrome {
+    gc: xlib::GC,
+    font: Option<*mut xlib::XFontStruct>,
+    /// The desktop brown, allocated from the default colormap once. An `XColor`
+    /// allocated per exposure spends a palette entry per frame.
+    desktop: u64,
+    white: u64,
+    black: u64,
+}
+
+impl Chrome {
+    unsafe fn new(display: *mut xlib::Display, root: xlib::Window) -> Option<Self> {
+        let screen = xlib::XDefaultScreen(display);
+        let gc = xlib::XCreateGC(display, root, 0, std::ptr::null_mut());
+        if gc.is_null() {
+            return None;
+        }
+        let font = xlib::XLoadQueryFont(display, c"fixed".as_ptr());
+        let font = if font.is_null() { None } else { Some(font) };
+        if let Some(font) = font {
+            xlib::XSetFont(display, gc, (*font).fid);
+        }
+        let mut colour: xlib::XColor = std::mem::zeroed();
+        colour.red = DESKTOP_RGB.0;
+        colour.green = DESKTOP_RGB.1;
+        colour.blue = DESKTOP_RGB.2;
+        colour.flags = xlib::DoRed | xlib::DoGreen | xlib::DoBlue;
+        let colormap = xlib::XDefaultColormap(display, screen);
+        let desktop = if xlib::XAllocColor(display, colormap, &mut colour) != 0 {
+            colour.pixel
+        } else {
+            // No spare colour: a black desktop is what the display had anyway.
+            xlib::XBlackPixel(display, screen)
+        };
+        Some(Chrome {
+            gc,
+            font,
+            desktop,
+            white: xlib::XWhitePixel(display, screen),
+            black: xlib::XBlackPixel(display, screen),
+        })
+    }
+
+    unsafe fn destroy(&mut self, display: *mut xlib::Display) {
+        if let Some(font) = self.font.take() {
+            xlib::XFreeFont(display, font);
+        }
+        xlib::XFreeGC(display, self.gc);
+    }
 }
 
 /// Paints the desktop itself, in place of the display's black.
@@ -511,45 +602,24 @@ unsafe fn paint_root(
     root: xlib::Window,
     width: i32,
     height: i32,
-    white: u64,
+    chrome: &Chrome,
 ) {
-    let screen = xlib::XDefaultScreen(display);
-    let colormap = xlib::XDefaultColormap(display, screen);
-    let mut colour: xlib::XColor = std::mem::zeroed();
-    colour.red = DESKTOP_RGB.0;
-    colour.green = DESKTOP_RGB.1;
-    colour.blue = DESKTOP_RGB.2;
-    colour.flags = xlib::DoRed | xlib::DoGreen | xlib::DoBlue;
-    let gc = xlib::XCreateGC(display, root, 0, std::ptr::null_mut());
-    if gc.is_null() {
-        return;
-    }
-    if xlib::XAllocColor(display, colormap, &mut colour) != 0 {
-        xlib::XSetForeground(display, gc, colour.pixel);
-    } else {
-        xlib::XSetForeground(display, gc, xlib::XBlackPixel(display, screen));
-    }
-    xlib::XFillRectangle(display, root, gc, 0, 0, width as u32, height as u32);
-    xlib::XSetForeground(display, gc, white);
-    if let Ok(font) = std::ffi::CString::new("fixed") {
-        let loaded = xlib::XLoadQueryFont(display, font.as_ptr());
-        if !loaded.is_null() {
-            xlib::XSetFont(display, gc, (*loaded).fid);
-        }
-    }
-    // What the display is for, in the corner it is empty at. Short enough to fit
-    // a phone's picture and honest about where the controls are.
+    xlib::XSetForeground(display, chrome.gc, chrome.desktop);
+    xlib::XFillRectangle(display, root, chrome.gc, 0, 0, width as u32, height as u32);
+    xlib::XSetForeground(display, chrome.gc, chrome.white);
+    // What the display is for, just above the bar it points at: windows open
+    // from the top of the screen, so the line under them is the part of the
+    // desktop that stays readable.
     let hint = c"aixodia desktop - terminal and browser are on the bar below";
     xlib::XDrawString(
         display,
         root,
-        gc,
+        chrome.gc,
         24,
-        height / 2,
+        height - crate::panel::HEIGHT - 12,
         hint.as_ptr(),
         hint.to_bytes().len() as i32,
     );
-    xlib::XFreeGC(display, gc);
 }
 
 /// Draws the strip again, with the windows that are open right now.
@@ -559,17 +629,21 @@ unsafe fn repaint_panel(display: *mut xlib::Display, bar: &mut Option<Panel>, fr
     };
     let tasks: Vec<(u64, String)> = frames
         .iter()
-        .map(|frame| (frame.client, window_title(display, frame.client)))
+        .map(|frame| (frame.client, frame.title.clone()))
         .collect();
     bar.paint(display, &tasks);
 }
 
 /// A window's title, or a plain name when it has not set one.
 ///
-/// `XFetchName` is the old Latin-1 property, which is what a program that does
-/// not know about `_NET_WM_NAME` sets; a program that only sets the new one shows
-/// as "window" here and is still reachable, which is the part that matters.
-unsafe fn window_title(display: *mut xlib::Display, client: xlib::Window) -> String {
+/// `_NET_WM_NAME` is UTF-8 and is what anything modern sets, which matters here:
+/// a title in Thai written to `WM_NAME` arrives as mojibake and a number of
+/// programs do not write it at all. `WM_NAME` is the older Latin-1 property and
+/// is the fallback, because everything else still sets it.
+unsafe fn window_title(display: *mut xlib::Display, client: xlib::Window, atoms: &Atoms) -> String {
+    if let Some(title) = net_name(display, client, atoms) {
+        return title;
+    }
     let mut name: *mut std::ffi::c_char = std::ptr::null_mut();
     if xlib::XFetchName(display, client, &mut name) == 0 || name.is_null() {
         return "window".to_string();
@@ -578,11 +652,85 @@ unsafe fn window_title(display: *mut xlib::Display, client: xlib::Window) -> Str
         .to_string_lossy()
         .into_owned();
     xlib::XFree(name as *mut std::ffi::c_void);
+    named(title)
+}
+
+/// The UTF-8 title, when the client published one.
+unsafe fn net_name(
+    display: *mut xlib::Display,
+    client: xlib::Window,
+    atoms: &Atoms,
+) -> Option<String> {
+    let mut kind: xlib::Atom = 0;
+    let mut format: i32 = 0;
+    let mut count: std::os::raw::c_ulong = 0;
+    let mut after: std::os::raw::c_ulong = 0;
+    let mut data: *mut u8 = std::ptr::null_mut();
+    let status = xlib::XGetWindowProperty(
+        display,
+        client,
+        atoms.net_wm_name,
+        0,
+        // Titles longer than this are cut by the bar in any case.
+        256,
+        0,
+        atoms.utf8_string,
+        &mut kind,
+        &mut format,
+        &mut count,
+        &mut after,
+        &mut data,
+    );
+    if status != 0 || data.is_null() {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(data, count as usize).to_vec();
+    xlib::XFree(data as *mut std::ffi::c_void);
+    if format != 8 || kind != atoms.utf8_string {
+        return None;
+    }
+    let title = String::from_utf8_lossy(&bytes).into_owned();
+    let title = named(title);
+    if title == "window" {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+/// A title worth writing, or the plain name for a window that has none.
+fn named(title: String) -> String {
     if title.trim().is_empty() {
         "window".to_string()
     } else {
-        title
+        title.trim().to_string()
     }
+}
+
+/// The size a newly adopted window asked to be.
+///
+/// Three answers, in order of authority: the size it asked for in a request that
+/// arrived before its frame existed, the size it mapped at, and — when that is a
+/// placeholder — the size in its own hints. xterm maps itself at one pixel and
+/// puts its real geometry in `WM_NORMAL_HINTS`, so a manager that stops at the
+/// first non-empty answer gives it a window one pixel across.
+fn requested_size(hints: &SizeHints, mapped: (i32, i32), asked: Option<(i32, i32)>) -> (i32, i32) {
+    let (width, height) = asked.unwrap_or(mapped);
+    let width = if width > 1 {
+        width
+    } else if hints.ask_width > 1 {
+        hints.ask_width
+    } else {
+        width
+    };
+    let height = if height > 1 {
+        height
+    } else if hints.ask_height > 1 {
+        hints.ask_height
+    } else {
+        height
+    };
+    (width, height)
 }
 
 unsafe fn adopt(
@@ -590,9 +738,9 @@ unsafe fn adopt(
     root: xlib::Window,
     client: xlib::Window,
     frames: &mut Vec<Frame>,
-    white: u64,
-    black: u64,
     asked: Option<(i32, i32)>,
+    atoms: &Atoms,
+    chrome: &Chrome,
 ) {
     if frames.iter().any(|f| f.client == client) {
         xlib::XMapWindow(display, client);
@@ -612,33 +760,9 @@ unsafe fn adopt(
     // The client's own size is what it asked to be, brought inside its limits
     // and on a step it can draw in.
     let hints = SizeHints::read(display, client);
-    // The size it asked to be, and failing that the size it mapped at: a client
-    // that maps at nothing has said nothing, and a frame of nothing is a window
-    // nobody can use.
-    let (asked_width, asked_height) = match asked {
-        Some((width, height)) => (width, height),
-        None => (attrs.width, attrs.height),
-    };
-    // A window mapped at one pixel has said nothing about itself in its
-    // attributes; what it asks for in its hints is the real size.
-    let (asked_width, asked_height) = if asked_width <= 1 || asked_height <= 1 {
-        (
-            if hints.ask_width > 1 {
-                hints.ask_width
-            } else {
-                asked_width
-            },
-            if hints.ask_height > 1 {
-                hints.ask_height
-            } else {
-                asked_height
-            },
-        )
-    } else {
-        (asked_width, asked_height)
-    };
+    let (asked_width, asked_height) = requested_size(&hints, (attrs.width, attrs.height), asked);
     let (width, height) = hints.frame_for(asked_width, asked_height);
-    eprintln!("DBG adopt frame={width}x{height}"); // Step each new window along so they do not arrive on top of each other.
+    // Step each new window along so they do not arrive on top of each other.
     let step = frames.len() as i32 % 8;
     let x = 40 + step * 28;
     let y = 40 + step * 28;
@@ -651,8 +775,8 @@ unsafe fn adopt(
         width as u32,
         height as u32,
         1,
-        white,
-        black,
+        chrome.white,
+        chrome.black,
     );
     xlib::XSelectInput(
         display,
@@ -663,11 +787,10 @@ unsafe fn adopt(
             | xlib::ExposureMask
             | xlib::SubstructureNotifyMask,
     );
-    xlib::XSelectInput(
-        display,
-        client,
-        xlib::PropertyChangeMask | xlib::StructureNotifyMask,
-    );
+    // Only the title is wanted from the client itself: its configuration comes
+    // through the frame, so asking for structure as well would deliver events
+    // nobody reads.
+    xlib::XSelectInput(display, client, xlib::PropertyChangeMask);
     xlib::XSetWindowBorderWidth(display, client, 0);
     xlib::XReparentWindow(display, client, frame, 0, TITLE_H);
     xlib::XResizeWindow(
@@ -684,7 +807,7 @@ unsafe fn adopt(
         client,
         drag: Drag::None,
         hints,
-        title: window_title(display, client),
+        title: window_title(display, client, atoms),
     });
 }
 
@@ -790,11 +913,10 @@ unsafe fn paint(
     display: *mut xlib::Display,
     event: &xlib::XExposeEvent,
     frames: &[Frame],
-    white: u64,
-    black: u64,
+    chrome: &Chrome,
 ) {
     if let Some(frame) = frames.iter().find(|f| f.frame == event.window) {
-        paint_frame_bar(display, frame, white, black);
+        paint_frame_bar(display, frame, chrome);
     }
 }
 
@@ -802,60 +924,73 @@ unsafe fn paint(
 ///
 /// The bar is repainted whenever the name changes, so a program that names its
 /// window after it is mapped is not left as the program's own name.
-unsafe fn paint_frame_bar(display: *mut xlib::Display, frame: &Frame, white: u64, black: u64) {
+unsafe fn paint_frame_bar(display: *mut xlib::Display, frame: &Frame, chrome: &Chrome) {
     let mut attrs: xlib::XWindowAttributes = std::mem::zeroed();
     if xlib::XGetWindowAttributes(display, frame.frame, &mut attrs) == 0 {
         return;
     }
-    let gc = xlib::XCreateGC(display, frame.frame, 0, std::ptr::null_mut());
-    if gc.is_null() {
-        return;
-    }
-    // The `fixed` font, so one character is one fixed six pixels and the room
-    // left for a title can be counted rather than guessed.
-    if let Ok(name) = std::ffi::CString::new("fixed") {
-        let font = xlib::XLoadQueryFont(display, name.as_ptr());
-        if !font.is_null() {
-            xlib::XSetFont(display, gc, (*font).fid);
-            xlib::XFreeFont(display, font);
-        }
-    }
     // The bar in dark grey, with the close box marked in white at its right.
-    xlib::XSetForeground(display, gc, black);
+    xlib::XSetForeground(display, chrome.gc, chrome.black);
     xlib::XFillRectangle(
         display,
         frame.frame,
-        gc,
+        chrome.gc,
         0,
         0,
         attrs.width as u32,
         TITLE_H as u32,
     );
-    xlib::XSetForeground(display, gc, white);
-    let room = ((attrs.width - CLOSE_W - 12) / CHAR_W).max(0) as usize;
-    let label = crate::panel::truncation(&frame.title, room);
+    xlib::XSetForeground(display, chrome.gc, chrome.white);
+    // The room left for a title, counted in the font it is drawn in: the bar is
+    // cut by characters because `fixed` has one advance, `CHAR_W`, for all of
+    // them.
+    let room = ((attrs.width - CLOSE_W - 12).max(0) / CHAR_W) as usize;
+    let label = crate::panel::shorten(&frame.title, room);
     if let Ok(drawn) = std::ffi::CString::new(label) {
         let bytes = drawn.as_bytes().len();
         xlib::XDrawString(
             display,
             frame.frame,
-            gc,
+            chrome.gc,
             6,
             TITLE_H - 5,
             drawn.as_ptr(),
             bytes as i32,
         );
     }
+    let box_x = attrs.width - CLOSE_W + 3;
+    let box_y = 4;
+    let box_w = CLOSE_W - 7;
+    let box_h = TITLE_H - 8;
     xlib::XDrawRectangle(
         display,
         frame.frame,
-        gc,
-        attrs.width - CLOSE_W + 3,
-        4,
-        (CLOSE_W - 7) as u32,
-        (TITLE_H - 8) as u32,
+        chrome.gc,
+        box_x,
+        box_y,
+        box_w as u32,
+        box_h as u32,
     );
-    xlib::XFreeGC(display, gc);
+    // A cross inside the box: an empty square reads as "maximise" to anyone who
+    // has used a window before, and this one closes.
+    xlib::XDrawLine(
+        display,
+        frame.frame,
+        chrome.gc,
+        box_x + 1,
+        box_y + 1,
+        box_x + box_w - 1,
+        box_y + box_h - 1,
+    );
+    xlib::XDrawLine(
+        display,
+        frame.frame,
+        chrome.gc,
+        box_x + 1,
+        box_y + box_h - 1,
+        box_x + box_w - 1,
+        box_y + 1,
+    );
 }
 
 /// The atoms a window manager needs by name.
@@ -910,6 +1045,50 @@ mod tests {
         assert!(!on_grip(150, 150));
         // The bar is a move, not a resize, even though it touches the top edge.
         assert!(!on_grip(width / 2, 2));
+    }
+
+    #[test]
+    fn a_window_that_maps_at_one_pixel_takes_the_size_it_asked_for() {
+        // The xterm case, measured on a real display: it maps at 1x1 and asks for
+        // 604x368 through its hints. The frame that followed used to be 84x82,
+        // which is the minimum, not the window.
+        let mut hints = SizeHints::default();
+        hints.ask_width = 604;
+        hints.ask_height = 368;
+        hints.width_inc = 6;
+        hints.height_inc = 13;
+        hints.base_width = 4;
+        hints.base_height = 4;
+        let asked = requested_size(&hints, (1, 1), Some((1, 1)));
+        assert_eq!(asked, (604, 368));
+        assert_eq!(hints.frame_for(asked.0, asked.1), (608, 390));
+    }
+
+    #[test]
+    fn a_window_that_maps_with_a_size_keeps_its_own() {
+        let mut hints = SizeHints::default();
+        hints.ask_width = 604;
+        hints.ask_height = 368;
+        // A window that already says 150x100 is 150x100, whatever its hints say.
+        assert_eq!(requested_size(&hints, (150, 100), None), (150, 100));
+        // And a request that arrived before its frame wins over the mapping.
+        assert_eq!(
+            requested_size(&hints, (150, 100), Some((300, 200))),
+            (300, 200)
+        );
+    }
+
+    #[test]
+    fn a_display_whose_server_is_gone_is_not_talked_to() {
+        assert!(alive(std::process::id()));
+        assert!(!alive(0));
+    }
+
+    #[test]
+    fn a_window_with_no_title_is_still_named() {
+        assert_eq!(named("".to_string()), "window");
+        assert_eq!(named("   ".to_string()), "window");
+        assert_eq!(named("  xterm  ".to_string()), "xterm");
     }
 
     #[test]

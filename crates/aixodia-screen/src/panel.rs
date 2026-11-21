@@ -55,6 +55,7 @@ impl Panel {
         display: *mut xlib::Display,
         root: xlib::Window,
         width: i32,
+        y: i32,
     ) -> Option<Panel> {
         let screen = xlib::XDefaultScreen(display);
         let white = xlib::XWhitePixel(display, screen);
@@ -63,7 +64,7 @@ impl Panel {
             display,
             root,
             0,
-            0,
+            y,
             width as u32,
             HEIGHT as u32,
             0,
@@ -153,7 +154,7 @@ impl Panel {
             if x > self.width - 90 {
                 break;
             }
-            let label = truncation(title, 16);
+            let label = shorten(title, 16);
             let width = (self.text_width(&label) + 20).min(180);
             self.button(display, x, width, &label);
             self.hits.push(Hit {
@@ -251,8 +252,11 @@ impl Panel {
     }
 }
 
-/// A label no longer than the button that carries it.
-pub fn truncation(title: &str, limit: usize) -> String {
+/// A label no longer than the button or bar that carries it.
+///
+/// Counted in characters, not bytes: a title in Thai would otherwise be cut in
+/// the middle of a character and drawn as a replacement mark.
+pub fn shorten(title: &str, limit: usize) -> String {
     let trimmed = title.trim();
     if trimmed.is_empty() {
         return "window".to_string();
@@ -260,6 +264,45 @@ pub fn truncation(title: &str, limit: usize) -> String {
     match trimmed.char_indices().nth(limit) {
         Some((cut, _)) => format!("{}…", &trimmed[..cut]),
         None => trimmed.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_title_is_kept_as_it_is() {
+        assert_eq!(shorten("xterm", 16), "xterm");
+        assert_eq!(shorten("  1234567890123456  ", 16), "1234567890123456");
+    }
+
+    #[test]
+    fn a_long_title_is_cut_with_a_mark() {
+        assert_eq!(shorten("12345678901234567", 16), "1234567890123456…");
+    }
+
+    #[test]
+    fn a_title_in_a_wide_alphabet_is_cut_between_characters() {
+        // Three characters, a limit of two: one character is dropped and the
+        // result is still valid text, never half of one.
+        assert_eq!(shorten("กขค", 2), "กข…");
+    }
+
+    #[test]
+    fn a_window_without_a_title_says_so() {
+        assert_eq!(shorten("", 16), "window");
+        assert_eq!(shorten("   ", 16), "window");
+    }
+
+    #[test]
+    fn the_clock_says_which_hour_it_is() {
+        // The stamp ends in its zone, so a phone showing an hour that disagrees
+        // with its own cannot be mistaken for a bug in the desktop.
+        let stamp = clock().1;
+        assert_eq!(stamp.len(), 6);
+        assert!(stamp.ends_with('z'));
+        assert_eq!(&stamp[2..3], ":");
     }
 }
 
@@ -318,7 +361,21 @@ pub fn launch(program: &str, display_name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    if let Err(err) = started {
-        tracing::warn!("could not start {program} ({binary}) on {display_name}: {err}");
+    match started {
+        // A child that is never waited for stays a zombie until the engine
+        // exits, one per launch. The wait is on its own thread so a launcher
+        // never holds up the manager.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                if let Ok(status) = child.wait() {
+                    if !status.success() {
+                        tracing::warn!("{binary} exited with {status}");
+                    }
+                }
+            });
+        }
+        Err(err) => {
+            tracing::warn!("could not start {program} ({binary}) on {display_name}: {err}");
+        }
     }
 }
