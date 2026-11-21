@@ -416,6 +416,13 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &str) -> Result<T> {
 
 // --------------------------------------------------------------------- shell
 
+/// Bounds for the model-supplied shell timeout, in milliseconds. They are
+/// applied before the `f64` becomes a `Duration`: `from_secs_f64` panics on
+/// values that overflow a `Duration`, and this binary aborts on panic in
+/// release.
+const MIN_SHELL_TIMEOUT_MS: f64 = 1_000.0;
+const MAX_SHELL_TIMEOUT_MS: f64 = 300_000.0;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ShellInput {
@@ -424,21 +431,21 @@ struct ShellInput {
     workdir: String,
 }
 
+/// The shell's timeout, with the model's number clamped before conversion.
+/// No timeout keeps the historical two minutes.
+fn shell_timeout(millis: f64) -> Duration {
+    if millis <= 0.0 {
+        return Duration::from_secs(120);
+    }
+    Duration::from_secs_f64(millis.clamp(MIN_SHELL_TIMEOUT_MS, MAX_SHELL_TIMEOUT_MS) / 1000.0)
+}
+
 async fn run_shell(ctx: &ToolContext, args: &str) -> Result<String> {
     let input: ShellInput = parse_args(args)?;
     if input.command.trim().is_empty() {
         bail!("command must not be empty");
     }
-    let mut timeout = Duration::from_secs(120);
-    if input.timeout > 0.0 {
-        timeout = Duration::from_secs_f64(input.timeout / 1000.0);
-        if timeout > Duration::from_secs(300) {
-            timeout = Duration::from_secs(300);
-        }
-        if timeout < Duration::from_secs(1) {
-            timeout = Duration::from_secs(1);
-        }
-    }
+    let timeout = shell_timeout(input.timeout);
 
     // An explicit `workdir` is a one-off override; otherwise the directory the
     // chat set with `set_directory` wins over the home directory.
@@ -1140,6 +1147,16 @@ mod tests {
             .expect("shell");
         assert_eq!(out, "oops\nexit code 3");
         assert!(run_shell(&ctx, r#"{"command":""}"#).await.is_err());
+    }
+
+    #[test]
+    fn shell_timeout_is_clamped_before_the_f64_conversion() {
+        assert_eq!(shell_timeout(-1.0), Duration::from_secs(120));
+        assert_eq!(shell_timeout(0.0), Duration::from_secs(120));
+        assert_eq!(shell_timeout(1.0), Duration::from_secs(1));
+        assert_eq!(shell_timeout(5_000.0), Duration::from_secs(5));
+        // A finite value large enough to overflow `Duration` used to panic.
+        assert_eq!(shell_timeout(2e22), Duration::from_secs(300));
     }
 
     #[tokio::test]
