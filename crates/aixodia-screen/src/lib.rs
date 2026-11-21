@@ -19,6 +19,7 @@
 pub mod capture;
 pub mod display;
 pub mod encoder;
+pub mod panel;
 pub mod server;
 pub mod wm;
 
