@@ -234,7 +234,7 @@ impl H264Encoder {
 /// X server hands over and converting the whole frame first would cost more
 /// than the encode. Only the three meaningful bytes of each pixel are copied
 /// into the RGB buffer the encoder takes.
-fn encode_tile(pixels: &[u8], width: u32, height: u32, quality: u8) -> Option<Vec<u8>> {
+pub(crate) fn encode_tile(pixels: &[u8], width: u32, height: u32, quality: u8) -> Option<Vec<u8>> {
     let count = (width as usize) * (height as usize);
     let mut rgb = Vec::with_capacity(count * 3);
     for pixel in pixels.chunks_exact(4) {

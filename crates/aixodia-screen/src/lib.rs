@@ -1,10 +1,11 @@
 //! Looking at, and touching, the display the engine runs in front of.
 //!
-//! This is not VNC and does not pretend to be: there is no RFB handshake, no
-//! second password, and no separate port to open. It is a socket on the engine
-//! the app already signs in to, carrying screen tiles one way and pointer and
-//! keyboard events the other, so a phone can see the machine the agent works on
-//! and put a finger on it.
+//! The app's own transport is a socket on the engine it already signs in to,
+//! carrying screen tiles one way and pointer and keyboard events the other, so a
+//! phone can see the machine the agent works on and put a finger on it. Beside
+//! it, [`rfb`] serves the published VNC protocol on loopback, for a viewer that
+//! is already installed: two doors onto one display, and the app's is the faster
+//! one.
 //!
 //! What travels is deliberately not a video stream. The screen is cut into
 //! tiling squares, each is compared with the previous frame, and only the ones
@@ -20,6 +21,7 @@ pub mod capture;
 pub mod display;
 pub mod encoder;
 pub mod panel;
+pub mod rfb;
 pub mod server;
 pub mod wm;
 

@@ -804,6 +804,26 @@ impl Input {
     ///
     /// A keycode is what X presses, not a keysym, and which number it is depends
     /// on the keyboard — XKeysymToKeycode asks the server, so a name is enough.
+    /// Presses or releases one key, named by its X keysym.
+    ///
+    /// `key` is one keystroke — down and up together — because a shell command
+    /// is typed rather than held. A remote viewer sends the halves separately,
+    /// since holding Ctrl is a state and not a keystroke.
+    pub fn keysym(&self, keysym: u32, pressed: bool) {
+        if self.display.is_null() {
+            return;
+        }
+        let code = unsafe { xlib::XKeysymToKeycode(self.display, keysym as xlib::KeySym) };
+        if code == 0 {
+            // A keysym this keyboard has no keycode for: nothing to press.
+            return;
+        }
+        unsafe {
+            xtest::XTestFakeKeyEvent(self.display, code as u32, pressed as i32, 0);
+            xlib::XFlush(self.display);
+        }
+    }
+
     pub fn key(&self, keysym_name: &str, mods: &[String]) {
         if self.display.is_null() {
             return;

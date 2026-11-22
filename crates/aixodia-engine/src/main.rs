@@ -325,6 +325,28 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .await?
         .unwrap_or_default();
     let screen = aixodia_screen::ScreenHub::new(display, token.clone());
+    // The second door onto the display: a stock VNC viewer, on loopback, with no
+    // password of its own. The app's own socket stays the faster path; this one
+    // exists so a viewer somebody already has can be used without installing
+    // anything. It is loopback because RFB's unauthenticated mode is exactly
+    // that, and a display on a public interface is an open desktop.
+    match std::env::var("AIXODIA_RFB").as_deref() {
+        Ok("0") | Ok("off") | Ok("no") => {}
+        _ => {
+            let port: u16 = std::env::var("AIXODIA_RFB_PORT")
+                .ok()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(5900);
+            match aixodia_screen::rfb::start(aixodia_screen::rfb::Config {
+                port,
+                quality: 75,
+                tile: 64,
+            }) {
+                Ok(port) => tracing::info!("vnc (RFB) listening on 127.0.0.1:{port}"),
+                Err(err) => tracing::warn!("vnc (RFB) not started: {err}"),
+            }
+        }
+    }
     let terminal = Arc::new(terminal_server);
     terminal.set_logf(Arc::new(|message| {
         d1log::info(message.clone());

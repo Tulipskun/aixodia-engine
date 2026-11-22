@@ -801,6 +801,10 @@ unsafe fn adopt(
     );
     xlib::XMapWindow(display, client);
     xlib::XMapWindow(display, frame);
+    // A new window is where the typing goes: a program that opens a prompt and
+    // then waits for a keystroke is useless if the keyboard is still somewhere
+    // else.
+    xlib::XSetInputFocus(display, client, xlib::RevertToParent, xlib::CurrentTime);
     xlib::XAddToSaveSet(display, client);
     frames.push(Frame {
         frame,
