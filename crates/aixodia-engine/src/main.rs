@@ -330,53 +330,86 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // exists so a viewer somebody already has can be used without installing
     // anything. It is loopback because RFB's unauthenticated mode is exactly
     // that, and a display on a public interface is an open desktop.
-    match std::env::var("AIXODIA_RFB").as_deref() {
-        Ok("0") | Ok("off") | Ok("no") => {}
-        _ => {
-            let port: u16 = std::env::var("AIXODIA_RFB_PORT")
+    //
+    // The settings come from a file first, because the launcher unsets every
+    // `AIXODIA_*` variable before it execs the engine — a shell variable cannot
+    // reach a supervised engine — and from the environment second, for a
+    // hand-run one.
+    let vnc_file = std::env::var("AIXODIA_RFB_CONF")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join("vnc.conf"));
+    let vnc = match std::fs::read_to_string(&vnc_file) {
+        Ok(text) => {
+            tracing::info!("vnc (RFB) settings from {}", vnc_file.display());
+            aixodia_screen::rfb::Settings::parse(&text)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            aixodia_screen::rfb::Settings::default()
+        }
+        Err(err) => {
+            tracing::warn!("vnc (RFB) cannot read {}: {err}", vnc_file.display());
+            aixodia_screen::rfb::Settings::default()
+        }
+    };
+    let environment_off = match std::env::var("AIXODIA_RFB").as_deref() {
+        Ok("0") | Ok("off") | Ok("no") => true,
+        _ => false,
+    };
+    if !vnc.off && !environment_off {
+        let port = vnc
+            .port
+            .or_else(|| {
+                std::env::var("AIXODIA_RFB_PORT")
+                    .ok()
+                    .and_then(|port| port.parse().ok())
+            })
+            .unwrap_or(5900);
+        // Loopback is the default because RFB's `None` security type is no
+        // password at all. An operator who wants a LAN viewer — or who wants to
+        // measure one — says so, and is told what they just did.
+        let host = vnc
+            .host
+            .clone()
+            .or_else(|| std::env::var("AIXODIA_RFB_HOST").ok())
+            .filter(|host| !host.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+            tracing::warn!(
+                "vnc (RFB) on {host}: no password, so anyone who can reach that address can use this desktop"
+            );
+        }
+        // A recorded stream is how another client's behaviour gets measured —
+        // its speed, its thresholds, its timing — instead of guessed at from its
+        // documentation.
+        let log_path = vnc.input_log.clone().or_else(|| {
+            std::env::var("AIXODIA_RFB_INPUT_LOG")
                 .ok()
-                .and_then(|port| port.parse().ok())
-                .unwrap_or(5900);
-            // Loopback is the default because RFB's `None` security type is no
-            // password at all. An operator who wants a LAN viewer — or who wants
-            // to measure one — says so, and is told what they just did.
-            let host = std::env::var("AIXODIA_RFB_HOST")
-                .ok()
-                .filter(|host| !host.trim().is_empty())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-                tracing::warn!(
-                    "vnc (RFB) on {host}: no password, so anyone who can reach that address can use this desktop"
-                );
-            }
-            // `AIXODIA_RFB_INPUT_LOG=path` writes every pointer and key event a
-            // viewer sends, so another client's behaviour can be measured
-            // instead of guessed at.
-            let record = match std::env::var("AIXODIA_RFB_INPUT_LOG") {
-                Ok(path) if !path.trim().is_empty() => match std::fs::File::create(&path) {
-                    Ok(file) => {
-                        tracing::info!("vnc (RFB) recording input to {path}");
-                        Some(std::sync::Arc::new(std::sync::Mutex::new(
-                            std::io::BufWriter::new(file),
-                        )))
-                    }
-                    Err(err) => {
-                        tracing::warn!("vnc (RFB) not recording input: {err}");
-                        None
-                    }
-                },
-                _ => None,
-            };
-            match aixodia_screen::rfb::start(aixodia_screen::rfb::Config {
-                port,
-                host: host.clone(),
-                quality: 75,
-                tile: 64,
-                record,
-            }) {
-                Ok(port) => tracing::info!("vnc (RFB) listening on {host}:{port}"),
-                Err(err) => tracing::warn!("vnc (RFB) not started: {err}"),
-            }
+                .filter(|path| !path.trim().is_empty())
+        });
+        let record = match log_path {
+            Some(path) => match std::fs::File::create(&path) {
+                Ok(file) => {
+                    tracing::info!("vnc (RFB) recording input to {path}");
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(
+                        std::io::BufWriter::new(file),
+                    )))
+                }
+                Err(err) => {
+                    tracing::warn!("vnc (RFB) not recording input: {err}");
+                    None
+                }
+            },
+            None => None,
+        };
+        match aixodia_screen::rfb::start(aixodia_screen::rfb::Config {
+            port,
+            host: host.clone(),
+            quality: vnc.quality.unwrap_or(75),
+            tile: 64,
+            record,
+        }) {
+            Ok(port) => tracing::info!("vnc (RFB) listening on {host}:{port}"),
+            Err(err) => tracing::warn!("vnc (RFB) not started: {err}"),
         }
     }
     let terminal = Arc::new(terminal_server);

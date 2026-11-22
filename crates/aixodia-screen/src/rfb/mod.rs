@@ -50,6 +50,65 @@ pub struct Config {
     pub record: Option<Arc<Mutex<BufWriter<File>>>>,
 }
 
+/// What a `vnc.conf` says about the VNC door.
+///
+/// A file rather than only environment variables, because the launcher unsets
+/// every `AIXODIA_*` variable before it execs the engine — deliberately, so a
+/// stray value in a shell cannot change the machine — which makes a file the
+/// only place a setting can live and still arrive. The format is one `key=value`
+/// per line, `#` for comments, and every key optional:
+///
+/// ```text
+/// host=0.0.0.0          # leave loopback: for a viewer on the LAN
+/// port=5900
+/// quality=75
+/// input_log=/root/.aixodia/vnc-input.log
+/// off                   # or off=1, to close the door entirely
+/// ```
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Settings {
+    pub off: bool,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub quality: Option<u8>,
+    pub input_log: Option<String>,
+}
+
+impl Settings {
+    /// Reads the file's text. Unknown keys and unreadable numbers are ignored
+    /// rather than fatal: a typo in a settings file must not take the picture
+    /// down with it.
+    pub fn parse(text: &str) -> Self {
+        let mut settings = Self::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (key, value) = match line.split_once('=') {
+                Some((key, value)) => (key.trim(), value.trim()),
+                None => (line, ""),
+            };
+            let value = value.split('#').next().unwrap_or("").trim();
+            match key {
+                "off" => settings.off = !matches!(value, "0" | "false" | "no"),
+                "host" if !value.is_empty() => settings.host = Some(value.to_string()),
+                "port" => settings.port = value.parse().ok(),
+                // Clamped rather than refused: 999 is somebody meaning "as sharp
+                // as it goes", and dropping it would quietly use a default.
+                "quality" => {
+                    settings.quality = value.parse().ok().map(|q: i32| q.clamp(1, 100) as u8)
+                }
+                "input_log" if !value.is_empty() => {
+                    settings.input_log = Some(value.to_string());
+                }
+                _ => {}
+            }
+        }
+        settings
+    }
+}
+
 /// Serves `config` on loopback until the process ends.
 ///
 /// Returns the port it is listening on, so the caller can say it in a log rather
@@ -416,6 +475,29 @@ mod tests {
             *byte = (index % 251) as u8;
         }
         (frame, vec![(0, 0, 4, 4), (4, 0, 4, 4)])
+    }
+
+    #[test]
+    fn a_settings_file_is_read_key_by_key() {
+        let settings = Settings::parse(
+            "# the VNC door\nhost=0.0.0.0\nport=5901\nquality=70  # a comment\n\ninput_log=/tmp/in.log\n",
+        );
+        assert_eq!(settings.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(settings.port, Some(5901));
+        assert_eq!(settings.quality, Some(70));
+        assert_eq!(settings.input_log.as_deref(), Some("/tmp/in.log"));
+        assert!(!settings.off);
+    }
+
+    #[test]
+    fn a_bare_off_key_closes_the_door_and_nonsense_is_ignored() {
+        let settings = Settings::parse("off\nport=seventy\nquality=999\nhost=\n");
+        assert!(settings.off);
+        // A port that is not a number keeps the default rather than becoming
+        // zero, and an empty host is no host at all.
+        assert_eq!(settings.port, None);
+        assert_eq!(settings.host, None);
+        assert_eq!(settings.quality, Some(100), "clamped, not dropped");
     }
 
     #[test]
