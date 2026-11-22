@@ -196,8 +196,20 @@ struct Hello {
     codec: &'static str,
 }
 
+/// Which way a wheel notch turns.
+///
+/// A phone drag is two numbers, so a drag that is mostly sideways has to say so
+/// rather than be sent as a vertical notch and hope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scroll {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
 /// What the client sends while it is connected.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
     /// Pointer moved to an absolute position on the captured screen.
@@ -230,11 +242,17 @@ enum ClientMessage {
         #[serde(default)]
         duration_ms: u64,
     },
-    /// One wheel notch; positive scrolls down.
+    /// One wheel notch; positive scrolls down, or right on the horizontal axis.
+    ///
+    /// The axis is a word rather than a sign because X has four wheel buttons,
+    /// and a client that only knows about the vertical one keeps working: the
+    /// field defaults to it.
     Wheel {
         x: i32,
         y: i32,
         delta: i32,
+        #[serde(default)]
+        axis: Scroll,
     },
     /// A key, by X keysym name, with modifiers held around it.
     Key {
@@ -751,12 +769,18 @@ impl ScreenHub {
                 input.move_pointer(to_x(x), to_y(y));
                 input.button(button_from(&button), false);
             }
-            ClientMessage::Wheel { x, y, delta } => {
+            ClientMessage::Wheel {
+                x,
+                y,
+                delta,
+                axis,
+            } => {
                 input.move_pointer(to_x(x), to_y(y));
-                let button = if delta > 0 {
-                    Button::WheelDown
-                } else {
-                    Button::WheelUp
+                let button = match (axis, delta > 0) {
+                    (Scroll::Vertical, true) => Button::WheelDown,
+                    (Scroll::Vertical, false) => Button::WheelUp,
+                    (Scroll::Horizontal, true) => Button::WheelRight,
+                    (Scroll::Horizontal, false) => Button::WheelLeft,
                 };
                 for _ in 0..delta.unsigned_abs().min(10) {
                     input.button(button, true);
@@ -1044,6 +1068,35 @@ fn run_capture(hub: Arc<ScreenHub>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wheel_notch_says_which_way_it_turns() {
+        // Two fingers moving sideways must arrive as a horizontal notch: X
+        // reports it on buttons 6 and 7, and a vertical button there would
+        // scroll the wrong list.
+        let sideways: ClientMessage =
+            serde_json::from_str(r#"{"type":"wheel","x":1,"y":2,"delta":-1,"axis":"horizontal"}"#)
+                .expect("a horizontal notch parses");
+        match sideways {
+            ClientMessage::Wheel { axis, delta, .. } => {
+                assert_eq!(axis, Scroll::Horizontal);
+                assert_eq!(delta, -1);
+            }
+            other => panic!("expected a wheel message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wheel_notch_without_an_axis_is_vertical() {
+        // An older client sends no axis at all, and must keep scrolling pages.
+        let plain: ClientMessage =
+            serde_json::from_str(r#"{"type":"wheel","x":1,"y":2,"delta":3}"#)
+                .expect("a plain notch parses");
+        match plain {
+            ClientMessage::Wheel { axis, .. } => assert_eq!(axis, Scroll::Vertical),
+            other => panic!("expected a wheel message, got {other:?}"),
+        }
+    }
 
     #[test]
     fn settings_from_a_client_are_clamped_not_trusted() {

@@ -289,8 +289,13 @@ fn press_buttons(input: &Input, held: &mut u8, mask: u8) {
         }
     }
     // A wheel notch is not a state that can be held: it is one click of a
-    // button X reports as 4 or 5.
-    for (bit, button) in [(3u8, Button::WheelUp), (4, Button::WheelDown)] {
+    // button X reports as 4, 5, 6 or 7 — up, down, left, right.
+    for (bit, button) in [
+        (3u8, Button::WheelUp),
+        (4, Button::WheelDown),
+        (5, Button::WheelLeft),
+        (6, Button::WheelRight),
+    ] {
         if mask & (1 << bit) != 0 && *held & (1 << bit) == 0 {
             input.button(button, true);
             input.button(button, false);

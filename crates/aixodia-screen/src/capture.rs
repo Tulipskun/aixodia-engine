@@ -60,8 +60,9 @@ pub struct Frame {
 }
 
 /// A pointer button, in X's numbering: 1 is left, 3 is right, 4 and 5 are the
-/// wheel. A wheel notch is a press and a release of one of those, which is how
-/// the X server has always reported scrolling.
+/// vertical wheel, 6 and 7 the horizontal one. A wheel notch is a press and a
+/// release of one of those, which is how the X server has always reported
+/// scrolling — including sideways, which a two-finger drag needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
     Left,
@@ -69,6 +70,8 @@ pub enum Button {
     Right,
     WheelUp,
     WheelDown,
+    WheelLeft,
+    WheelRight,
 }
 
 impl Button {
@@ -79,6 +82,8 @@ impl Button {
             Self::Right => 3,
             Self::WheelUp => 4,
             Self::WheelDown => 5,
+            Self::WheelLeft => 6,
+            Self::WheelRight => 7,
         }
     }
 }
@@ -793,6 +798,8 @@ impl Input {
             Button::Right => 3,
             Button::WheelUp => 4,
             Button::WheelDown => 5,
+            Button::WheelLeft => 6,
+            Button::WheelRight => 7,
         };
         unsafe {
             xtest::XTestFakeButtonEvent(self.display, code, i32::from(pressed), 0);
