@@ -769,12 +769,7 @@ impl ScreenHub {
                 input.move_pointer(to_x(x), to_y(y));
                 input.button(button_from(&button), false);
             }
-            ClientMessage::Wheel {
-                x,
-                y,
-                delta,
-                axis,
-            } => {
+            ClientMessage::Wheel { x, y, delta, axis } => {
                 input.move_pointer(to_x(x), to_y(y));
                 let button = match (axis, delta > 0) {
                     (Scroll::Vertical, true) => Button::WheelDown,
