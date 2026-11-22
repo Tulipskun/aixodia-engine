@@ -11,8 +11,10 @@ fn main() {
         .unwrap_or(5900);
     match aixodia_screen::rfb::start(aixodia_screen::rfb::Config {
         port,
+        host: "127.0.0.1".to_string(),
         quality: 75,
         tile: 64,
+        record: None,
     }) {
         Ok(port) => println!("rfb: listening on 127.0.0.1:{port}"),
         Err(err) => {

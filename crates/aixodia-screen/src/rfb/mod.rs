@@ -12,9 +12,12 @@
 
 pub mod protocol;
 
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::capture::{Button, Input, Screen};
 use crate::encoder;
@@ -31,10 +34,20 @@ const TILE: u32 = 64;
 pub struct Config {
     /// The port to listen on. Zero asks the kernel for a free one.
     pub port: u16,
+    /// The address to listen on. Loopback unless an operator says otherwise.
+    pub host: String,
     /// JPEG quality for a Tight tile, 1 to 100.
     pub quality: u8,
     /// Tile side in pixels; zero means the default.
     pub tile: u32,
+    /// Where to write what a viewer does, when the reader is measuring one.
+    ///
+    /// Every pointer and key event, with its millisecond offset and the button
+    /// mask, in one line each: enough to work out how another client turns
+    /// fingers into events — its speed, its thresholds, its timing — by
+    /// watching it work rather than by reading its source, which is not in the
+    /// file it ships.
+    pub record: Option<Arc<Mutex<BufWriter<File>>>>,
 }
 
 /// Serves `config` on loopback until the process ends.
@@ -44,7 +57,7 @@ pub struct Config {
 /// no password at all, and a display on a public interface is somebody else's
 /// desktop. Reaching it from another machine is a tunnel's job.
 pub fn start(mut config: Config) -> std::io::Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", config.port))?;
+    let listener = TcpListener::bind((config.host.as_str(), config.port))?;
     let port = listener.local_addr()?.port();
     if config.tile == 0 {
         config.tile = TILE;
@@ -158,6 +171,7 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
     let mut format = PixelFormat::NATIVE;
     let mut encoding = encoding::RAW;
     let mut previous = vec![0u8; (width as usize) * (height as usize) * 4];
+    let started = Instant::now();
     let mut buttons = 0u8;
 
     loop {
@@ -207,6 +221,7 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
                 let down = body[0] != 0;
                 let keysym = u32::from_be_bytes([body[3], body[4], body[5], body[6]]);
                 input.keysym(keysym, down);
+                record(config, started, "key", None, keysym as i32, i32::from(down));
             }
             // PointerEvent
             5 => {
@@ -217,6 +232,7 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
                 let y = u16::from_be_bytes([body[3], body[4]]) as i32;
                 input.move_pointer(x, y);
                 press_buttons(&input, &mut buttons, mask);
+                record(config, started, "pointer", Some(mask), x, y);
             }
             // ClientCutText: the viewer's clipboard. Nothing here reads it.
             6 => {
@@ -272,6 +288,31 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
         previous.copy_from_slice(&frame.pixels);
         requested = false;
         whole = false;
+    }
+}
+
+/// Writes one line about what a viewer just did, when recording is on.
+///
+/// The line is the whole point of the feature, so it is formatted by a function
+/// of its own rather than by an inline `write!`: a recorded stream is only
+/// useful if its shape is stable enough to compare two clients' streams field by
+/// field.
+fn record(config: &Config, started: Instant, kind: &str, mask: Option<u8>, x: i32, y: i32) {
+    let Some(log) = &config.record else { return };
+    let line = record_line(started.elapsed().as_millis(), kind, mask, x, y);
+    if let Ok(mut log) = log.lock() {
+        // A recorder that cannot write must not take the viewer down with it:
+        // the picture is the job, the log is the measuring.
+        let _ = log.write_all(line.as_bytes());
+        let _ = log.flush();
+    }
+}
+
+/// One recorded event, as text: `ms kind mask x y`.
+fn record_line(elapsed_ms: u128, kind: &str, mask: Option<u8>, x: i32, y: i32) -> String {
+    match mask {
+        Some(mask) => format!("{elapsed_ms} {kind} mask={mask} x={x} y={y}\n"),
+        None => format!("{elapsed_ms} {kind} x={x} y={y}\n"),
     }
 }
 
@@ -375,6 +416,18 @@ mod tests {
             *byte = (index % 251) as u8;
         }
         (frame, vec![(0, 0, 4, 4), (4, 0, 4, 4)])
+    }
+
+    #[test]
+    fn a_recorded_line_carries_the_time_the_buttons_and_the_place() {
+        // A recorded stream is compared field by field against another client's,
+        // so the shape matters as much as the values: time first (two streams can
+        // be laid side by side), then what happened, then where.
+        assert_eq!(
+            record_line(1234, "pointer", Some(1), 350, 250),
+            "1234 pointer mask=1 x=350 y=250\n"
+        );
+        assert_eq!(record_line(9, "key", None, 65293, 1), "9 key x=65293 y=1\n");
     }
 
     #[test]

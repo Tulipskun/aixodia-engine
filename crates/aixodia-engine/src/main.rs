@@ -337,12 +337,44 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
                 .ok()
                 .and_then(|port| port.parse().ok())
                 .unwrap_or(5900);
+            // Loopback is the default because RFB's `None` security type is no
+            // password at all. An operator who wants a LAN viewer — or who wants
+            // to measure one — says so, and is told what they just did.
+            let host = std::env::var("AIXODIA_RFB_HOST")
+                .ok()
+                .filter(|host| !host.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+                tracing::warn!(
+                    "vnc (RFB) on {host}: no password, so anyone who can reach that address can use this desktop"
+                );
+            }
+            // `AIXODIA_RFB_INPUT_LOG=path` writes every pointer and key event a
+            // viewer sends, so another client's behaviour can be measured
+            // instead of guessed at.
+            let record = match std::env::var("AIXODIA_RFB_INPUT_LOG") {
+                Ok(path) if !path.trim().is_empty() => match std::fs::File::create(&path) {
+                    Ok(file) => {
+                        tracing::info!("vnc (RFB) recording input to {path}");
+                        Some(std::sync::Arc::new(std::sync::Mutex::new(
+                            std::io::BufWriter::new(file),
+                        )))
+                    }
+                    Err(err) => {
+                        tracing::warn!("vnc (RFB) not recording input: {err}");
+                        None
+                    }
+                },
+                _ => None,
+            };
             match aixodia_screen::rfb::start(aixodia_screen::rfb::Config {
                 port,
+                host: host.clone(),
                 quality: 75,
                 tile: 64,
+                record,
             }) {
-                Ok(port) => tracing::info!("vnc (RFB) listening on 127.0.0.1:{port}"),
+                Ok(port) => tracing::info!("vnc (RFB) listening on {host}:{port}"),
                 Err(err) => tracing::warn!("vnc (RFB) not started: {err}"),
             }
         }
