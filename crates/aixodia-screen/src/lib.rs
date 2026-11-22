@@ -18,6 +18,7 @@
 //! bad link turns the quality and rate down from the client, with no restart.
 
 pub mod capture;
+pub mod cursor;
 pub mod display;
 pub mod encoder;
 pub mod panel;

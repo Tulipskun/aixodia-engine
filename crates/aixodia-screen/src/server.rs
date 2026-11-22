@@ -20,12 +20,14 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use base64::Engine as _;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::capture::{Button, Input, Screen};
+use crate::cursor;
 use crate::encoder::{self, EncodeSettings, H264Encoder};
 
 /// How the picture is produced. Every field can change while the engine runs.
@@ -46,6 +48,12 @@ pub struct Settings {
     /// so it is worth having where the client can decode it.
     pub codec: Codec,
 }
+
+/// How often the pointer's cursor is looked at, in milliseconds.
+///
+/// Reading it is a round trip to the X server and it changes at the pace of a
+/// hand crossing into another window, not at the pace of a frame.
+const CURSOR_POLL_MS: u128 = 120;
 
 /// How many encoded frames may pass before a keyframe is forced.
 ///
@@ -122,6 +130,15 @@ struct FrameState {
     h264: Option<H264Encoder>,
     /// True when the next video frame must be decodable on its own.
     h264_keyframe_due: bool,
+    /// The serial of the cursor already announced to the clients.
+    ///
+    /// X hands back the whole cursor every read; the serial is what says it is
+    /// still the same object. Only a change is worth a message: a link under a
+    /// resting finger would otherwise repeat its bitmap eight times a second for
+    /// as long as it was hovered.
+    cursor_serial: Option<u64>,
+    /// When the shape was last looked at.
+    cursor_checked: Option<std::time::Instant>,
     /// Frames encoded since the last keyframe.
     ///
     /// A client that joins mid-stream has no earlier frame to predict from, and
@@ -138,6 +155,8 @@ impl FrameState {
             previous: Vec::new(),
             h264: None,
             h264_keyframe_due: true,
+            cursor_serial: None,
+            cursor_checked: None,
             since_keyframe: 0,
         }
     }
@@ -644,6 +663,50 @@ impl ScreenHub {
         ))
     }
 
+    /// The pointer's cursor at the machine, if it can be read at all.
+    fn cursor_now(&self) -> Option<cursor::Now> {
+        // Read through the input handle for the same reason the position is: the
+        // capture handle is held for the whole of a grab, and a cursor is not
+        // worth waiting thirteen milliseconds for.
+        let guard = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref()?.cursor_shape()
+    }
+
+    /// Tells the clients when the pointer's cursor changes.
+    ///
+    /// A pointer over a link is a hand, over text an I-beam, over something
+    /// loading a watch — the phone has no pointer of its own to learn that from,
+    /// so the cursor itself is sent: its bitmap, its hot spot and its size. It is
+    /// polled on a slow clock and sent on a change of serial, so a resting finger
+    /// costs one message, not eight a second.
+    fn announce_cursor(&self, state: &mut FrameState) {
+        let now = std::time::Instant::now();
+        if let Some(at) = state.cursor_checked {
+            if now.duration_since(at).as_millis() < CURSOR_POLL_MS {
+                return;
+            }
+        }
+        state.cursor_checked = Some(now);
+        let Some(cursor) = self.cursor_now() else {
+            return;
+        };
+        if state.cursor_serial == Some(cursor.serial) {
+            return;
+        }
+        state.cursor_serial = Some(cursor.serial);
+        let message = serde_json::json!({
+            "type": "cursor",
+            "width": cursor.width,
+            "height": cursor.height,
+            "hot_x": cursor.hot_x,
+            "hot_y": cursor.hot_y,
+            "rgba": base64::engine::general_purpose::STANDARD.encode(&cursor.rgba),
+        });
+        let _ = self
+            .frames
+            .send(Arc::new(Message::Text(message.to_string().into())));
+    }
+
     fn pack(&self, width: u32, height: u32, updates: &[encoder::TileUpdate]) -> Vec<u8> {
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as u64;
         // The pointer is reported in the display's own pixels; the frame has
@@ -935,6 +998,27 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
         return;
     }
 
+    // The pointer's cursor, before the picture: a newcomer would otherwise show
+    // an arrow until the cursor happened to change, and a hand over a link can
+    // stand still for a minute.
+    if let Some(cursor) = hub.cursor_now() {
+        let message = serde_json::json!({
+            "type": "cursor",
+            "width": cursor.width,
+            "height": cursor.height,
+            "hot_x": cursor.hot_x,
+            "hot_y": cursor.hot_y,
+            "rgba": base64::engine::general_purpose::STANDARD.encode(&cursor.rgba),
+        });
+        if socket
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     // Input is read by a task of its own, not by the loop that sends pictures.
     //
     // One loop served both at first, and the pointer then arrived at the speed
@@ -1056,6 +1140,8 @@ fn run_capture(hub: Arc<ScreenHub>) {
         let settings = hub.settings_now();
         let period = Duration::from_millis((1000 / settings.fps.max(1) as u64).max(1));
         let started = std::time::Instant::now();
+
+        hub.announce_cursor(&mut state);
 
         match hub.publish(&mut state) {
             Ok(_) => state.force_all = false,

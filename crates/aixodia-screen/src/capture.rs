@@ -702,6 +702,11 @@ mod tests {
 /// they get their own handles and their own locks.
 pub struct Input {
     display: *mut xlib::Display,
+    /// Whether this display can report its pointer's cursor.
+    ///
+    /// XFixes is an extension, and asking a display without it is an X error, so
+    /// the question is answered once when the connection opens.
+    xfixes: bool,
     /// The thread that holds the clipboard, once text has been typed.
     clipboard: Option<ClipboardServer>,
 }
@@ -720,8 +725,10 @@ impl Input {
         unsafe {
             xlib::XSetErrorHandler(Some(note_error));
         }
+        let xfixes = unsafe { crate::cursor::available(display) };
         Ok(Self {
             display,
+            xfixes,
             clipboard: None,
         })
     }
@@ -750,6 +757,18 @@ impl Input {
             )
         };
         (found != 0).then_some((root_x, root_y))
+    }
+
+    /// What the pointer looks like right now, as its serial and its shape.
+    ///
+    /// Read through XFixes, which is what makes a link look like a hand and a
+    /// text box like an I-beam on the phone: the shape is the focused window's,
+    /// and only this connection can see it.
+    pub fn cursor_shape(&self) -> Option<crate::cursor::Now> {
+        if self.display.is_null() || !self.xfixes {
+            return None;
+        }
+        unsafe { crate::cursor::read(self.display) }
     }
 
     /// The display's own size, which the client's coordinates are scaled from.

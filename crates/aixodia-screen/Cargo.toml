@@ -17,8 +17,8 @@ base64.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 tracing = { workspace = true }
 rayon = "1"
-x11 = "2.21"
+x11 = { version = "2.21", features = ["xfixes"] }
 openh264 = { version = "0.6", features = ["source"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11 = "2.21"
+x11 = { version = "2.21", features = ["xfixes"] }
