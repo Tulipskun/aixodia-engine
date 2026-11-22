@@ -83,20 +83,10 @@ impl Resolve for ReachableResolver {
                 Err(err) => return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>),
             };
 
-            let keep_v6 = host_has_ipv6();
-            let filtered: Vec<SocketAddr> = if keep_v6 {
-                addrs.clone()
-            } else {
-                addrs
-                    .iter()
-                    .copied()
-                    .filter(|addr| matches!(addr.ip(), IpAddr::V4(_)))
-                    .collect()
-            };
-
-            // An answer that is only v6 is passed through: reporting the real
-            // failure is better than replacing it with an empty one.
-            let answer = if filtered.is_empty() { addrs } else { filtered };
+            // The rule lives in `filter`, which is what the tests exercise. It
+            // used to live here twice — once in this function, once in the
+            // tested one — so the tests proved a copy of the code that ran.
+            let answer = filter(addrs, host_has_ipv6());
             Ok(Box::new(answer.into_iter()) as Addrs)
         })
     }

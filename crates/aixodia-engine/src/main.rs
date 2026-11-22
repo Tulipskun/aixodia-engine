@@ -351,10 +351,10 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
             aixodia_screen::rfb::Settings::default()
         }
     };
-    let environment_off = match std::env::var("AIXODIA_RFB").as_deref() {
-        Ok("0") | Ok("off") | Ok("no") => true,
-        _ => false,
-    };
+    let environment_off = matches!(
+        std::env::var("AIXODIA_RFB").as_deref(),
+        Ok("0" | "off" | "no")
+    );
     if !vnc.off && !environment_off {
         let port = vnc
             .port
