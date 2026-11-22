@@ -283,6 +283,7 @@ dependencies = [
  "aixodia-wsock",
  "axum",
  "base64 0.22.1",
+ "futures-util",
  "image",
  "openh264",
  "rayon",

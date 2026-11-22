@@ -20,6 +20,8 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -933,6 +935,31 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
         return;
     }
 
+    // Input is read by a task of its own, not by the loop that sends pictures.
+    //
+    // One loop served both at first, and the pointer then arrived at the speed
+    // the pictures left: measured from the phone, a 200-pixel drag went on
+    // moving the desktop's pointer for five seconds after the finger had left,
+    // because sixty small messages sat behind a few hundred kilobytes of frames
+    // in the same task. A mouse cannot be slower than the picture it moves on.
+    let (mut sink, mut source) = socket.split();
+    let input_hub = Arc::clone(&hub);
+    let input_task = tokio::spawn(async move {
+        while let Some(message) = source.next().await {
+            let Ok(message) = message else { break };
+            match message {
+                Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(parsed) => input_hub.apply(parsed),
+                    Err(err) => tracing::debug!(%err, "screen: unreadable input"),
+                },
+                Message::Binary(_) => {}
+                Message::Close(_) => break,
+                // Ping and pong are answered by the transport.
+                _ => {}
+            }
+        }
+    });
+
     // Subscribe before the first frame, not after it.
     //
     // The capture loop publishes a diff against the previous frame and moves its
@@ -952,7 +979,7 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
     // anyway. Sending one would hand it a message it must throw away.
     if settings.codec == Codec::Jpeg {
         if let Ok(first) = hub.full_frame() {
-            if socket.send(first).await.is_err() {
+            if sink.send(first).await.is_err() {
                 return;
             }
         }
@@ -979,7 +1006,7 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
             frame = frames.recv() => {
                 match frame {
                     Ok(message) => {
-                        if socket.send((*message).clone()).await.is_err() {
+                        if sink.send((*message).clone()).await.is_err() {
                             break;
                         }
                     }
@@ -993,7 +1020,7 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
                         tracing::debug!(skipped, "screen: client lagged, resending the whole frame");
                         match hub.full_frame() {
                             Ok(whole) => {
-                                if socket.send(whole).await.is_err() {
+                                if sink.send(whole).await.is_err() {
                                     break;
                                 }
                             }
@@ -1006,22 +1033,9 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Input from the client.
-            incoming = socket.recv() => {
-                let Some(Ok(message)) = incoming else { break };
-                match message {
-                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                        Ok(parsed) => hub.apply(parsed),
-                        Err(err) => tracing::debug!(%err, "screen: unreadable input"),
-                    },
-                    Message::Binary(_) => {}
-                    Message::Close(_) => break,
-                    // Ping and pong are answered by the transport.
-                    _ => {}
-                }
-            }
         }
     }
+    input_task.abort();
 
     // Leaving decrements the count. Only the last viewer stops the loop, and
     // only the connection that started it waits for it to finish, so the display
