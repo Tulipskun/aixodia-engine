@@ -73,6 +73,97 @@ impl std::fmt::Display for DisplayError {
     }
 }
 
+/// Stops displays this engine's geometry on a dead engine's behalf.
+///
+/// `Drop` is what stops a display, and `Drop` does not run when the process is
+/// killed — which is exactly what a restart does. Measured on this machine after
+/// a morning of restarts: five `Xvfb :9x` servers, all parented to init, holding
+/// display numbers and about a hundred megabytes between them, because the
+/// previous engines were stopped rather than shut down.
+///
+/// Only an orphan is swept, and only one that was started with this engine's own
+/// arguments, so a desktop session or another person's Xvfb is never touched. The
+/// display this process owns is skipped by number.
+pub fn sweep_orphans(ours: Option<&str>) {
+    for pid in orphan_displays(&read_processes(), ours) {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+/// One line of `/proc`: who it is, who started it, and what it was told to do.
+pub(crate) struct Proc {
+    pub pid: u32,
+    pub parent: u32,
+    pub command: String,
+}
+
+/// The processes on this machine. Anything unreadable is simply absent.
+fn read_processes() -> Vec<Proc> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut processes = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        // The command is in parentheses and may itself contain spaces or
+        // parentheses, so the parent is read from the field after the last `)`.
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let parent = stat[close + 1..]
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let command = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .replace('\0', " ");
+        processes.push(Proc {
+            pid,
+            parent,
+            command,
+        });
+    }
+    processes
+}
+
+/// The orphans among [processes] that are displays this engine started.
+///
+/// An engine's display is an `Xvfb :<n> -screen 0 1280x720x24 -nolisten tcp` on
+/// a number in the range this engine uses, whose parent is init — the engine that
+/// began it is gone, which is what makes it an orphan.
+pub(crate) fn orphan_displays(processes: &[Proc], ours: Option<&str>) -> Vec<u32> {
+    let mut found = Vec::new();
+    for process in processes {
+        if !process.command.contains("Xvfb") || !process.command.contains("1280x720x24") {
+            continue;
+        }
+        let number = process
+            .command
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(':').and_then(|n| n.parse::<u32>().ok()));
+        let Some(number) = number else { continue };
+        if !(FIRST_DISPLAY..=LAST_DISPLAY).contains(&number) {
+            continue;
+        }
+        if ours == Some(name(number).as_str()) {
+            continue;
+        }
+        // A parent that is still alive owns its display, whatever it is doing.
+        if process.parent != 1 {
+            continue;
+        }
+        found.push(process.pid);
+    }
+    found
+}
+
 /// The display to capture from, starting one if the machine has none.
 ///
 /// The engine's own `DISPLAY` wins when it works: an operator who pointed the
@@ -91,7 +182,17 @@ pub fn ensure() -> Result<String, DisplayError> {
             _ => *guard = None,
         }
     }
+    // Under the lock, so a burst of connections that all found nothing does not
+    // start one each: that is how five displays were left behind in a minute.
+    if let Some(existing) = working_display() {
+        return Ok(existing);
+    }
 
+    // A display whose engine was killed still holds its number; clear it away
+    // before trying to take one. The name of the one we own is passed rather
+    // than asked for: `owned_display` takes this same lock.
+    let held = guard.as_ref().map(|owned| name(owned.number));
+    sweep_orphans(held.as_deref());
     let owned = start()?;
     let number = owned.number;
     *guard = Some(owned);
@@ -390,5 +491,40 @@ mod tests {
             let _ = thread.join();
         }
         assert!(stop.load(Ordering::SeqCst));
+    }
+
+    fn display(pid: u32, parent: u32, command: &str) -> Proc {
+        Proc {
+            pid,
+            parent,
+            command: command.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_orphaned_display_of_ours_is_swept() {
+        let processes = vec![
+            display(10, 1, "Xvfb :93 -screen 0 1280x720x24 -nolisten tcp"),
+            // Still owned by a live process: not ours to kill.
+            display(11, 700, "Xvfb :94 -screen 0 1280x720x24 -nolisten tcp"),
+            // The display this engine owns now.
+            display(12, 1, "Xvfb :90 -screen 0 1280x720x24 -nolisten tcp"),
+        ];
+        assert_eq!(orphan_displays(&processes, Some(":90")), vec![10]);
+    }
+
+    #[test]
+    fn a_desktop_session_and_a_different_geometry_are_left_alone() {
+        let processes = vec![
+            // Somebody's real session, at their own size.
+            display(20, 1, "/usr/bin/Xvfb :1 -screen 0 1920x1080x24"),
+            // An earlier engine's display, but not the size this one starts.
+            display(21, 1, "Xvfb :95 -screen 0 800x600x24 -nolisten tcp"),
+            // Outside the number range this engine uses.
+            display(22, 1, "Xvfb :3 -screen 0 1280x720x24 -nolisten tcp"),
+            // Not a display at all.
+            display(23, 1, "xterm -geometry 80x24"),
+        ];
+        assert!(orphan_displays(&processes, None).is_empty());
     }
 }
