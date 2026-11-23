@@ -58,10 +58,6 @@ case "$os/$arch" in
 esac
 
 ENGINE_URL="https://github.com/$REPO_SLUG/releases/download/engine-latest/aixodia-engine-$PLATFORM"
-# The same engine with the screen pane left out. The pane links X libraries, and
-# a host without them cannot load the engine at all — the terminal and the chat
-# die over a tab that host could not have used anyway.
-ENGINE_URL_NOSCREEN="$ENGINE_URL-noscreen"
 CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-$PLATFORM"
 
 mkdir -p "$PREFIX"
@@ -84,6 +80,20 @@ engine_can_load() {
   ! ldd "$1" 2>/dev/null | grep -q "not found"
 }
 
+# engine_reason <binary> — why this binary does not load here, in one line.
+engine_reason() {
+  local needed host missing
+  needed="$(glibc_required "$1")"
+  host="$(glibc_host)"
+  if [ -n "$needed" ] && [ -n "$host" ] &&
+    [ "$(printf '%s\n%s\n' "$needed" "$host" | sort -V | tail -1)" != "$host" ]; then
+    echo "it needs glibc $needed and this host has $host"
+    return
+  fi
+  missing="$(ldd "$1" 2>/dev/null | grep "not found" | head -3 | tr -s ' ' | tr '\n' ' ')"
+  echo "a shared library is missing: ${missing:-unknown}"
+}
+
 # glibc_required <binary> — the newest GLIBC_x.y the binary asks the loader for,
 # or nothing. A minimal host may have none of these tools, and an installer that
 # died because `objdump` was absent would be worse than one that says nothing.
@@ -100,41 +110,12 @@ glibc_host() {
     grep -oE '[0-9]+\.[0-9]+' 2>/dev/null | head -1 || true
 }
 
-# Installs the X libraries the screen pane links, if this host has a package
-# manager that knows them. Returns non-zero when it cannot.
-install_x_libraries() {
-  command -v apt-get >/dev/null 2>&1 || return 1
-  local attempt
-  for attempt in 1 2 3; do
-    if apt-get update -qq >/dev/null 2>&1 &&
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        libx11-6 libxext6 libxtst6 libxfixes3 >/dev/null 2>&1; then
-      return 0
-    fi
-    log "apt attempt $attempt for the X libraries failed; retrying in 5s"
-    sleep 5
-  done
-  return 1
-}
-
 fetch "$ENGINE_URL" "$PREFIX/aixodia-engine"
-needed_glibc="$(glibc_required "$PREFIX/aixodia-engine")"
-host_glibc="$(glibc_host)"
-if [ -n "$needed_glibc" ] && [ -n "$host_glibc" ] &&
-  [ "$(printf '%s\n%s\n' "$needed_glibc" "$host_glibc" | sort -V | tail -1)" != "$host_glibc" ]; then
-  # Not a missing library: this build was linked against a newer C library than
-  # this machine has, and no package will fix that. Measured as "installed
-  # cleanly, then died at start with 'version `GLIBC_2.38' not found'".
-  die "this build needs glibc $needed_glibc and this host has $host_glibc; build the engine on this machine (cargo build --release) or install on a host with glibc $needed_glibc or newer"
-fi
+# The pane asks the host for nothing — it is a compositor the engine owns — so
+# the only thing that can stop this binary loading is the C library it was built
+# against, and no package fixes a host older than the build.
 if ! engine_can_load "$PREFIX/aixodia-engine"; then
-  log "the screen pane needs X libraries this host does not have"
-  if install_x_libraries && engine_can_load "$PREFIX/aixodia-engine"; then
-    log "installed the X libraries; the screen pane is available"
-  else
-    log "installing the build without the screen pane instead (terminal, chat and tunnel are unaffected)"
-    fetch "$ENGINE_URL_NOSCREEN" "$PREFIX/aixodia-engine"
-  fi
+  die "the engine cannot load on this host: $(engine_reason "$PREFIX/aixodia-engine")"
 fi
 fetch "$RAW_BASE/aixodia" "$PREFIX/aixodia"
 

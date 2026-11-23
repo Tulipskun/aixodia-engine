@@ -323,11 +323,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     let terminal_server = TerminalServer::new(token.clone());
     // The screen is a hub per process, like the terminal server: one display,
     // one capture, however many phones are looking at it.
-    let display = db
-        .config_kv_get("runtime/display")
-        .await?
-        .unwrap_or_default();
-    let screen = screen::ScreenHub::new(display, token.clone());
+    let screen = screen::ScreenHub::new(token.clone());
     // The second door onto the display: a stock VNC viewer, on loopback, with no
     // password of its own. The app's own socket stays the faster path; this one
     // exists so a viewer somebody already has can be used without installing
@@ -338,9 +334,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // `AIXODIA_*` variable before it execs the engine — a shell variable cannot
     // reach a supervised engine — and from the environment second, for a
     // hand-run one.
-    // A pane that is not built has no display to put on the wire, so the whole
-    // door is absent, settings file and all.
-    #[cfg(feature = "screen")]
     {
         let vnc_file = std::env::var("AIXODIA_RFB_CONF")
             .map(std::path::PathBuf::from)
@@ -614,12 +607,6 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // A turn can answer while its rows are still on their way to D1, and those
     // writes belong to this process: an exit must not take the catch-up with it.
     let _ = tokio::time::timeout(Duration::from_secs(5), gateway.await_all_backups()).await;
-    // The display and the window manager the screen feature brought up belong to
-    // this process. Without this the Xvfb outlives the engine, keeps its socket
-    // on the display number, and the next start adopts a server whose window
-    // manager is gone — a picture with no way to move a window. It also stacks a
-    // server per restart.
-    screen::display::shutdown();
     Ok(())
 }
 

@@ -121,7 +121,6 @@ namespace `AIXODIA_CONFIG`:
 | `client/allowed_users` | Allowed GitHub login names, comma-separated | Operator-managed |
 | `mcp/upstream` | MCP upstream HTTPS URL; defaults to the built-in upstream when absent | Operator-managed |
 | `runtime/tmux_enabled` | Enable tmux terminal sessions (`true`/ `false`); defaults to enabled | Operator-managed |
-| `runtime/display` | X11 display name for screen capture; defaults to empty | Operator-managed |
 
 Create `AIXODIA_CONFIG` in Cloudflare Workers KV before starting the engine,
 then add `tunnel_token`, `tunnel_url`, and the authentication keys required by

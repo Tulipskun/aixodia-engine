@@ -176,6 +176,33 @@ pub struct Pointer {
     pub y: f64,
     /// The surface the pointer is over, and the client that owns it.
     pub over: Option<(usize, u32)>,
+    /// The cursor the client under the pointer asked us to draw.
+    pub cursor: Option<PointerCursor>,
+}
+
+/// A cursor a client set on the pointer: which surface holds its pixels, and
+/// which pixel of that surface sits on the pointer.
+#[derive(Debug, Clone, Copy)]
+pub struct PointerCursor {
+    pub client: usize,
+    pub surface: u32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+}
+
+/// The pixels of the cursor on screen, and where they point.
+///
+/// A viewer draws this itself, and so does the app: the shape is the only honest
+/// answer to "can text be typed here", and a name is not available to ask for.
+#[derive(Debug, Clone)]
+pub struct CursorImage {
+    pub serial: u64,
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    /// ARGB, premultiplied, as the client drew it.
+    pub argb: Vec<u32>,
 }
 
 /// The compositor.
@@ -191,6 +218,8 @@ pub struct State {
     /// Menus and dropdowns, drawn above every window.
     pub popups: Vec<Popup>,
     pub pointer: Pointer,
+    /// The cursor image last committed on the pointer's surface.
+    pub cursor_image: Option<CursorImage>,
     /// Set by anything that must be recomposited before the next frame.
     pub dirty: bool,
     /// The surface the keyboard types into, and the client that owns it.
@@ -232,6 +261,7 @@ impl State {
             popups: Vec::new(),
             releases: Vec::new(),
             pointer: Pointer::default(),
+            cursor_image: None,
             dirty: true,
             keyboard_focus: None,
             keymap: None,
@@ -389,6 +419,30 @@ impl State {
                 }
             }
             (Interface::Surface, opcode) => self.surface_request(index, object, opcode, body)?,
+            // set_cursor(serial, surface, hotspot_x, hotspot_y): the client is
+            // telling us what to draw, as a surface of its own. A null surface
+            // means it has nothing to say and the caller's own pointer stands.
+            (Interface::Pointer, 0) => {
+                let mut args = Args::new(body);
+                let _serial = args.uint();
+                let surface = args.object();
+                let hot_x = args.int();
+                let hot_y = args.int();
+                self.pointer.cursor = if surface == 0 {
+                    None
+                } else {
+                    Some(PointerCursor {
+                        client: index,
+                        surface,
+                        hot_x,
+                        hot_y,
+                    })
+                };
+            }
+            // release(): the pointer object is going away; its cursor with it.
+            (Interface::Pointer, 1) => {
+                self.pointer.cursor = None;
+            }
             (Interface::Seat, 0) => {
                 let pointer = Args::new(body).new_id();
                 self.insert(index, pointer, Object::Pointer);
@@ -825,6 +879,10 @@ impl State {
             popup.height = buffer.height / scale as u32;
             popup.mapped = true;
         }
+        // The cursor is the one surface whose pixels are not part of the picture:
+        // it is drawn by whoever is looking, at the pointer, and it changes to
+        // say what is under the pointer.
+        self.capture_cursor(index, surface_id, buffer_id);
         // The buffer that was on screen before this one is free for the client to
         // draw into again; that is the whole of Wayland's buffer recycling.
         if let Some(previous) = previous {
@@ -1198,6 +1256,52 @@ impl State {
                     .map(|p| (p.x, p.y, p.width, p.height, p.mapped)),
             )
             .collect()
+    }
+
+    /// Reads the pixels of a surface the pointer has named as its cursor.
+    ///
+    /// A cursor surface is an ordinary surface with an ordinary buffer, so this
+    /// is the same read a window gets — kept separate because a cursor is one
+    /// small image rather than part of the frame, and because nothing draws it
+    /// here: the caller that has a pointer draws it.
+    fn capture_cursor(&mut self, index: usize, surface_id: u32, buffer_id: u32) {
+        let Some(cursor) = self.pointer.cursor else {
+            return;
+        };
+        if cursor.client != index || cursor.surface != surface_id {
+            return;
+        }
+        let Some(Object::Buffer(buffer)) = self.clients[index].objects.get(&buffer_id) else {
+            return;
+        };
+        let Some(Object::ShmPool(pool)) = self.clients[index].objects.get(&buffer.pool) else {
+            return;
+        };
+        let argb = buffer.pixels(pool);
+        if argb.is_empty() {
+            return;
+        }
+        let (width, height) = (buffer.width, buffer.height);
+        // A serial that only moves when the picture does: two identical cursors
+        // in a row are one cursor, and a viewer that treats them as two redraws
+        // a pointer nobody moved.
+        let unchanged = self
+            .cursor_image
+            .as_ref()
+            .is_some_and(|image| image.argb == argb && image.width == width);
+        let serial = if unchanged {
+            self.cursor_image.as_ref().map(|i| i.serial).unwrap_or(0)
+        } else {
+            u64::from(self.next_serial())
+        };
+        self.cursor_image = Some(CursorImage {
+            serial,
+            width,
+            height,
+            hot_x: cursor.hot_x.max(0) as u32,
+            hot_y: cursor.hot_y.max(0) as u32,
+            argb,
+        });
     }
 
     /// Draws every mapped window into the frame, bottom first.

@@ -266,6 +266,20 @@ impl Compositor {
         self.state.pointer_axis_along(notches, false)
     }
 
+    /// The cursor on screen: its pixels, its hot spot and the serial that says
+    /// whether it is the same one as last time.
+    pub fn cursor(&self) -> Option<(u32, u32, u32, u32, u64, Vec<u32>)> {
+        let image = self.state.cursor_image.as_ref()?;
+        Some((
+            image.width,
+            image.height,
+            image.hot_x,
+            image.hot_y,
+            image.serial,
+            image.argb.clone(),
+        ))
+    }
+
     /// Where the pointer is, in the frame's coordinates.
     pub fn pointer_position(&self) -> (f64, f64) {
         (self.state.pointer.x, self.state.pointer.y)
@@ -564,6 +578,100 @@ mod tests {
             modifiers_sent(&theirs),
             Some(0),
             "and releasing it clears the bit"
+        );
+    }
+
+    #[test]
+    fn a_client_that_sets_a_cursor_gets_it_back_as_pixels() {
+        let (mut compositor, theirs) = with_input(128);
+        // The registry, so this connection has a compositor and an shm to bind:
+        // the cursor surface and its buffer are made like any other surface's.
+        request(&theirs, Writer::new(1, 1).uint(2).finish());
+        settle(&mut compositor);
+        for _ in 0..server::GLOBALS.len() {
+            let (object, opcode, _) = next_event(&theirs);
+            assert_eq!((object, opcode), (2, 0));
+        }
+        for (name, interface, id) in [(1u32, "wl_compositor", 3u32), (2, "wl_shm", 4)] {
+            request(
+                &theirs,
+                Writer::new(2, 0)
+                    .uint(name)
+                    .string(Some(interface))
+                    .uint(4)
+                    .uint(id)
+                    .finish(),
+            );
+        }
+        settle(&mut compositor);
+        // The cursor surface, a pool and a buffer into it.
+        request(&theirs, Writer::new(3, 0).uint(30).finish());
+        let pool = tempfile_pool(4, 4, 0xff11_2233);
+        request(
+            &theirs,
+            Writer::new(4, 0)
+                .uint(31)
+                .int(4 * 4 * 4)
+                .fd(pool.as_raw_fd())
+                .finish(),
+        );
+        request(
+            &theirs,
+            Writer::new(31, 0)
+                .uint(32)
+                .int(0)
+                .int(4)
+                .int(4)
+                .int(4 * 4)
+                .uint(0)
+                .finish(),
+        );
+        settle(&mut compositor);
+
+        // set_cursor(serial, surface, hotspot_x, hotspot_y) — opcode 0 on the
+        // pointer. A viewer draws the pointer itself, so the pixels are the
+        // answer and nothing is composited here.
+        request(
+            &theirs,
+            Writer::new(20, 0).uint(1).object(30).int(1).int(2).finish(),
+        );
+        settle(&mut compositor);
+        assert!(
+            compositor.cursor().is_none(),
+            "a cursor surface with no pixels attached is not a cursor yet"
+        );
+
+        request(
+            &theirs,
+            Writer::new(30, 1).object(32).int(0).int(0).finish(),
+        );
+        request(&theirs, Writer::new(30, 6).finish());
+        settle(&mut compositor);
+
+        let (width, height, hot_x, hot_y, _serial, argb) =
+            compositor.cursor().expect("the cursor was committed");
+        assert_eq!((width, height, hot_x, hot_y), (4, 4, 1, 2));
+        assert_eq!(argb.len(), 16);
+        assert_eq!(argb[0], 0xff11_2233, "the pixels are what the client drew");
+
+        // The same picture again is the same cursor, not a new one: a viewer that
+        // redrew on every commit would flicker a pointer nobody moved.
+        let serial = compositor.cursor().unwrap().4;
+        request(&theirs, Writer::new(30, 6).finish());
+        settle(&mut compositor);
+        assert_eq!(compositor.cursor().unwrap().4, serial);
+
+        // A null surface means the client has nothing to say any more.
+        request(
+            &theirs,
+            Writer::new(20, 0).uint(2).object(0).int(0).int(0).finish(),
+        );
+        settle(&mut compositor);
+        request(&theirs, Writer::new(30, 6).finish());
+        settle(&mut compositor);
+        assert!(
+            compositor.cursor().is_some(),
+            "the last cursor still stands"
         );
     }
 

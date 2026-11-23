@@ -17,18 +17,16 @@
 //! the scale it is captured at, the tile size and the frame rate. A phone on a
 //! bad link turns the quality and rate down from the client, with no restart.
 
-pub mod capture;
 pub mod cursor;
-pub mod display;
 pub mod encoder;
+pub mod frame;
+pub mod launch;
 pub mod pane;
-pub mod panel;
 pub mod rfb;
 pub mod server;
 pub mod wayland;
-pub mod wm;
 
-pub use capture::{Button, Frame, Input, Screen, ScreenError};
 pub use encoder::{diff_and_encode, TileUpdate};
+pub use frame::{Button, Frame, ScreenError};
 pub use server::{router, ScreenHub, Settings};
 pub use wayland::Pane;

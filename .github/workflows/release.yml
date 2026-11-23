@@ -67,11 +67,11 @@ jobs:
           # The release profile is a distinct artifact set from the test profile.
           cache-on-failure: false
 
-      - name: Install X11 development libraries
+      - name: Install the C toolchain the bundled codecs build with
         run: |
           for attempt in 1 2 3; do
             if sudo apt-get update && sudo apt-get install -y \
-                libx11-dev libxext-dev libxtst-dev cmake clang libclang-dev; then
+                cmake clang libclang-dev; then
               exit 0
             fi
             echo "apt attempt $attempt failed; retrying in 15s" >&2
@@ -89,16 +89,12 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} -p aixodia-engine
           cp target/${{ matrix.target }}/release/aixodia-engine aixodia-engine-linux-${{ matrix.suffix }}
-          # The same engine with the screen pane left out, for a machine with no
-          # X libraries: the pane links libX11/libXext/libXtst/libXfixes, and a
-          # binary that needs them cannot load at all on a host without them —
-          # measured, the whole engine died over a pane that host could not have
-          # used anyway. This build mentions no X.
-          cargo build --release --target ${{ matrix.target }} -p aixodia-engine --no-default-features
-          cp target/${{ matrix.target }}/release/aixodia-engine \
-             aixodia-engine-linux-${{ matrix.suffix }}-noscreen
-          if ldd aixodia-engine-linux-${{ matrix.suffix }}-noscreen | grep -qE 'libX11|libXfixes'; then
-            echo "the no-screen build still links X" >&2
+          # The pane is a compositor of our own, so the engine asks the host for
+          # no X library at all. A build that quietly linked one would install
+          # cleanly and then fail to load on a machine without it, which is how
+          # this was discovered the first time.
+          if ldd aixodia-engine-linux-${{ matrix.suffix }} | grep -qE 'libX11|libXext|libXtst|libXfixes'; then
+            echo "the engine still links X" >&2
             exit 1
           fi
 
@@ -109,8 +105,7 @@ jobs:
           # start on the user's machine — so it is checked here instead of being
           # discovered there.
           floor=2.35
-          for name in aixodia-engine-linux-${{ matrix.suffix }} \
-                      aixodia-engine-linux-${{ matrix.suffix }}-noscreen; do
+          for name in aixodia-engine-linux-${{ matrix.suffix }}; do
             worst=$(objdump -T "$name" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' |
                     sed 's/GLIBC_//' | sort -uV | tail -1)
             echo "$name asks for GLIBC_$worst"
@@ -123,9 +118,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: engine-${{ matrix.suffix }}
-          path: |
-            aixodia-engine-linux-${{ matrix.suffix }}
-            aixodia-engine-linux-${{ matrix.suffix }}-noscreen
+          path: aixodia-engine-linux-${{ matrix.suffix }}
           if-no-files-found: error
 
   publish:
@@ -150,7 +143,6 @@ jobs:
               --title "engine-latest" --notes "Rolling build of main"
           gh release upload engine-latest \
             dist/aixodia-engine-linux-amd64 dist/aixodia-engine-linux-arm64 \
-            dist/aixodia-engine-linux-amd64-noscreen dist/aixodia-engine-linux-arm64-noscreen \
             --repo "$GITHUB_REPOSITORY" --clobber
           # The installer fetches the plain name on the architecture it runs on,
           # so the amd64 build is also published under it.

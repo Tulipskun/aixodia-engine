@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::capture::Button;
 use crate::encoder;
+use crate::frame::Button;
 use crate::pane::Events;
 use crate::rfb::protocol::{encoding, PixelFormat};
 
@@ -202,7 +202,7 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
         }
     };
     let input = panes.events;
-    let mut screen = panes.source;
+    let screen = panes.source;
     let (width, height) = input.display_size();
 
     // ServerInit: the size, the format this server works in, and a name.

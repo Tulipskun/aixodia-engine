@@ -126,17 +126,6 @@ rotate_log() {
   echo "aixodia: rotated $file ($size bytes) to $file.1"
 }
 
-# What the desktop is made of, when it is made of packages.
-#
-# The pane is a compositor this engine owns, so it asks a host for nothing at
-# all. The one exception is the engine binary itself: it still links the X
-# libraries for the old display, which `AIXODIA_PANE=x` selects, so without them
-# it cannot even load. Those four are installed the first time the engine starts,
-# exactly as cloudflared is, and never asked about again. Xvfb, xterm and the X
-# fonts belong to the old pane and are installed only when it is asked for.
-PANE_PACKAGES="libx11-6 libxext6 libxtst6 libxfixes3"
-X_PANE_PACKAGES="xvfb xterm xfonts-base"
-
 # True when the binary's shared libraries are all present. A script has no
 # dynamic dependencies at all, which is why the test engines pass.
 engine_libraries_ok() {
@@ -159,75 +148,24 @@ glibc_too_old() {
   [ -n "$1" ] && [ -n "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" != "$2" ]
 }
 
-# A package manager this process may use, or nothing.
-package_installer() {
-  [ "${AIXODIA_SKIP_DEPENDENCIES:-0}" = "1" ] && return 1
-  if [ "$(id -u)" -eq 0 ]; then
-    command -v apt-get >/dev/null 2>&1 && { echo "apt-get|"; return 0; }
-    command -v apk >/dev/null 2>&1 && { echo "apk|"; return 0; }
-    command -v dnf >/dev/null 2>&1 && { echo "dnf|"; return 0; }
-    return 1
-  fi
-  # Not root: only an unattended sudo counts. A password prompt in a start
-  # command would hang whatever ran it.
-  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-    command -v apt-get >/dev/null 2>&1 && { echo "sudo apt-get|"; return 0; }
-    command -v dnf >/dev/null 2>&1 && { echo "sudo dnf|"; return 0; }
-  fi
-  return 1
-}
-
-# True when the old display was asked for by name.
-x_pane_wanted() {
-  case "${AIXODIA_PANE:-}" in
-    x|X|x11|X11) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-ensure_pane_packages() {
-  local missing="" installer="" attempt packages="$PANE_PACKAGES" needed host
-  if ! engine_libraries_ok "$ENGINE_RESOLVED"; then
-    # A missing X library and a C library that is too old both show up as "not
-    # found", and only one of them is fixed by installing a package. Say which.
-    needed="$(engine_glibc_needed "$ENGINE_RESOLVED")"
-    host="$(host_glibc)"
-    if glibc_too_old "$needed" "$host"; then
-      echo "aixodia: this build needs glibc $needed and this host has $host" >&2
-      echo "aixodia: no package fixes that — rebuild the engine on this machine, or install the build for this host" >&2
-      return 0
-    fi
-    missing=" libraries"
-  fi
-  if x_pane_wanted; then
-    packages="$PANE_PACKAGES $X_PANE_PACKAGES"
-    command -v Xvfb >/dev/null 2>&1 || missing="$missing Xvfb"
-    command -v xterm >/dev/null 2>&1 || missing="$missing xterm"
-  fi
-  [ -n "$missing" ] || return 0
-  if ! installer="$(package_installer)"; then
-    echo "aixodia: the screen pane needs$missing, and this host cannot install them." >&2
-    echo "aixodia: install them yourself ($packages)" >&2
-    return 0
-  fi
-  echo "aixodia: the screen pane needs$missing; installing $packages"
-  # shellcheck disable=SC2086
-  for attempt in 1 2 3; do
-    case "$installer" in
-      *apt-get*) ${installer%|*} update -qq >/dev/null 2>&1 || true
-                 DEBIAN_FRONTEND=noninteractive ${installer%|*} install -y -qq \
-                   $packages >/dev/null 2>&1 && break ;;
-      *apk*)     ${installer%|*} add --no-cache $packages >/dev/null 2>&1 && break ;;
-      *dnf*)     ${installer%|*} install -y -q $packages >/dev/null 2>&1 && break ;;
-    esac
-    echo "aixodia: install attempt $attempt failed; retrying" >&2
-    sleep 5
-  done
-  if engine_libraries_ok "$ENGINE_RESOLVED"; then
-    echo "aixodia: the screen pane's packages are in place"
+# Whether the engine can be loaded at all, and the honest reason when it cannot.
+#
+# The pane asks the host for nothing — it is a compositor this engine owns — so
+# the only thing that can stop the binary loading is the C library it was built
+# against. A build from a newer distribution than the host is not a missing
+# package: no install fixes it, and saying so is cheaper than three apt attempts.
+check_engine_loads() {
+  engine_libraries_ok "$ENGINE_RESOLVED" && return 0
+  local needed host
+  needed="$(engine_glibc_needed "$ENGINE_RESOLVED")"
+  host="$(host_glibc)"
+  if glibc_too_old "$needed" "$host"; then
+    echo "aixodia: this build needs glibc $needed and this host has $host" >&2
+    echo "aixodia: no package fixes that — rebuild the engine on this machine, or install the build for this host" >&2
   else
-    echo "aixodia: the screen pane's libraries are still missing" >&2
+    echo "aixodia: the engine could not load a shared library it needs" >&2
   fi
+  return 0
 }
 
 require_prerequisites() {
@@ -237,7 +175,7 @@ require_prerequisites() {
   command -v cloudflared >/dev/null 2>&1 || die "cloudflared not found in PATH — reinstall with the install script"
   mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
   export AIXODIA_HOME
-  ensure_pane_packages
+  check_engine_loads
 }
 
 cmd_start() {
@@ -317,16 +255,13 @@ cmd_start() {
   fi
   echo "aixodia: engine exited during startup; last log lines:" >&2
   tail -n 20 "$(log_path)" >&2 || true
-  # A loader that could not find a library is not a crash, and the fix is a
-  # package rather than a bug report: the screen pane links X, and a host without
-  # it cannot load the engine at all.
-  if tail -n 20 "$(log_path)" 2>/dev/null | grep -q "error while loading shared libraries"; then
+  # A loader that could not find something is not a crash, and the answer is
+  # never in the log: the engine asks the host for nothing but the C library it
+  # was built against, so a loader error here is a host older than the build.
+  if tail -n 20 "$(log_path)" 2>/dev/null | grep -q "error while loading shared libraries\|GLIBC_"; then
     echo >&2
-    echo "aixodia: a shared library the engine needs is missing, so it could not start." >&2
-    echo "aixodia: the screen pane links X. Either install it:" >&2
-    echo "aixodia:   apt-get install -y libx11-6 libxext6 libxtst6 libxfixes3" >&2
-    echo "aixodia: or run install.sh again on this host — it picks the build" >&2
-    echo "aixodia: without the screen pane when the libraries are not there." >&2
+    echo "aixodia: the engine could not load a library it needs, so it could not start." >&2
+    check_engine_loads
   fi
   rm -f "$file"
   exit 1

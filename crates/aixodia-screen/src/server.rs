@@ -26,10 +26,11 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::capture::Button;
 use crate::cursor;
 use crate::encoder::{self, EncodeSettings, H264Encoder};
-use crate::pane::{self, compositor_mode, Events, ScreenSource};
+use crate::frame::Button;
+use crate::pane::{self, Events};
+use crate::wayland;
 
 /// How the picture is produced. Every field can change while the engine runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,13 +326,12 @@ fn button_from(name: &str) -> Button {
 
 /// The shared state behind the screen socket.
 pub struct ScreenHub {
-    display: String,
     /// The engine's master token, so the ticket endpoint can refuse a caller
     /// that has not signed in. The socket itself is opened with a ticket.
     token: String,
     tickets: aixodia_wsock::Tickets,
     settings: Mutex<Settings>,
-    screen: Mutex<Option<ScreenSource>>,
+    screen: Mutex<Option<Arc<wayland::Pane>>>,
     /// A separate connection, used only for input.
     ///
     /// Never held while a frame is being read, which is the whole point: an
@@ -355,12 +355,10 @@ pub struct ScreenHub {
 }
 
 impl ScreenHub {
-    /// Builds a hub for `display` (empty means `$DISPLAY`), guarded by the
-    /// engine's master `token`.
-    pub fn new(display: impl Into<String>, token: impl Into<String>) -> Arc<Self> {
+    /// Builds a hub guarded by the engine's master `token`.
+    pub fn new(token: impl Into<String>) -> Arc<Self> {
         let (frames, _) = broadcast::channel(8);
         Arc::new(Self {
-            display: display.into(),
             token: token.into(),
             tickets: aixodia_wsock::Tickets::new(),
             settings: Mutex::new(Settings::default()),
@@ -441,68 +439,36 @@ impl ScreenHub {
         *self.settings.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Opens the display if it is not open yet, at the current settings.
+    /// Opens the pane if it is not open yet, at the current settings.
     fn ensure_screen(&self) -> Result<(), String> {
-        if compositor_mode() {
-            return self.open_compositor();
-        }
-        // A server with no monitor is the ordinary case. Before the capture
-        // display is opened, the engine brings up one of its own if the
-        // machine has none, so the screen window works wherever the engine
-        // runs rather than only where someone is logged in.
-        let display = crate::display::ensure().map_err(|e| e.0)?;
-        // The input connection is opened alongside the capture one, on its own
-        // handle, so an event never has to wait for a frame to be read.
-        {
-            let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
-            if input.is_none() {
-                *input = pane::open_events(0, 0).ok();
-            }
-        }
-        let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
-            return Ok(());
-        }
-        let settings = self.settings_now();
-        *guard = Some(pane::open_source(settings.width, settings.height)?);
-        Ok(())
+        self.open_compositor()
     }
 
-    /// Opens our own compositor instead of an X display, and gives the input
-    /// handle the same pane so a finger goes where the picture came from.
+    /// Opens the compositor, and gives the input handle the same pane so a
+    /// finger goes where the picture came from.
     fn open_compositor(&self) -> Result<(), String> {
-        let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
-        let pane = match guard.as_ref() {
-            Some(ScreenSource::Wayland(pane)) => Arc::clone(pane),
-            Some(ScreenSource::X(_)) => {
-                return Err("the pane is already open as an X display".into())
-            }
-            None => {
-                let settings = self.settings_now();
-                let pane = pane::open_wayland(settings.width, settings.height)?;
-                *guard = Some(ScreenSource::Wayland(Arc::clone(&pane)));
-                pane
+        let pane = {
+            let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(pane) => Arc::clone(pane),
+                None => {
+                    let settings = self.settings_now();
+                    let pane =
+                        pane::open(settings.width, settings.height).map(|panes| panes.source)?;
+                    *guard = Some(Arc::clone(&pane));
+                    pane
+                }
             }
         };
-        drop(guard);
         // A client started by the engine finds the compositor through these two
         // variables, and nobody else's display through them.
         std::env::set_var("XDG_RUNTIME_DIR", pane.dir());
         std::env::set_var("WAYLAND_DISPLAY", crate::wayland::SOCKET);
         let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
         if input.is_none() {
-            *input = Some(Events::Wayland(pane));
+            *input = Some(Events::new(pane));
         }
         Ok(())
-    }
-
-    /// The display's real size, without waiting for a frame that is being read.
-    fn display_size(&self) -> (u32, u32) {
-        let guard = self.input.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(input) => input.display_size(),
-            None => (0, 0),
-        }
     }
 
     /// Runs one frame: capture, diff, encode, publish. Returns how many tiles
@@ -531,18 +497,14 @@ impl ScreenHub {
             // stream running across the change.
             if guard.is_none() {
                 let settings = self.settings_now();
-                if compositor_mode() {
-                    let pane = pane::open_wayland(settings.width, settings.height)?;
-                    let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
-                    if input.is_none() {
-                        *input = Some(Events::Wayland(Arc::clone(&pane)));
-                    }
-                    *guard = Some(ScreenSource::Wayland(pane));
-                } else {
-                    *guard = Some(pane::open_source(settings.width, settings.height)?);
+                let pane = pane::open(settings.width, settings.height).map(|panes| panes.source)?;
+                let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                if input.is_none() {
+                    *input = Some(Events::new(Arc::clone(&pane)));
                 }
+                *guard = Some(pane);
             }
-            let screen = guard.as_mut().ok_or("display is not open")?;
+            let screen = guard.as_ref().ok_or("display is not open")?;
             let frame = screen.frame().map_err(|e| e.to_string())?;
             (frame.pixels, frame.width, frame.height)
         };
@@ -876,13 +838,10 @@ impl ScreenHub {
                 }
             }
             ClientMessage::Key { keysym, mods } => input.key(&keysym, &mods),
-            ClientMessage::Text { text } => {
-                // A screen of text is not a keystroke race: the whole string is
-                // typed here, and a failure is logged rather than dropped.
-                if let Err(err) = input.type_text(&text) {
-                    tracing::warn!(%err, "screen: could not type the text");
-                }
-            }
+            // A screen of text is not a keystroke race: the whole string is
+            // typed here, one character at a time, and a character the keymap
+            // cannot name is dropped rather than guessed at.
+            ClientMessage::Text { text } => input.type_text(&text),
             ClientMessage::Drag { .. } => unreachable!("handled above, on its own thread"),
             // Nothing to do to the display; the loop picks the request up.
             ClientMessage::Settings { .. } | ClientMessage::RequestKeyframe => {}
@@ -1236,7 +1195,7 @@ mod tests {
 
     #[test]
     fn settings_from_a_client_are_clamped_not_trusted() {
-        let hub = ScreenHub::new(":0", "test-token");
+        let hub = ScreenHub::new("test-token");
         hub.update(&ClientMessage::Settings {
             codec: None,
             width: Some(99_999),
@@ -1255,7 +1214,7 @@ mod tests {
 
     #[test]
     fn settings_keep_what_the_client_did_not_mention() {
-        let hub = ScreenHub::new(":0", "test-token");
+        let hub = ScreenHub::new("test-token");
         hub.update(&ClientMessage::Settings {
             codec: None,
             width: None,
@@ -1381,7 +1340,7 @@ mod viewer_lifetime {
         // The count is what decides. Two viewers are two viewers whatever order
         // they arrived in, and the one that leaves first must not take the
         // loop away from the one that stays.
-        let hub = ScreenHub::new("", "token");
+        let hub = ScreenHub::new("token");
         assert_eq!(hub.viewers.load(Ordering::SeqCst), 0);
 
         hub.viewers.fetch_add(1, Ordering::SeqCst); // first client
@@ -1406,7 +1365,7 @@ mod viewer_lifetime {
     fn only_the_first_viewer_starts_the_loop() {
         // Starting a loop per connection would give two capture tasks reading
         // one display and handing each other half-frames.
-        let hub = ScreenHub::new("", "token");
+        let hub = ScreenHub::new("token");
         let first = hub.viewers.fetch_add(1, Ordering::SeqCst);
         assert_eq!(first, 0, "the first viewer starts the loop");
         let second = hub.viewers.fetch_add(1, Ordering::SeqCst);
@@ -1444,7 +1403,7 @@ mod codec_choice {
 
     #[test]
     fn a_client_can_switch_codec_and_keep_everything_else() {
-        let hub = ScreenHub::new(":0", "test-token");
+        let hub = ScreenHub::new("test-token");
         hub.update(&ClientMessage::Settings {
             codec: Some("h264".to_string()),
             width: None,
@@ -1462,7 +1421,7 @@ mod codec_choice {
 
     #[test]
     fn an_unknown_codec_leaves_the_setting_alone() {
-        let hub = ScreenHub::new(":0", "test-token");
+        let hub = ScreenHub::new("test-token");
         hub.update(&ClientMessage::Settings {
             codec: Some("mpeg2".to_string()),
             width: None,
@@ -1476,7 +1435,7 @@ mod codec_choice {
 
     #[test]
     fn a_keyframe_request_is_counted_once_however_often_asked() {
-        let hub = ScreenHub::new(":0", "test-token");
+        let hub = ScreenHub::new("test-token");
         assert!(!hub.keyframe_wanted.load(Ordering::SeqCst));
         hub.apply(ClientMessage::RequestKeyframe);
         hub.apply(ClientMessage::RequestKeyframe);

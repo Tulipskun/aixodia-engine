@@ -1,29 +1,27 @@
 //! The screen pane's own display: a Wayland compositor instead of an X server.
 //!
-//! This is the same picture the X path produces — a [`Frame`] of BGRX pixels and
-//! a set of pointer and key events going the other way — so everything above it
-//! (the tiling encoder, the socket, the RFB server) does not know which display
-//! made it.
+//! It produces a [`Frame`] of BGRX pixels and a set of pointer and key events
+//! going the other way, so everything above it (the tiling encoder, the socket,
+//! the RFB server) speaks in frames and buttons and never in protocol.
 //!
-//! What changes is what the host needs. The X path needs `Xvfb`, `xterm`, `xwd`'s
-//! extension, `XTest` to move a pointer nobody can see, and six shared libraries
-//! linked into the engine. Here the compositor *is* the display server and the
-//! window manager, clients draw into shared memory we already have, and nothing
-//! on the host has to be installed for it.
+//! What the host needs is nothing. There is no X server to install, no `xterm`, no
+//! `XTest` to move a pointer nobody can see, and no X libraries linked into the
+//! engine: the compositor *is* the display server and the window manager, and
+//! clients draw into shared memory we already have.
 //!
-//! Keys are the one place where the two disagree about vocabulary. Above this
-//! module a key is an X keysym *name* — `Return`, `BackSpace`, `a`, `A` — because
-//! that is what the phone sends and what the X path resolves. A Wayland client is
-//! told a keymap and then an evdev keycode, so this module owns the one table
-//! that turns a name into a keycode and says whether shift has to be held to make
-//! that name come out.
+//! Keys keep their old vocabulary: above this module a key is an X keysym *name*
+//! — `Return`, `BackSpace`, `a`, `A` — because that is what the phone and a VNC
+//! viewer send. A Wayland client is told a keymap and then an evdev keycode, so
+//! this module owns the one table that turns a name into a keycode and says
+//! whether shift has to be held to make that name come out.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aixodia_wayland::Compositor;
 
-use crate::capture::{Button, Frame, ScreenError};
+use crate::cursor;
+use crate::frame::{Button, Frame, ScreenError};
 
 /// Where clients find the compositor: `XDG_RUNTIME_DIR` names the directory and
 /// `WAYLAND_DISPLAY` the socket inside it.
@@ -62,7 +60,7 @@ pub fn shared(width: u32, height: u32) -> Result<Arc<Pane>, ScreenError> {
         program.trim()
     };
     if program != "none" {
-        crate::panel::launch_in_compositor(program, pane.dir(), SOCKET);
+        crate::launch::launch_in_compositor(program, pane.dir(), SOCKET);
     }
     Ok(pane)
 }
@@ -191,7 +189,7 @@ impl Pane {
     /// unchanged, and the encoder above diffs it to no updates at all.
     pub fn frame(&self) -> Result<Frame, ScreenError> {
         let mut compositor = self.lock();
-        compositor.poll(0).map_err(|e| ScreenError::Gone)?;
+        compositor.poll(0).map_err(|_| ScreenError::Gone)?;
         let (width, height) = compositor.size();
         let pixels = frame_bytes(compositor.frame());
         Ok(Frame {
@@ -208,6 +206,26 @@ impl Pane {
     pub fn pointer_position(&self) -> Option<(i32, i32)> {
         let (x, y) = self.lock().pointer_position();
         Some((x as i32, y as i32))
+    }
+
+    /// The cursor the client under the pointer asked for.
+    ///
+    /// A Wayland client sets its cursor as a surface with a bitmap and a hot
+    /// spot, which is exactly what a viewer wants to draw — and what the app
+    /// wants to look at before it decides whether a tap lands on something text
+    /// can be typed into. Nothing set means nothing to report: an arrow drawn by
+    /// the caller is better than an invented shape.
+    pub fn cursor_shape(&self) -> Option<cursor::Now> {
+        let compositor = self.lock();
+        let (width, height, hot_x, hot_y, serial, argb) = compositor.cursor()?;
+        Some(cursor::Now {
+            serial,
+            width,
+            height,
+            hot_x,
+            hot_y,
+            rgba: cursor::straighten(&argb),
+        })
     }
 
     pub fn button(&self, button: Button, pressed: bool) {

@@ -142,6 +142,31 @@ impl Buffer {
     // The frame's geometry and where the buffer goes are all needed here; a
     // struct to carry six numbers would be a struct nobody else uses.
     #[allow(clippy::too_many_arguments)]
+    /// The buffer's pixels as words, row by row.
+    ///
+    /// `blit` writes into a frame; this hands the pixels to a caller that is not
+    /// drawing them into the picture at all — a cursor is drawn by whoever is
+    /// holding the pointer, not by the compositor.
+    pub fn pixels(&self, pool: &Pool) -> Vec<u32> {
+        let bytes = pool.bytes();
+        let mut out = Vec::with_capacity((self.width as usize) * (self.height as usize));
+        for row in 0..self.height {
+            for column in 0..self.width {
+                let at = row as usize * self.stride + column as usize * 4 + self.offset;
+                if at + 4 > bytes.len() {
+                    return out;
+                }
+                out.push(u32::from_le_bytes([
+                    bytes[at],
+                    bytes[at + 1],
+                    bytes[at + 2],
+                    bytes[at + 3],
+                ]));
+            }
+        }
+        out
+    }
+
     pub fn blit(
         &self,
         pool: &Pool,

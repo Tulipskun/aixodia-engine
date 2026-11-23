@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 jobs:
-  # Shell only: no compiler, no X11 headers, so it finishes long before the
-  # Rust jobs and reports the launcher problems first.
+  # Shell only: no compiler at all, so it finishes long before the Rust job and
+  # reports the launcher problems first.
   shell:
     runs-on: ubuntu-latest
     steps:
@@ -39,11 +39,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install X11 development libraries
+      - name: Install the C toolchain the bundled codecs build with
         run: |
           for attempt in 1 2 3; do
             if sudo apt-get update && sudo apt-get install -y \
-                libx11-dev libxext-dev libxtst-dev cmake clang libclang-dev; then
+                cmake clang libclang-dev; then
               exit 0
             fi
             echo "apt attempt $attempt failed; retrying in 15s" >&2

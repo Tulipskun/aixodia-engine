@@ -144,8 +144,8 @@ env CF_TOKEN=test-token AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
   ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" \
   ENGINE_HOME_FILE="$home/engine-home" ENGINE_STOP_FILE="$home/stopped" \
   bash "$LAUNCHER" start >"$out_file" 2>&1
-if grep -q "apt-get install -y libx11-6" "$out_file"; then
-  pass "a missing shared library names the package that fixes it"
+if grep -q "could not load a library it needs" "$out_file"; then
+  pass "a loader error is explained instead of being called a crash"
 else
   fail "a loader error is not explained (output=$(tr '\n' ' ' < "$out_file"))"
 fi

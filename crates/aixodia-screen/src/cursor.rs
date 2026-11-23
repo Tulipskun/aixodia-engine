@@ -17,8 +17,6 @@
 //! sixteen or twenty-four pixels square — and it is only sent when the serial
 //! changes, which is when the pointer crosses into another window.
 
-use x11::{xfixes, xlib};
-
 /// The cursor the display is showing: its pixels, its hot spot, its serial.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Now {
@@ -121,65 +119,6 @@ impl Now {
             .unwrap_or(0);
         bar >= stem_width * 2
     }
-}
-
-/// Whether this display can report its cursor at all.
-///
-/// XFixes is an extension: a display without it simply never changes the arrow,
-/// which is what happened before this existed.
-pub unsafe fn available(display: *mut xlib::Display) -> bool {
-    if display.is_null() {
-        return false;
-    }
-    let mut event_base = 0;
-    let mut error_base = 0;
-    xfixes::XFixesQueryExtension(display, &mut event_base, &mut error_base) != 0
-}
-
-/// Reads the cursor the display is showing.
-///
-/// The image XFixes returns is allocated by the library and must be freed with
-/// `XFree`. Its pixels are premultiplied ARGB, which is not what an image viewer
-/// wants; [`straighten`] turns them into the RGBA everything else speaks.
-pub unsafe fn read(display: *mut xlib::Display) -> Option<Now> {
-    if display.is_null() {
-        return None;
-    }
-    let image = unsafe { xfixes::XFixesGetCursorImage(display) };
-    if image.is_null() {
-        return None;
-    }
-    let (serial, width, height, hot_x, hot_y, pixels) = unsafe {
-        (
-            (*image).cursor_serial as u64,
-            (*image).width as u32,
-            (*image).height as u32,
-            (*image).xhot as u32,
-            (*image).yhot as u32,
-            (*image).pixels,
-        )
-    };
-    let count = (width * height) as usize;
-    let argb: Vec<u32> = if pixels.is_null() {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(pixels, count) }
-            .iter()
-            .map(|pixel| *pixel as u32)
-            .collect()
-    };
-    unsafe { xlib::XFree(image as *mut std::ffi::c_void) };
-    if argb.len() != count {
-        return None;
-    }
-    Some(Now {
-        serial,
-        width,
-        height,
-        hot_x,
-        hot_y,
-        rgba: straighten(&argb),
-    })
 }
 
 /// Premultiplied ARGB, as X stores a cursor, to straight RGBA as an image is.
