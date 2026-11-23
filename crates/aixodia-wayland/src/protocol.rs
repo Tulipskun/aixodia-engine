@@ -1,8 +1,11 @@
 //! Wayland's wire format, written out by hand.
 //!
-//! Every message is a 32-bit object id, a 16-bit length that counts its own
-//! header, and a 16-bit opcode, followed by arguments whose types are fixed by
-//! the interface. The argument types are the interesting part and there are only
+//! Every message begins with two words: a 32-bit object id, and a second word
+//! whose low half is the opcode and whose high half is the length that counts
+//! the header itself. On a little-endian machine that puts the opcode's two
+//! bytes before the length's, which is the one detail of this format that is
+//! easy to get backwards — and silent when you do, because a reader and a writer
+//! that swap it in the same way agree with each other and with nothing else. The argument types are the interesting part and there are only
 //! eight of them: int, uint, fixed (a 24.8 number), string (length plus bytes
 //! plus a terminator, padded to four), object, new_id, array, and fd — and an fd
 //! is not in the bytes at all, it rides beside them in a Unix socket's control
@@ -51,8 +54,9 @@ pub fn take(bytes: &[u8]) -> Result<Option<(Message<'_>, usize)>, WireError> {
         return Ok(None);
     }
     let object = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    let size = u16::from_le_bytes([bytes[4], bytes[5]]);
-    let opcode = u16::from_le_bytes([bytes[6], bytes[7]]);
+    // The second word is `size << 16 | opcode`, so the opcode comes first.
+    let opcode = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let size = u16::from_le_bytes([bytes[6], bytes[7]]);
     if size < 8 || size % 4 != 0 {
         return Err(WireError::BadLength(size));
     }
@@ -180,8 +184,9 @@ impl Writer {
     pub fn new(object: u32, opcode: u16) -> Self {
         let mut bytes = Vec::with_capacity(32);
         bytes.extend_from_slice(&object.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&opcode.to_le_bytes());
+        // The length is written by `finish`, once the arguments are in.
+        bytes.extend_from_slice(&0u16.to_le_bytes());
         Self {
             bytes,
             fds: Vec::new(),
@@ -241,7 +246,7 @@ impl Writer {
 
     pub fn finish(mut self) -> Self {
         let size = self.bytes.len() as u16;
-        self.bytes[4..6].copy_from_slice(&size.to_le_bytes());
+        self.bytes[6..8].copy_from_slice(&size.to_le_bytes());
         self
     }
 
@@ -276,8 +281,28 @@ mod tests {
     #[test]
     fn a_length_that_cannot_be_a_message_is_an_error() {
         let mut bytes = Writer::new(1, 1).uint(0).finish().bytes().to_vec();
-        bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
+        bytes[6..8].copy_from_slice(&7u16.to_le_bytes());
         assert!(matches!(take(&bytes), Err(WireError::BadLength(7))));
+    }
+
+    #[test]
+    fn a_real_client_s_hello_message_reads_as_it_was_sent() {
+        // The first 24 bytes libwayland's client sends, taken from a real
+        // connection: get_registry(new id 2), then sync(new id 3). The opcode's
+        // two bytes come before the length's, and reading them the other way
+        // round makes the length 1 — which is how this cost an afternoon.
+        let hello = [
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x0c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x03, 0x00, 0x00, 0x00,
+        ];
+        let (first, used) = take(&hello).unwrap().unwrap();
+        assert_eq!((first.object, first.opcode, used), (1, 1, 12));
+        let mut args = Args::new(first.body);
+        assert_eq!(args.new_id(), 2);
+        let (second, used) = take(&hello[used..]).unwrap().unwrap();
+        assert_eq!((second.object, second.opcode, used), (1, 0, 12));
+        let mut args = Args::new(second.body);
+        assert_eq!(args.new_id(), 3);
     }
 
     #[test]

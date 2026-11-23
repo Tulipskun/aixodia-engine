@@ -1,24 +1,433 @@
 //! A Wayland compositor written from the protocol up.
 //!
-//! X11 is the older protocol and it shows: a separate display server, a window
+//! X11 is the older arrangement and it shows: a separate display server, a window
 //! manager that is a second program talking to it, a client library linked into
-//! whatever wants a picture, and a capture path that copies the server's
-//! framebuffer across a socket. Wayland folds the server and the window manager
-//! into one program — the compositor — and hands each client's pixels over
-//! shared memory, so the compositor owns the only copy.
+//! every program that wants a picture, and a capture path that copies the
+//! server's framebuffer back out across a socket. Wayland folds the display
+//! server and the window manager into one program — the compositor — and hands
+//! each client's pixels over shared memory, so the compositor owns the only copy
+//! of the picture it already has to encode.
 //!
-//! Writing that compositor here, rather than linking `wlroots`, is the same
-//! decision as writing the RFB server: the protocol is public and small enough
-//! to hold in your head, while the library that wraps it drags in a dozen shared
-//! objects (and, for the GPU path, needs a device the engine's host may not have).
-//! The dependencies of this crate are `libc` and `tracing`; nothing here needs a
-//! Wayland package installed.
+//! `wlroots` would bring that with eleven shared libraries and a GPU its renderer
+//! needs; this host has no `/dev/dri` at all. So the compositor is written from
+//! the protocol, the way the RFB server was: this crate depends on `libc` and
+//! `tracing`, and nothing in it needs a Wayland package installed.
 //!
-//! `protocol` is the wire format, `sys` is the sendmsg/recvmsg that carries an fd
-//! beside the bytes, and `server` is the object model and the dispatch.
+//! * `protocol` — the wire format, eight argument types and all.
+//! * `sys` — the sendmsg/recvmsg that carries a file descriptor beside the bytes.
+//! * `server` — connections, the message pump, and the globals on offer.
+//! * `state` — the object model, what each opcode does, and compositing.
+//! * `shm` — the client's shared-memory pool, mapped and blitted.
+//! * `keymap` — the xkb keymap a keyboard is sent, so typing produces text.
 
+pub mod keymap;
 pub mod protocol;
 pub mod server;
+pub mod shm;
+pub mod state;
 pub mod sys;
 
-pub use server::{Client, Global, Interface, Server, GLOBALS};
+use std::io;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+
+pub use server::{Global, GLOBALS};
+pub use state::{State, Window};
+
+/// A compositor: the socket clients connect to, and the picture they draw into.
+pub struct Compositor {
+    server: server::Server,
+    pub state: State,
+}
+
+impl Compositor {
+    /// Binds `dir/name` and gives the output a size. Clients find it through
+    /// `WAYLAND_DISPLAY=name` and `XDG_RUNTIME_DIR=dir`, which is what a
+    /// launcher unsets and sets before starting a program.
+    pub fn new(dir: &Path, name: &str, width: u32, height: u32) -> io::Result<Self> {
+        let server = server::Server::bind(dir, name)?;
+        Ok(Self {
+            server,
+            state: State::new(width, height),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.server.path()
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.state.width, self.state.height)
+    }
+
+    /// The picture, as ARGB.
+    pub fn frame(&self) -> &[u32] {
+        &self.state.frame
+    }
+
+    /// Takes a connection the caller already has, which is what a test does and
+    /// what a program launched with an inherited socket would need.
+    pub fn adopt(&mut self, stream: UnixStream) -> io::Result<()> {
+        stream.set_nonblocking(true)?;
+        self.state.add_client(server::Client::new(stream)?);
+        Ok(())
+    }
+
+    /// Waits up to `timeout_ms` for something to happen and then does it.
+    ///
+    /// Returns true when the picture changed, which is the only thing a caller
+    /// that encodes frames cares about.
+    pub fn poll(&mut self, timeout_ms: i32) -> io::Result<bool> {
+        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(self.state.clients.len() + 1);
+        fds.push(libc::pollfd {
+            fd: self.server.listener().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        for client in &self.state.clients {
+            fds.push(libc::pollfd {
+                fd: client.client.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        // SAFETY: the array is valid for its length and poll does not keep it.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+        self.pump(!fds.is_empty() && fds[0].revents != 0)
+    }
+
+    /// Handles whatever is already waiting, without blocking.
+    pub fn pump_ready(&mut self) -> io::Result<bool> {
+        self.pump(true)
+    }
+
+    fn pump(&mut self, accept: bool) -> io::Result<bool> {
+        if accept {
+            while let Some(client) = self.server.accept()? {
+                self.state.add_client(client);
+            }
+        }
+        // Read and handle per client; a client that has gone is dropped with its
+        // windows.
+        let mut gone = Vec::new();
+        for index in 0..self.state.clients.len() {
+            let alive = self.state.clients[index].client.fill()?;
+            if !alive {
+                gone.push(index);
+                continue;
+            }
+            if let Err(err) = self.state.handle_client(index) {
+                tracing::info!("wayland: dropping a client: {err}");
+                gone.push(index);
+            }
+        }
+        for index in gone.into_iter().rev() {
+            self.remove_client(index);
+        }
+        self.state.reconcile();
+        if self.state.dirty {
+            self.state.compose();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Forgets a client, and every window that belonged to it.
+    ///
+    /// Window indices are positions in a vector that other objects point at, so
+    /// the survivors are rebuilt and the ids that pointed at them are corrected
+    /// rather than left dangling.
+    fn remove_client(&mut self, index: usize) {
+        self.state.clients.remove(index);
+        // Windows are positions in a vector that objects point at, so the
+        // survivors are rebuilt and every pointer to a window is rewritten from
+        // what each surface now is, rather than shifted by arithmetic.
+        let mut kept = Vec::with_capacity(self.state.windows.len());
+        for window in self.state.windows.drain(..) {
+            if window.client == index {
+                continue;
+            }
+            let client = if window.client > index {
+                window.client - 1
+            } else {
+                window.client
+            };
+            kept.push(Window { client, ..window });
+        }
+        self.state.windows = kept;
+        for (client_index, client) in self.state.clients.iter_mut().enumerate() {
+            let windows: Vec<(u32, usize)> = self
+                .state
+                .windows
+                .iter()
+                .enumerate()
+                .filter(|(_, window)| window.client == client_index)
+                .map(|(position, window)| (window.surface, position))
+                .collect();
+            for object in client.objects.values_mut() {
+                if let state::Object::XdgSurface { surface, window } = object {
+                    *window = windows
+                        .iter()
+                        .find(|(surface_id, _)| surface_id == surface)
+                        .map(|(_, position)| *position);
+                }
+            }
+        }
+        if let Some((client, _surface)) = self.state.pointer.over {
+            if client >= index {
+                self.state.pointer.over = None;
+            }
+        }
+        if let Some((client, _surface)) = self.state.focus {
+            if client >= index {
+                self.state.focus = None;
+            }
+        }
+        self.state.dirty = true;
+    }
+
+    /// Moves the pointer, as a phone's finger would.
+    pub fn pointer_motion(&mut self, x: f64, y: f64) -> io::Result<()> {
+        self.state.pointer_motion(x, y)
+    }
+
+    /// A pointer button. Wayland's numbers are evdev's: 1 left, 2 middle, 3 right.
+    pub fn pointer_button(&mut self, button: u32, pressed: bool) -> io::Result<()> {
+        self.state.pointer_button(button, pressed)
+    }
+
+    /// A scroll, in notches.
+    pub fn pointer_axis(&mut self, notches: f64) -> io::Result<()> {
+        self.state.pointer_axis(notches)
+    }
+
+    /// A key, by evdev code.
+    pub fn key(&mut self, evdev: u32, pressed: bool) -> io::Result<()> {
+        self.state.key(evdev, pressed)
+    }
+
+    /// A window's title, for a taskbar the engine draws itself.
+    pub fn windows(&self) -> &[Window] {
+        &self.state.windows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{Args, Writer};
+    use crate::sys;
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    /// Reads one event from the client end of the connection.
+    fn next_event(theirs: &UnixStream) -> (u32, u16, Vec<u8>) {
+        let mut reader = theirs;
+        let mut header = [0u8; 8];
+        reader.read_exact(&mut header).unwrap();
+        let object = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let opcode = u16::from_le_bytes([header[4], header[5]]);
+        let size = u16::from_le_bytes([header[6], header[7]]) as usize;
+        let mut body = vec![0u8; size - 8];
+        if !body.is_empty() {
+            reader.read_exact(&mut body).unwrap();
+        }
+        (object, opcode, body)
+    }
+
+    /// Sends one request with an optional fd beside it.
+    fn request(theirs: &UnixStream, writer: Writer) {
+        let bytes = writer.bytes();
+        sys::send(theirs.as_raw_fd(), bytes, &writer.fds).unwrap();
+    }
+
+    /// A compositor and a client on the two ends of one socket.
+    fn setup(size: u32) -> (Compositor, UnixStream) {
+        let dir = std::env::temp_dir().join(format!("aixodia-wl-{}-{size}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut compositor = Compositor::new(&dir, "wayland-0", size, size).unwrap();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        compositor.adopt(ours).unwrap();
+        (compositor, theirs)
+    }
+
+    /// Pumps the compositor until it has handled what the test sent.
+    fn settle(compositor: &mut Compositor) {
+        compositor.pump_ready().unwrap();
+    }
+
+    #[test]
+    fn a_client_that_does_the_whole_handshake_gets_its_pixels_into_the_frame() {
+        let (mut compositor, theirs) = setup(8);
+        // wl_display.get_registry(2), and read the globals it answers with.
+        request(&theirs, Writer::new(1, 1).uint(2).finish());
+        settle(&mut compositor);
+        let mut globals = Vec::new();
+        loop {
+            let (object, opcode, body) = next_event(&theirs);
+            assert_eq!((object, opcode), (2, 0));
+            let mut args = Args::new(&body);
+            let _name = args.uint();
+            globals.push(args.string().unwrap_or_default());
+            if globals.len() == server::GLOBALS.len() {
+                break;
+            }
+        }
+        assert!(globals.iter().any(|name| name == "wl_shm"));
+
+        // Bind compositor, shm, seat and xdg_wm_base.
+        for (name, interface, id) in [
+            (1u32, "wl_compositor", 3u32),
+            (2, "wl_shm", 4),
+            (3, "wl_seat", 5),
+            (6, "xdg_wm_base", 6),
+        ] {
+            request(
+                &theirs,
+                Writer::new(2, 0)
+                    .uint(name)
+                    .string(Some(interface))
+                    .uint(4)
+                    .uint(id)
+                    .finish(),
+            );
+        }
+        settle(&mut compositor);
+
+        // A surface, an xdg_surface and a toplevel on it.
+        request(&theirs, Writer::new(3, 0).uint(7).finish());
+        request(&theirs, Writer::new(6, 2).uint(8).object(7).finish());
+        request(&theirs, Writer::new(8, 1).uint(9).finish());
+        settle(&mut compositor);
+        // The commit that asks to be configured.
+        request(&theirs, Writer::new(7, 6).finish());
+        settle(&mut compositor);
+
+        // A pool holding an 8x8 picture, and a buffer into it.
+        let pool = tempfile_pool(8, 8, 0xff00_ff00);
+        let message = Writer::new(4, 0)
+            .uint(10)
+            .int(8 * 8 * 4)
+            .fd(pool.as_raw_fd())
+            .finish();
+        request(&theirs, message);
+        request(
+            &theirs,
+            Writer::new(10, 0)
+                .uint(11)
+                .int(0)
+                .int(8)
+                .int(8)
+                .int(8 * 4)
+                .uint(0)
+                .finish(),
+        );
+        settle(&mut compositor);
+        // Attach it and commit: this is the frame the client wants shown.
+        request(&theirs, Writer::new(7, 1).object(11).int(0).int(0).finish());
+        request(&theirs, Writer::new(7, 6).finish());
+        settle(&mut compositor);
+
+        assert_eq!(compositor.state.windows.len(), 1);
+        let window = &compositor.state.windows[0];
+        assert!(window.mapped, "the window has a buffer and is mapped");
+        assert_eq!((window.width, window.height), (8, 8));
+        // The window sits at (40, 40) by default, which is outside this 8x8
+        // output, so the frame is background — the window is real but off screen.
+        assert!(compositor
+            .state
+            .frame
+            .iter()
+            .all(|pixel| *pixel == 0xff10_1a2b));
+        // Move it into view and the pixels arrive.
+        compositor.state.windows[0].x = 0;
+        compositor.state.windows[0].y = 0;
+        compositor.state.dirty = true;
+        compositor.state.compose();
+        assert_eq!(compositor.state.frame[0], 0xff00_ff00);
+    }
+
+    /// A shared-memory pool with every pixel one colour.
+    fn tempfile_pool(width: u32, height: u32, colour: u32) -> std::fs::File {
+        use std::io::Write;
+        let name = c"aixodia-test-pool";
+        // SAFETY: a C string literal and the documented memfd flags.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        // SAFETY: the fd is fresh and ownership moves into the File.
+        let mut file = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) };
+        let mut bytes = Vec::new();
+        for _ in 0..width * height {
+            bytes.extend_from_slice(&colour.to_le_bytes());
+        }
+        file.write_all(&bytes).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_sync_is_answered_and_a_surface_can_be_created() {
+        let (mut compositor, theirs) = setup(4);
+        // The registry first: a callback has no bind, and a bind on a callback
+        // is the protocol error this test exists to not make.
+        request(&theirs, Writer::new(1, 1).uint(2).finish());
+        settle(&mut compositor);
+        for _ in 0..server::GLOBALS.len() {
+            let (object, opcode, _) = next_event(&theirs);
+            assert_eq!((object, opcode), (2, 0));
+        }
+        request(
+            &theirs,
+            Writer::new(2, 0)
+                .uint(1)
+                .string(Some("wl_compositor"))
+                .uint(4)
+                .uint(3)
+                .finish(),
+        );
+        settle(&mut compositor);
+        request(&theirs, Writer::new(3, 0).uint(4).finish());
+        settle(&mut compositor);
+        assert!(matches!(
+            compositor.state.clients[0].objects.get(&4),
+            Some(state::Object::Surface(_))
+        ));
+
+        // And a sync after all that is answered with its own serial.
+        request(&theirs, Writer::new(1, 0).uint(5).finish());
+        settle(&mut compositor);
+        let (object, opcode, body) = next_event(&theirs);
+        assert_eq!((object, opcode), (5, 0));
+        assert!(Args::new(&body).uint() >= 1);
+    }
+
+    #[test]
+    fn the_pointer_reports_the_window_under_it_and_the_focus_follows() {
+        let (mut compositor, theirs) = setup(64);
+        // A window record by hand: this test is about hit testing, not about the
+        // handshake the other test already proves.
+        compositor.state.windows.push(Window {
+            client: 0,
+            surface: 7,
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+            title: "test".into(),
+            app_id: "test".into(),
+            mapped: true,
+        });
+        compositor.pointer_motion(15.0, 15.0).unwrap();
+        assert_eq!(compositor.state.pointer.over, Some((0, 7)));
+        compositor.pointer_motion(60.0, 60.0).unwrap();
+        assert_eq!(compositor.state.pointer.over, None);
+        drop(theirs);
+    }
+}

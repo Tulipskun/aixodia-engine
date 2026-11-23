@@ -1,22 +1,16 @@
-//! The server side of Wayland: who is connected, which objects they hold, and
-//! what each opcode means.
+//! The connection itself: a socket, a buffer of bytes that are not yet a
+//! message, and the fds that arrived with them.
 //!
-//! Wayland names its interfaces and their opcodes in XML files. This module is
-//! the part of that contract this compositor implements, written out as Rust:
-//! every opcode arrives as a number on an object, so the object's interface plus
-//! the opcode is the whole dispatch.
-//!
-//! The first milestone is deliberately small — a display, a registry and its
-//! callbacks — because that is the part every client starts with, and a client
-//! that cannot get past `wl_display.sync` never draws anything at all.
+//! This module owns no protocol opinions. `state` decides what each opcode
+//! means; here a message is just an id, an opcode and a body.
 
-use std::collections::HashMap;
-use std::io::{self, Read};
+use std::collections::VecDeque;
+use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-use crate::protocol::{self, Args, Writer};
+use crate::protocol::{self, Writer};
 use crate::sys;
 
 /// The id the protocol reserves for `wl_display` on every connection.
@@ -64,7 +58,7 @@ pub const GLOBALS: &[Global] = &[
     },
 ];
 
-/// What an object id means on this connection.
+/// The interface names Wayland gives its objects, for logging and dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interface {
     Display,
@@ -79,15 +73,19 @@ pub enum Interface {
     Seat,
     Pointer,
     Keyboard,
+    Touch,
     Output,
+    DataDevice,
+    DataSource,
     DataDeviceManager,
     XdgWmBase,
+    Positioner,
     XdgSurface,
     XdgToplevel,
+    XdgPopup,
 }
 
 impl Interface {
-    /// The name Wayland gives the interface, used in logs and in `bind`.
     pub fn name(self) -> &'static str {
         match self {
             Self::Display => "wl_display",
@@ -102,47 +100,33 @@ impl Interface {
             Self::Seat => "wl_seat",
             Self::Pointer => "wl_pointer",
             Self::Keyboard => "wl_keyboard",
+            Self::Touch => "wl_touch",
             Self::Output => "wl_output",
+            Self::DataDevice => "wl_data_device",
+            Self::DataSource => "wl_data_source",
             Self::DataDeviceManager => "wl_data_device_manager",
             Self::XdgWmBase => "xdg_wm_base",
+            Self::Positioner => "xdg_positioner",
             Self::XdgSurface => "xdg_surface",
             Self::XdgToplevel => "xdg_toplevel",
+            Self::XdgPopup => "xdg_popup",
         }
-    }
-
-    /// Whether the interface is a global a client binds by name.
-    pub fn from_global(name: &str) -> Option<Self> {
-        Some(match name {
-            "wl_compositor" => Self::Compositor,
-            "wl_shm" => Self::Shm,
-            "wl_seat" => Self::Seat,
-            "wl_output" => Self::Output,
-            "wl_data_device_manager" => Self::DataDeviceManager,
-            "xdg_wm_base" => Self::XdgWmBase,
-            _ => return None,
-        })
     }
 }
 
-/// One connected client: its socket, its objects, and the bytes it has sent so
-/// far that do not yet make a message.
+/// One connected client and the bytes it has sent.
 pub struct Client {
     stream: UnixStream,
-    objects: HashMap<u32, Interface>,
     pending: Vec<u8>,
-    fds: Vec<RawFd>,
+    fds: VecDeque<RawFd>,
 }
 
 impl Client {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
-        stream.set_nonblocking(false)?;
-        let mut objects = HashMap::new();
-        objects.insert(DISPLAY_ID, Interface::Display);
         Ok(Self {
             stream,
-            objects,
-            pending: Vec::with_capacity(4096),
-            fds: Vec::new(),
+            pending: Vec::with_capacity(8192),
+            fds: VecDeque::new(),
         })
     }
 
@@ -150,167 +134,62 @@ impl Client {
         self.stream.as_raw_fd()
     }
 
-    /// The interface behind an id, for a caller that wants to know what a client
-    /// holds.
-    pub fn interface_of(&self, id: u32) -> Option<Interface> {
-        self.objects.get(&id).copied()
-    }
-
-    /// Reads what the socket has and handles every whole message in it.
+    /// Reads from the socket, if anything is there.
     ///
-    /// Returns how many messages were handled, so an event loop can tell "the
-    /// client is quiet" from "the client spoke".
-    pub fn read_and_handle(&mut self, serial: &mut u32) -> io::Result<usize> {
-        let (bytes, fds) = sys::recv(self.fd(), 65536)?;
+    /// Returns false at end of file, which an event loop treats as a client that
+    /// has gone.
+    pub fn fill(&mut self) -> io::Result<bool> {
+        let (bytes, fds) = match sys::recv(self.fd(), 65536) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+            Err(err) => return Err(err),
+        };
         if bytes.is_empty() && fds.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the client closed the connection",
-            ));
+            return Ok(false);
         }
         self.pending.extend_from_slice(&bytes);
         self.fds.extend(fds);
-        self.handle_pending(serial)
+        Ok(true)
     }
 
-    /// Handles bytes a caller already has, which is what the tests use and what a
-    /// future in-process client would use.
-    pub fn handle_bytes(&mut self, bytes: &[u8], serial: &mut u32) -> io::Result<usize> {
-        self.pending.extend_from_slice(bytes);
-        self.handle_pending(serial)
-    }
-
-    /// Handles every whole message already buffered.
-    ///
-    /// A message's body is copied out before dispatch because dispatch writes to
-    /// the same client: a borrow of the buffer and a call that appends to it
-    /// cannot both be alive.
-    fn handle_pending(&mut self, serial: &mut u32) -> io::Result<usize> {
-        let mut handled = 0;
-        loop {
-            let step = match protocol::take(&self.pending) {
-                Ok(Some((message, used))) => {
-                    Some((message.object, message.opcode, message.body.to_vec(), used))
-                }
-                Ok(None) => None,
-                Err(err) => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
-                }
-            };
-            let Some((object, opcode, body, used)) = step else {
-                break;
-            };
-            self.pending.drain(..used);
-            self.dispatch(object, opcode, &body, serial)?;
-            handled += 1;
+    /// The next whole message, if one is buffered.
+    pub fn next_message(&mut self) -> io::Result<Option<(u32, u16, Vec<u8>)>> {
+        match protocol::take(&self.pending) {
+            Ok(Some((message, used))) => {
+                let taken = (message.object, message.opcode, message.body.to_vec());
+                self.pending.drain(..used);
+                Ok(Some(taken))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string())),
         }
-        Ok(handled)
     }
 
-    fn dispatch(
-        &mut self,
-        object: u32,
-        opcode: u16,
-        body: &[u8],
-        serial: &mut u32,
-    ) -> io::Result<()> {
-        let interface = match self.objects.get(&object) {
-            Some(interface) => *interface,
-            None => {
-                // An id this connection never created. Wayland requires an error
-                // event and a close here; the connection is not trusted after it.
+    /// Sends one event.
+    pub fn send(&mut self, writer: Writer) -> io::Result<()> {
+        let bytes = writer.bytes();
+        let mut sent = 0;
+        while sent < bytes.len() {
+            let written = sys::send(self.fd(), &bytes[sent..], &writer.fds)?;
+            if written == 0 {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("request on unknown object {object}"),
+                    io::ErrorKind::WriteZero,
+                    "the client's socket took nothing",
                 ));
             }
-        };
-        match (interface, opcode) {
-            // wl_display.sync(new_id)
-            (Interface::Display, 0) => {
-                let callback = Args::new(body).new_id();
-                self.insert(callback, Interface::Callback);
-                *serial += 1;
-                self.send(Writer::new(callback, 0).uint(*serial).finish())?;
-            }
-            // wl_display.get_registry(new_id)
-            (Interface::Display, 1) => {
-                let registry = Args::new(body).new_id();
-                self.insert(registry, Interface::Registry);
-                for global in GLOBALS {
-                    self.send(
-                        Writer::new(registry, 0)
-                            .uint(global.name)
-                            .string(Some(global.interface))
-                            .uint(global.version)
-                            .finish(),
-                    )?;
-                }
-            }
-            // wl_registry.bind(name, interface, version, new_id)
-            (Interface::Registry, 0) => {
-                let mut args = Args::new(body);
-                let name = args.uint();
-                let interface = args.string().unwrap_or_default();
-                let version = args.uint();
-                let id = args.new_id();
-                match Interface::from_global(&interface) {
-                    Some(bound) => {
-                        tracing::debug!(
-                            "wayland: client bound {interface} v{version} (global {name}) as {id}"
-                        );
-                        self.insert(id, bound);
-                    }
-                    None => {
-                        tracing::warn!("wayland: client asked for unknown global {interface}");
-                    }
-                }
-            }
-            // wl_callback is a one-shot object with no requests.
-            (Interface::Callback, opcode) => {
-                tracing::debug!("wayland: ignored callback request {opcode}");
-            }
-            (interface, opcode) => {
-                tracing::debug!(
-                    "wayland: {} request {opcode} is not implemented yet",
-                    interface.name()
-                );
-            }
+            sent += written;
         }
         Ok(())
     }
 
-    fn insert(&mut self, id: u32, interface: Interface) {
-        self.objects.insert(id, interface);
+    /// Takes the next fd a client sent, in the order it sent them.
+    pub fn take_fd(&mut self) -> Option<RawFd> {
+        self.fds.pop_front()
     }
 
-    fn send(&mut self, writer: Writer) -> io::Result<()> {
-        let bytes = writer.bytes();
-        let sent = sys::send(self.fd(), bytes, &writer.fds)?;
-        if sent != bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "the socket took only part of a message",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Takes the fds this client has sent, consumed in order by pool creation.
-    pub fn take_fds(&mut self) -> Vec<RawFd> {
-        std::mem::take(&mut self.fds)
-    }
-
-    /// Reads anything the client has sent without blocking, for an event loop
-    /// that polls first.
-    pub fn drain(&mut self) -> io::Result<()> {
-        let mut sink = Vec::new();
-        match self.stream.read_to_end(&mut sink) {
-            Ok(_) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
+    /// Drops a client's socket without touching its fds, for a compositor that is
+    /// shutting down.
+    pub fn close(self) {}
 }
 
 /// Where clients connect: a directory and a socket name, which is what
@@ -318,52 +197,50 @@ impl Client {
 pub struct Server {
     listener: UnixListener,
     path: PathBuf,
-    pub serial: u32,
 }
 
 impl Server {
-    /// Binds `dir/name` and refuses to start if something is already listening
-    /// there: a compositor that steals another's socket is a compositor whose
-    /// clients are talking to the wrong program.
+    /// Binds `dir/name`. A socket nobody is listening on is a stale one — a
+    /// crashed predecessor — and is replaced; a socket with a listener behind it
+    /// is left alone, because two compositors on one name is two compositors
+    /// whose clients are talking to the wrong program.
     pub fn bind(dir: &Path, name: &str) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(name);
         if path.exists() {
-            // A socket nobody is listening on is stale — a crashed predecessor.
-            match UnixStream::connect(&path) {
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        format!("{} is already in use", path.display()),
-                    ))
-                }
-                Err(_) => {
-                    let _ = std::fs::remove_file(&path);
-                }
+            if UnixStream::connect(&path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("{} is already in use", path.display()),
+                ));
             }
+            let _ = std::fs::remove_file(&path);
         }
         let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
         tracing::info!("wayland: listening on {}", path.display());
-        Ok(Self {
-            listener,
-            path,
-            serial: 0,
-        })
+        Ok(Self { listener, path })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Accepts one client. Blocking; an event loop polls the listener first.
-    pub fn accept(&mut self) -> io::Result<Client> {
-        let (stream, _) = self.listener.accept()?;
-        tracing::info!("wayland: client connected");
-        Client::new(stream)
-    }
-
     pub fn listener(&self) -> &UnixListener {
         &self.listener
+    }
+
+    /// Accepts one client if one is waiting.
+    pub fn accept(&mut self) -> io::Result<Option<Client>> {
+        match self.listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(true)?;
+                tracing::info!("wayland: client connected");
+                Ok(Some(Client::new(stream)?))
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -376,120 +253,34 @@ impl Drop for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixStream;
-
-    /// A client and a compositor on the two ends of one socket pair, so the
-    /// tests speak the real wire format instead of calling functions.
-    fn pair() -> (Client, UnixStream) {
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        (Client::new(ours).unwrap(), theirs)
-    }
-
-    /// Reads one message from the client side of the pair.
-    fn next_event(theirs: &mut UnixStream) -> (u32, u16, Vec<u8>) {
-        let mut header = [0u8; 8];
-        theirs.read_exact(&mut header).unwrap();
-        let object = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let size = u16::from_le_bytes([header[4], header[5]]) as usize;
-        let opcode = u16::from_le_bytes([header[6], header[7]]);
-        let mut body = vec![0u8; size - 8];
-        if !body.is_empty() {
-            theirs.read_exact(&mut body).unwrap();
-        }
-        (object, opcode, body)
-    }
-
-    #[test]
-    fn a_sync_is_answered_with_a_done_callback() {
-        let (mut client, mut theirs) = pair();
-        let mut serial = 0;
-        // wl_display.sync(new_id 2)
-        client
-            .handle_bytes(
-                &Writer::new(DISPLAY_ID, 0).uint(2).finish().bytes(),
-                &mut serial,
-            )
-            .unwrap();
-        let (object, opcode, body) = next_event(&mut theirs);
-        assert_eq!(object, 2, "the callback is the id the client asked for");
-        assert_eq!(opcode, 0, "wl_callback.done");
-        let mut args = Args::new(&body);
-        assert_eq!(args.uint(), 1, "the first serial");
-        assert_eq!(client.interface_of(2), Some(Interface::Callback));
-    }
-
-    #[test]
-    fn asking_for_the_registry_answers_with_every_global() {
-        let (mut client, mut theirs) = pair();
-        let mut serial = 0;
-        client
-            .handle_bytes(
-                &Writer::new(DISPLAY_ID, 1).uint(3).finish().bytes(),
-                &mut serial,
-            )
-            .unwrap();
-        let mut seen = Vec::new();
-        for _ in 0..GLOBALS.len() {
-            let (object, opcode, body) = next_event(&mut theirs);
-            assert_eq!(object, 3);
-            assert_eq!(opcode, 0, "wl_registry.global");
-            let mut args = Args::new(&body);
-            let name = args.uint();
-            let interface = args.string().unwrap_or_default();
-            let version = args.uint();
-            seen.push((name, interface, version));
-        }
-        assert!(seen
-            .iter()
-            .any(|(_, interface, _)| interface == "wl_compositor"));
-        assert!(seen.iter().any(|(_, interface, _)| interface == "wl_shm"));
-        assert!(seen
-            .iter()
-            .any(|(_, interface, _)| interface == "xdg_wm_base"));
-    }
-
-    #[test]
-    fn binding_a_global_makes_the_new_id_mean_that_interface() {
-        let (mut client, mut theirs) = pair();
-        let mut serial = 0;
-        client
-            .handle_bytes(
-                &Writer::new(DISPLAY_ID, 1).uint(3).finish().bytes(),
-                &mut serial,
-            )
-            .unwrap();
-        for _ in 0..GLOBALS.len() {
-            next_event(&mut theirs);
-        }
-        let bind = Writer::new(3, 0)
-            .uint(1)
-            .string(Some("wl_compositor"))
-            .uint(4)
-            .uint(9)
-            .finish();
-        client.handle_bytes(bind.bytes(), &mut serial).unwrap();
-        assert_eq!(client.interface_of(9), Some(Interface::Compositor));
-    }
-
-    #[test]
-    fn a_request_on_an_id_that_was_never_created_is_refused() {
-        let (mut client, _theirs) = pair();
-        let mut serial = 0;
-        let err = client
-            .handle_bytes(&Writer::new(77, 0).uint(1).finish().bytes(), &mut serial)
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-    }
+    use std::io::Read;
 
     #[test]
     fn a_message_split_across_two_reads_is_handled_once_it_is_whole() {
-        let (mut client, mut theirs) = pair();
-        let mut serial = 0;
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut client = Client::new(ours).unwrap();
         let message = Writer::new(DISPLAY_ID, 0).uint(2).finish();
         let bytes = message.bytes();
-        assert_eq!(client.handle_bytes(&bytes[..5], &mut serial).unwrap(), 0);
-        assert_eq!(client.handle_bytes(&bytes[5..], &mut serial).unwrap(), 1);
-        let (object, opcode, _) = next_event(&mut theirs);
-        assert_eq!((object, opcode), (2, 0));
+        client.pending.extend_from_slice(&bytes[..5]);
+        assert!(client.next_message().unwrap().is_none());
+        client.pending.extend_from_slice(&bytes[5..]);
+        let (object, opcode, body) = client.next_message().unwrap().unwrap();
+        assert_eq!((object, opcode), (DISPLAY_ID, 0));
+        assert_eq!(body.len(), 4);
+        drop(theirs);
+    }
+
+    #[test]
+    fn an_event_written_to_one_end_arrives_at_the_other() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut client = Client::new(ours).unwrap();
+        client.send(Writer::new(2, 0).uint(7).finish()).unwrap();
+        let mut header = [0u8; 8];
+        theirs.read_exact(&mut header).unwrap();
+        // object 2, opcode 0, then the length: 12 bytes in all.
+        assert_eq!(&header[..8], &[2, 0, 0, 0, 0, 0, 12, 0]);
+        let mut body = [0u8; 4];
+        theirs.read_exact(&mut body).unwrap();
+        assert_eq!(u32::from_le_bytes(body), 7);
     }
 }
