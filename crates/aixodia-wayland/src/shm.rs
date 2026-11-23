@@ -8,7 +8,7 @@
 //! step here at all — the pixels are already in memory we can see.
 
 use std::io;
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// The pixel formats a client may hand over. Wayland's numbers, which are
 /// `DRM_FORMAT_*` values.
@@ -17,7 +17,8 @@ pub const XRGB8888: u32 = 1;
 
 /// A mapped shared-memory pool.
 pub struct Pool {
-    /// Kept so the mapping has an owner and so a client's fd count is honest.
+    /// Kept so the mapping has an owner, and so a resize can ask the file how big
+    /// it really is.
     _fd: OwnedFd,
     address: *mut u8,
     size: usize,
@@ -59,6 +60,43 @@ impl Pool {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Grows the mapping to what the client has grown its file to.
+    ///
+    /// A client that needs more room sends `wl_shm_pool.resize` and later
+    /// offsets buffers past our old mapping. Ignoring that is not a cosmetic
+    /// complaint: measured against a real browser, the pool went 2304 → 587520
+    /// bytes while the mapping stayed at 2304, so the next buffer at offset
+    /// 211968 was refused and the browser kept committing a buffer that did not
+    /// exist. The file itself is asked how big it is, because a mapping beyond a
+    /// file's end is a SIGBUS on the first read, not an error return.
+    pub fn resize(&mut self, size: usize) -> io::Result<usize> {
+        // SAFETY: stat is ours and the fd is a plain descriptor.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(self._fd.as_raw_fd(), &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let grown = size.min(stat.st_size.max(0) as usize);
+        if grown <= self.size {
+            return Ok(self.size);
+        }
+        // SAFETY: the old mapping is ours, the new size is within the file, and
+        // MAP_FAILED is checked. MREMAP_MAYMOVE lets the kernel pick a place.
+        let address = unsafe {
+            libc::mremap(
+                self.address as *mut libc::c_void,
+                self.size,
+                grown,
+                libc::MREMAP_MAYMOVE,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        self.address = address as *mut u8;
+        self.size = grown;
+        Ok(self.size)
     }
 
     /// The pool's bytes. A caller must not hold this across a `resize`.

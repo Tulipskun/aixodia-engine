@@ -57,10 +57,12 @@ fn main() {
 }
 
 async fn async_main() {
-    // Log verbosity is a built-in default, not an environment configuration.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-        .try_init();
+    // Info by default. `AIXODIA_LOG=debug` (or `aixodia_wayland=debug` for one
+    // crate) is how a compositor that draws the wrong thing gets diagnosed
+    // without a rebuild: a picture is the last thing to say what went wrong.
+    let filter = tracing_subscriber::EnvFilter::try_from_env("AIXODIA_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     tunnel::set_started_at(now_unix());
 

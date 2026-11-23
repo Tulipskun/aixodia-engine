@@ -253,6 +253,16 @@ impl Writer {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// The object an event is sent to, for a log that says what was said.
+    pub fn object_id(&self) -> u32 {
+        u32::from_le_bytes([self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]])
+    }
+
+    /// The event's opcode on that object.
+    pub fn op(&self) -> u16 {
+        u16::from_le_bytes([self.bytes[4], self.bytes[5]])
+    }
 }
 
 #[cfg(test)]

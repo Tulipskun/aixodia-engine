@@ -21,6 +21,7 @@ pub mod capture;
 pub mod cursor;
 pub mod display;
 pub mod encoder;
+pub mod pane;
 pub mod panel;
 pub mod rfb;
 pub mod server;

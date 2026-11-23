@@ -39,6 +39,9 @@ pub use state::{State, Window};
 pub struct Compositor {
     server: server::Server,
     pub state: State,
+    /// What was last written to the log, so a change is logged once and an idle
+    /// pane is silent.
+    reported: Option<(usize, usize, bool)>,
 }
 
 impl Compositor {
@@ -50,6 +53,7 @@ impl Compositor {
         Ok(Self {
             server,
             state: State::new(width, height),
+            reported: None,
         })
     }
 
@@ -110,6 +114,7 @@ impl Compositor {
     }
 
     fn pump(&mut self, accept: bool) -> io::Result<bool> {
+        let arrangement = self.state.arrangement();
         if accept {
             while let Some(client) = self.server.accept()? {
                 self.state.add_client(client);
@@ -132,7 +137,41 @@ impl Compositor {
         for index in gone.into_iter().rev() {
             self.remove_client(index);
         }
+        // Whatever a client could not take last turn is offered again now. A
+        // composer that keeps this inside the write path is a composer that stalls
+        // the whole display behind one slow reader.
+        for index in 0..self.state.clients.len() {
+            if let Err(err) = self.state.clients[index].client.flush() {
+                tracing::info!("wayland: a client stopped reading: {err}");
+                self.remove_client(index);
+                break;
+            }
+        }
+        self.state.release_buffers()?;
         self.state.reconcile();
+        // A window that appears under a pointer that has not moved still takes the
+        // pointer, and with it the keyboard. Without this, a viewer that points at
+        // the middle of an empty screen before the browser has drawn has to point
+        // again — and a viewer that only then sends keys (ctrl+L, a URL) has
+        // typed into nothing.
+        if arrangement != self.state.arrangement() {
+            let (x, y) = (self.state.pointer.x, self.state.pointer.y);
+            self.state.pointer_motion(x, y)?;
+        }
+        let report = (
+            self.state.clients.len(),
+            self.state.windows.len(),
+            self.state.dirty,
+        );
+        if self.reported != Some(report) {
+            self.reported = Some(report);
+            tracing::debug!(
+                "wayland: {} clients, {} windows, dirty={}",
+                report.0,
+                report.1,
+                report.2
+            );
+        }
         if self.state.dirty {
             self.state.compose();
             return Ok(true);
@@ -163,6 +202,14 @@ impl Compositor {
             kept.push(Window { client, ..window });
         }
         self.state.windows = kept;
+        // A popup belongs to a client the same way a window does, including the
+        // indices of the clients that are left.
+        self.state.popups.retain(|popup| popup.client != index);
+        for popup in &mut self.state.popups {
+            if popup.client > index {
+                popup.client -= 1;
+            }
+        }
         for (client_index, client) in self.state.clients.iter_mut().enumerate() {
             let windows: Vec<(u32, usize)> = self
                 .state
@@ -173,7 +220,12 @@ impl Compositor {
                 .map(|(position, window)| (window.surface, position))
                 .collect();
             for object in client.objects.values_mut() {
-                if let state::Object::XdgSurface { surface, window } = object {
+                if let state::Object::XdgSurface {
+                    surface,
+                    window,
+                    configured: _,
+                } = object
+                {
                     *window = windows
                         .iter()
                         .find(|(surface_id, _)| surface_id == surface)

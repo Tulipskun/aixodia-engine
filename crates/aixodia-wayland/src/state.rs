@@ -53,10 +53,15 @@ pub enum Object {
     DataDevice,
     DataSource,
     XdgWmBase,
-    Positioner,
+    Positioner(Positioner),
     XdgSurface {
         surface: u32,
         window: Option<usize>,
+        /// False until the first configure has gone out. The protocol puts that
+        /// configure in answer to the client's initial commit, and a client that
+        /// is configured before it ever committed is being answered before it
+        /// asked.
+        configured: bool,
     },
     XdgToplevel {
         xdg_surface: u32,
@@ -65,6 +70,12 @@ pub enum Object {
     },
     XdgPopup {
         xdg_surface: u32,
+    },
+    TextInputManager,
+    TextInput {
+        /// True between `enable` and `disable`: the client has a text field
+        /// waiting for characters.
+        enabled: bool,
     },
 }
 
@@ -89,12 +100,50 @@ impl Object {
             Self::DataDevice => Interface::DataDevice,
             Self::DataSource => Interface::DataSource,
             Self::XdgWmBase => Interface::XdgWmBase,
-            Self::Positioner => Interface::Positioner,
+            Self::Positioner(_) => Interface::Positioner,
             Self::XdgSurface { .. } => Interface::XdgSurface,
             Self::XdgToplevel { .. } => Interface::XdgToplevel,
             Self::XdgPopup { .. } => Interface::XdgPopup,
+            Self::TextInputManager => Interface::TextInputManager,
+            Self::TextInput { .. } => Interface::TextInput,
         }
     }
+}
+
+/// Where a popup asked to be, in the terms the protocol gives.
+///
+/// A positioner is a form the client fills in: a rectangle to hang the popup off,
+/// the size it wants, and an offset. Only the parts that decide *where* a popup
+/// lands are kept; the gravity and constraint words are read and not remembered,
+/// because this compositor has one screen and no edges to slide away from.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Positioner {
+    pub anchor: (i32, i32, i32, i32),
+    pub size: (i32, i32),
+    pub offset: (i32, i32),
+}
+
+/// A menu or a dropdown: a surface that belongs to another surface, not to the
+/// list of windows.
+///
+/// Chrome's address bar suggestions are a popup. Without one, the browser has no
+/// place to put them and, measured here, died with a SIGSEGV while typing into an
+/// omnibox that had opened one.
+#[derive(Clone, Debug)]
+pub struct Popup {
+    pub client: usize,
+    /// The `xdg_popup` object itself: the popup is configured through this, the
+    /// surface through its `xdg_surface`.
+    pub object: u32,
+    pub surface: u32,
+    pub xdg_surface: u32,
+    pub parent: u32,
+    pub positioner: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub mapped: bool,
 }
 
 /// What a surface has been told, and what it has not yet shown.
@@ -110,6 +159,8 @@ pub struct Surface {
     pub frame_callbacks: Vec<u32>,
     pub scale: i32,
     pub window: Option<usize>,
+    /// False until the surface has been told which output it is on.
+    pub entered: bool,
 }
 
 /// One connection and the objects it holds.
@@ -137,6 +188,8 @@ pub struct State {
     pub serial: u32,
     /// Bottom first.
     pub windows: Vec<Window>,
+    /// Menus and dropdowns, drawn above every window.
+    pub popups: Vec<Popup>,
     pub pointer: Pointer,
     /// Set by anything that must be recomposited before the next frame.
     pub dirty: bool,
@@ -148,9 +201,22 @@ pub struct State {
     /// lock, 2 control, 3 alt, 6 logo — the xkb indices the keymap in `keymap`
     /// actually uses.
     pub mods: u32,
+    /// Buffers to release once the client's own requests for this turn have all
+    /// been read.
+    ///
+    /// A release is the compositor talking about a buffer the client may already
+    /// have thrown away: the destroy can be sitting in the same turn's buffer,
+    /// later than the commit that freed it. Sending the release mid-turn is
+    /// therefore a race with the client's own words — measured as a browser
+    /// dying the instant it typed, right after a release went out to an id it had
+    /// recycled. Sending it at the end of the turn, once every request has been
+    /// read, is the same promise kept in the right order.
+    pub releases: Vec<(usize, u32)>,
     /// Counters for the log: a compositor that is asked for buffers and never
     /// commits one is a compositor whose client is stuck, and the log should say.
     pub commits: u64,
+    /// When the compositor started, for the time field of input events.
+    started: std::time::Instant,
     pub configures: u64,
 }
 
@@ -163,6 +229,8 @@ impl State {
             clients: Vec::new(),
             serial: 0,
             windows: Vec::new(),
+            popups: Vec::new(),
+            releases: Vec::new(),
             pointer: Pointer::default(),
             dirty: true,
             keyboard_focus: None,
@@ -170,8 +238,18 @@ impl State {
             keymap_size: 0,
             mods: 0,
             commits: 0,
+            started: std::time::Instant::now(),
             configures: 0,
         }
+    }
+
+    /// Milliseconds since the compositor started.
+    ///
+    /// A key event carries a time, and a client uses it to tell a fresh press
+    /// from a repeat: every event stamped zero is a client that computes a
+    /// nonsense interval the first time it holds a key down.
+    fn now_ms(&self) -> u32 {
+        self.started.elapsed().as_millis() as u32
     }
 
     fn next_serial(&mut self) -> u32 {
@@ -268,6 +346,19 @@ impl State {
                     None => tracing::warn!("wayland: create_pool without a file descriptor"),
                 }
             }
+            (Interface::ShmPool, 2) => {
+                let mut args = Args::new(body);
+                let size = args.int().max(0) as usize;
+                if let Some(Object::ShmPool(pool)) = self.clients[index].objects.get_mut(&object) {
+                    match pool.resize(size) {
+                        Ok(mapped) if mapped < size => tracing::warn!(
+                            "wayland: pool {object} asked for {size} bytes but its file holds {mapped}"
+                        ),
+                        Ok(_) => {}
+                        Err(err) => tracing::warn!("wayland: a pool could not grow: {err}"),
+                    }
+                }
+            }
             (Interface::ShmPool, 0) => {
                 let mut args = Args::new(body);
                 let id = args.new_id();
@@ -290,7 +381,7 @@ impl State {
                 };
                 if offset + buffer.required_bytes() > pool_size {
                     tracing::warn!(
-                        "wayland: buffer {id} needs {} bytes at {offset} of a {pool_size}-byte pool",
+                        "wayland: buffer {id} on pool {object} needs {} bytes at {offset} of a {pool_size}-byte pool",
                         buffer.required_bytes()
                     );
                 } else {
@@ -340,15 +431,13 @@ impl State {
                     Object::XdgSurface {
                         surface,
                         window: None,
+                        configured: false,
                     },
                 );
-                self.send_configure(index, xdg_surface)?;
             }
             (Interface::XdgWmBase, 1) => {
-                // xdg_positioner: popups are placed where the client asks, so the
-                // positioner is only the token the protocol requires.
                 let positioner = Args::new(body).new_id();
-                self.insert(index, positioner, Object::Positioner);
+                self.insert(index, positioner, Object::Positioner(Positioner::default()));
             }
             (Interface::XdgSurface, 1) => {
                 let toplevel = Args::new(body).new_id();
@@ -363,7 +452,12 @@ impl State {
                 );
             }
             (Interface::XdgSurface, 2) => {
-                let popup = Args::new(body).new_id();
+                let mut args = Args::new(body);
+                let popup = args.new_id();
+                let parent = args.object();
+                let positioner = args.object();
+                let _x = args.int();
+                let _y = args.int();
                 self.insert(
                     index,
                     popup,
@@ -371,6 +465,71 @@ impl State {
                         xdg_surface: object,
                     },
                 );
+                let surface = match self.clients[index].objects.get(&object) {
+                    Some(Object::XdgSurface { surface, .. }) => *surface,
+                    _ => return Ok(()),
+                };
+                self.popups.push(Popup {
+                    client: index,
+                    object: popup,
+                    surface,
+                    xdg_surface: object,
+                    parent,
+                    positioner,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                    mapped: false,
+                });
+            }
+            (Interface::Positioner, opcode) => {
+                let mut args = Args::new(body);
+                let mut asked = match self.clients[index].objects.get(&object) {
+                    Some(Object::Positioner(positioner)) => *positioner,
+                    _ => Positioner::default(),
+                };
+                match opcode {
+                    // set_size
+                    1 => asked.size = (args.int(), args.int()),
+                    // set_anchor_rect
+                    2 => {
+                        asked.anchor = (args.int(), args.int(), args.int(), args.int());
+                    }
+                    // set_offset
+                    6 => asked.offset = (args.int(), args.int()),
+                    // destroy, and the anchor/gravity/constraint words: read, not
+                    // remembered, since one screen has no edge to slide away from.
+                    0 => {
+                        self.clients[index].objects.remove(&object);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                self.clients[index]
+                    .objects
+                    .insert(object, Object::Positioner(asked));
+            }
+            (Interface::XdgPopup, 0) => {
+                self.clients[index].objects.remove(&object);
+                self.popups.retain(|popup| popup.object != object);
+                self.dirty = true;
+            }
+            // Destroys. A table that keeps what the client has thrown away starts
+            // sending events about objects that no longer exist, and the first
+            // thing that does is a buffer release for a buffer the client already
+            // destroyed. Measured against a real browser, that was the last thing
+            // it was told before it died.
+            (Interface::Buffer, 0) | (Interface::Region, 0) => {
+                self.clients[index].objects.remove(&object);
+            }
+            (Interface::Callback, 0) => {
+                self.clients[index].objects.remove(&object);
+                for held in self.clients[index].objects.values_mut() {
+                    if let Object::Surface(surface) = held {
+                        surface.frame_callbacks.retain(|id| *id != object);
+                    }
+                }
             }
             (Interface::XdgSurface, 0) => {
                 self.clients[index].objects.remove(&object);
@@ -399,6 +558,42 @@ impl State {
             }
             (Interface::XdgToplevel, 0) => {
                 self.clients[index].objects.remove(&object);
+            }
+            // get_text_input: the manager's only request besides its own destroy,
+            // and it is the second one on the wire. Measured: guessing it at
+            // opcode 0 left the client asking for an object that never existed,
+            // and this compositor dropped it for asking.
+            (Interface::TextInputManager, 1) => {
+                let text_input = Args::new(body).new_id();
+                self.insert(index, text_input, Object::TextInput { enabled: false });
+            }
+            (Interface::TextInputManager, 0) => {
+                self.clients[index].objects.remove(&object);
+            }
+            (Interface::TextInput, opcode) => {
+                let mut args = Args::new(body);
+                match opcode {
+                    0 => {
+                        self.clients[index].objects.remove(&object);
+                    }
+                    // enable and disable
+                    1 | 2 => {
+                        let enabled = opcode == 1;
+                        if let Some(Object::TextInput { enabled: slot }) =
+                            self.clients[index].objects.get_mut(&object)
+                        {
+                            *slot = enabled;
+                        }
+                        self.text_input_commit(index, object)?;
+                    }
+                    // set_surrounding_text(string, uint, uint)
+                    3 => {
+                        let _text = args.string();
+                    }
+                    // commit: the point at which a client's wishes take effect.
+                    7 => self.text_input_commit(index, object)?,
+                    _ => {}
+                }
             }
             (Interface::DataDeviceManager, 0) => {
                 let source = Args::new(body).new_id();
@@ -435,6 +630,7 @@ impl State {
             "wl_output" => Object::Output,
             "wl_data_device_manager" => Object::DataDeviceManager,
             "xdg_wm_base" => Object::XdgWmBase,
+            "zwp_text_input_manager_v3" => Object::TextInputManager,
             other => {
                 tracing::warn!("wayland: bind of unknown global {other} ({name})");
                 return Ok(());
@@ -494,11 +690,24 @@ impl State {
         match opcode {
             0 => {
                 self.clients[index].objects.remove(&object);
+                // A surface that is gone takes its window, its popup and its
+                // keyboard with it. Left behind, they are records of a window
+                // that cannot be drawn and a keyboard that types into nothing —
+                // and once the client reuses the id, a window that draws someone
+                // else's pixels.
+                self.windows.retain(|window| window.surface != object);
+                self.popups.retain(|popup| popup.surface != object);
                 if let Some((client, surface)) = self.pointer.over {
                     if client == index && surface == object {
                         self.pointer.over = None;
                     }
                 }
+                if let Some((client, surface)) = self.keyboard_focus {
+                    if client == index && surface == object {
+                        self.keyboard_focus = None;
+                    }
+                }
+                self.dirty = true;
             }
             // attach(buffer, x, y)
             1 => {
@@ -537,6 +746,7 @@ impl State {
     /// A commit is the client saying "this is what I have now".
     fn commit(&mut self, index: usize, surface_id: u32) -> std::io::Result<()> {
         self.commits += 1;
+        self.enter_output(index, surface_id)?;
         let (pending_buffer, callbacks, window) = {
             let Some(Object::Surface(surface)) = self.clients[index].objects.get(&surface_id)
             else {
@@ -552,7 +762,17 @@ impl State {
         // frame is waiting on these.
         let serial = self.serial;
         for callback in &callbacks {
-            self.send(index, Writer::new(*callback, 0).uint(serial).finish())?;
+            // A callback the client has thrown away is not a callback: answering
+            // it sends an event to an id the client may already have given to
+            // something else, which is a listener looking at a proxy of the wrong
+            // type and, measured against a real browser, a SIGSEGV.
+            let still_there = matches!(
+                self.clients[index].objects.get(callback),
+                Some(Object::Callback)
+            );
+            if still_there {
+                self.send(index, Writer::new(*callback, 0).uint(serial).finish())?;
+            }
         }
         if let Some(Object::Surface(surface)) = self.clients[index].objects.get_mut(&surface_id) {
             surface.frame_callbacks.clear();
@@ -560,10 +780,19 @@ impl State {
 
         let Some(buffer_id) = pending_buffer else {
             // A commit with no buffer is a client saying it is ready to be told
-            // what size to be — the first step of every toplevel.
+            // what size to be — the first step of every toplevel, and the only
+            // step of a popup.
             if let Some(window) = window {
                 self.windows[window].mapped = false;
                 self.dirty = true;
+            }
+            let xdg_surface = self.xdg_surface_of(index, surface_id);
+            if let Some(popup) = self.popups.iter().position(|p| p.surface == surface_id) {
+                self.configure_popup(index, popup)?;
+            } else if let Some(xdg_surface) = xdg_surface {
+                if self.take_unconfigured(index, xdg_surface) {
+                    self.send_configure(index, xdg_surface)?;
+                }
             }
             return Ok(());
         };
@@ -591,13 +820,95 @@ impl State {
             self.windows[window].height = buffer.height / scale as u32;
             self.windows[window].mapped = true;
         }
+        if let Some(popup) = self.popups.iter_mut().find(|p| p.surface == surface_id) {
+            popup.width = buffer.width / scale as u32;
+            popup.height = buffer.height / scale as u32;
+            popup.mapped = true;
+        }
         // The buffer that was on screen before this one is free for the client to
         // draw into again; that is the whole of Wayland's buffer recycling.
         if let Some(previous) = previous {
-            if previous != buffer_id {
-                self.send(index, Writer::new(previous, 0).finish())?;
+            // Only a buffer the client still holds may be released: an id it has
+            // already destroyed is an event to an object that is not there, and a
+            // client that is told about its own dead object is entitled to treat
+            // it as a protocol error.
+            let held = matches!(
+                self.clients[index].objects.get(&previous),
+                Some(Object::Buffer(_))
+            );
+            if previous != buffer_id && held {
+                self.releases.push((index, previous));
             }
         }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Places a popup and tells it where it is.
+    ///
+    /// The protocol wants two events: `xdg_popup.configure` with the rectangle the
+    /// compositor chose, and then `xdg_surface.configure` with its serial. A
+    /// popup told only the second waits for the first forever, and a browser
+    /// whose address-bar dropdown never appears is a browser whose typing stalls.
+    fn configure_popup(&mut self, index: usize, popup: usize) -> std::io::Result<()> {
+        let (xdg_surface, surface, positioner, parent) = {
+            let popup = &self.popups[popup];
+            (
+                popup.xdg_surface,
+                popup.surface,
+                popup.positioner,
+                popup.parent,
+            )
+        };
+        let asked = match self.clients[index].objects.get(&positioner) {
+            Some(Object::Positioner(positioner)) => *positioner,
+            _ => Positioner::default(),
+        };
+        // The anchor rectangle is in the parent's coordinates, so the popup lands
+        // in the parent's frame: the client says "the bottom of this field", not
+        // "y=812 of the screen".
+        let (parent_x, parent_y) = match self.toplevel_window(index, parent) {
+            Some(window) => (self.windows[window].x, self.windows[window].y),
+            None => (0, 0),
+        };
+        let width = if asked.size.0 > 0 {
+            asked.size.0 as u32
+        } else {
+            240
+        };
+        let height = if asked.size.1 > 0 {
+            asked.size.1 as u32
+        } else {
+            240
+        };
+        let x = parent_x + asked.anchor.0 + asked.anchor.2 + asked.offset.0;
+        let y = parent_y + asked.anchor.1 + asked.anchor.3 + asked.offset.1;
+        {
+            let popup = &mut self.popups[popup];
+            popup.x = x;
+            popup.y = y;
+            // A zero size in the configure means "whatever the client draws".
+            if asked.size.0 > 0 {
+                popup.width = width;
+            }
+            if asked.size.1 > 0 {
+                popup.height = height;
+            }
+        }
+        let _ = surface;
+        self.take_unconfigured(index, xdg_surface);
+        let xdg_popup = self.popups[popup].object;
+        self.send(
+            index,
+            Writer::new(xdg_popup, 0)
+                .int(x)
+                .int(y)
+                .int(width as i32)
+                .int(height as i32)
+                .finish(),
+        )?;
+        self.send_configure(index, xdg_surface)?;
+        self.configures += 1;
         self.dirty = true;
         Ok(())
     }
@@ -694,7 +1005,64 @@ impl State {
     }
 
     fn send(&mut self, index: usize, writer: Writer) -> std::io::Result<()> {
+        tracing::trace!(
+            "wayland: -> client {index} {} {:?}",
+            writer.object_id(),
+            writer.op()
+        );
         self.clients[index].client.send(writer)
+    }
+
+    /// Tells a surface, once, which output it is drawn on.
+    ///
+    /// The protocol has this as `wl_surface.enter`, and a client uses it to know
+    /// the screen's scale and refresh. A surface that has never been told is a
+    /// surface with no output at all — measured against a real browser, the
+    /// surface it made just before dying was exactly such a surface.
+    fn enter_output(&mut self, index: usize, surface: u32) -> std::io::Result<()> {
+        let entered = match self.clients[index].objects.get(&surface) {
+            Some(Object::Surface(surface)) => surface.entered,
+            _ => return Ok(()),
+        };
+        if entered {
+            return Ok(());
+        }
+        let output = self.clients[index]
+            .objects
+            .iter()
+            .find_map(|(id, object)| match object {
+                Object::Output => Some(*id),
+                _ => None,
+            });
+        if let Some(output) = output {
+            self.send(index, Writer::new(surface, 0).object(output).finish())?;
+        }
+        if let Some(Object::Surface(surface)) = self.clients[index].objects.get_mut(&surface) {
+            surface.entered = true;
+        }
+        Ok(())
+    }
+
+    /// The `xdg_surface` that wraps a `wl_surface`, if it has been made yet.
+    fn xdg_surface_of(&self, index: usize, surface: u32) -> Option<u32> {
+        self.clients[index]
+            .objects
+            .iter()
+            .find_map(|(id, object)| match object {
+                Object::XdgSurface { surface: s, .. } if *s == surface => Some(*id),
+                _ => None,
+            })
+    }
+
+    /// True the first time it is asked, so one commit is one configure.
+    fn take_unconfigured(&mut self, index: usize, xdg_surface: u32) -> bool {
+        match self.clients[index].objects.get_mut(&xdg_surface) {
+            Some(Object::XdgSurface { configured, .. }) if !*configured => {
+                *configured = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn window_of(&self, index: usize, xdg_surface: u32) -> Option<usize> {
@@ -770,6 +1138,68 @@ impl State {
         }
     }
 
+    /// Tells an input method what it needs to know and nothing more.
+    ///
+    /// The protocol wants `enter` and then a `done` with a serial, once per
+    /// commit; a client waiting for `done` never shows its preedit or its caret.
+    /// Nothing is committed back: characters arrive as keys.
+    fn text_input_commit(&mut self, index: usize, text_input: u32) -> std::io::Result<()> {
+        let enabled = matches!(
+            self.clients[index].objects.get(&text_input),
+            Some(Object::TextInput { enabled: true })
+        );
+        let focus = self
+            .keyboard_focus
+            .filter(|(client, _)| *client == index)
+            .map(|(_, surface)| surface);
+        // Both events name the surface: text-input-unstable-v3's `leave(o)` takes
+        // one, unlike v1's. Measured by libwayland's own words, "message too short,
+        // object (18), message leave(o)" — a client told with an empty event reads
+        // the next message's bytes as a surface.
+        match (enabled, focus) {
+            (true, Some(surface)) => {
+                self.send(index, Writer::new(text_input, 0).object(surface).finish())?;
+            }
+            (_, Some(surface)) => {
+                self.send(index, Writer::new(text_input, 1).object(surface).finish())?;
+            }
+            (_, None) => {}
+        }
+        let serial = self.next_serial();
+        self.send(index, Writer::new(text_input, 5).uint(serial).finish())?;
+        Ok(())
+    }
+
+    /// Releases the buffers freed this turn, now that the client's own requests
+    /// for the turn have been read.
+    pub fn release_buffers(&mut self) -> std::io::Result<()> {
+        let queued = std::mem::take(&mut self.releases);
+        for (index, buffer) in queued {
+            let held = matches!(
+                self.clients.get(index).and_then(|c| c.objects.get(&buffer)),
+                Some(Object::Buffer(_))
+            );
+            if held {
+                self.send(index, Writer::new(buffer, 0).finish())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Where every window is, and whether it is showing — a cheap fingerprint of
+    /// what is on the screen for a pointer that is standing still.
+    pub fn arrangement(&self) -> Vec<(i32, i32, u32, u32, bool)> {
+        self.windows
+            .iter()
+            .map(|w| (w.x, w.y, w.width, w.height, w.mapped))
+            .chain(
+                self.popups
+                    .iter()
+                    .map(|p| (p.x, p.y, p.width, p.height, p.mapped)),
+            )
+            .collect()
+    }
+
     /// Draws every mapped window into the frame, bottom first.
     pub fn compose(&mut self) {
         self.frame.fill(0xff10_1a2b);
@@ -803,11 +1233,54 @@ impl State {
                 window.y,
             );
         }
+        for index in 0..self.popups.len() {
+            let popup = self.popups[index].clone();
+            if !popup.mapped {
+                continue;
+            }
+            let Some(client) = self.clients.get(popup.client) else {
+                continue;
+            };
+            let Some(Object::Surface(surface)) = client.objects.get(&popup.surface) else {
+                continue;
+            };
+            let Some(buffer_id) = surface.buffer else {
+                continue;
+            };
+            let Some(Object::Buffer(buffer)) = client.objects.get(&buffer_id) else {
+                continue;
+            };
+            let Some(Object::ShmPool(pool)) = client.objects.get(&buffer.pool) else {
+                continue;
+            };
+            buffer.blit(
+                pool,
+                None,
+                &mut self.frame,
+                self.width,
+                self.height,
+                popup.x,
+                popup.y,
+            );
+        }
         self.dirty = false;
     }
 
     /// The topmost mapped window whose rectangle contains a point.
     pub fn window_at(&self, x: f64, y: f64) -> Option<(usize, u32)> {
+        // Popups are above every window, so they are hit first.
+        for popup in self.popups.iter().rev() {
+            if !popup.mapped {
+                continue;
+            }
+            if x >= popup.x as f64
+                && y >= popup.y as f64
+                && x < (popup.x + popup.width as i32) as f64
+                && y < (popup.y + popup.height as i32) as f64
+            {
+                return Some((popup.client, popup.surface));
+            }
+        }
         for index in (0..self.windows.len()).rev() {
             let window = &self.windows[index];
             if !window.mapped {
@@ -936,7 +1409,7 @@ impl State {
             client,
             Writer::new(keyboard, 3)
                 .uint(serial)
-                .uint(0)
+                .uint(self.now_ms())
                 .uint(evdev)
                 .uint(if pressed { 1 } else { 0 })
                 .finish(),

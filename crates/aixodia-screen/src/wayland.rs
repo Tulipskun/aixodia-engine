@@ -19,7 +19,7 @@
 //! that name come out.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aixodia_wayland::Compositor;
 
@@ -29,10 +29,78 @@ use crate::capture::{Button, Frame, ScreenError};
 /// `WAYLAND_DISPLAY` the socket inside it.
 pub const SOCKET: &str = "wayland-0";
 
+/// The compositor this process has, made once.
+///
+/// Two doors lead to one screen — the app's socket and the RFB server — and two
+/// compositors would be two desktops wearing one name: a viewer on one of them
+/// would click into a picture the other never drew.
+pub fn shared(width: u32, height: u32) -> Result<Arc<Pane>, ScreenError> {
+    static SHARED: OnceLock<Mutex<Option<Arc<Pane>>>> = OnceLock::new();
+    let cell = SHARED.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pane) = guard.as_ref() {
+        if pane.display_size() != (width, height) {
+            tracing::debug!(
+                "wayland: the pane is already {:?}, not {:?}",
+                pane.display_size(),
+                (width, height)
+            );
+        }
+        return Ok(Arc::clone(pane));
+    }
+    let pane = Arc::new(Pane::open(width, height)?);
+    *guard = Some(Arc::clone(&pane));
+    // The compositor starts empty, and an empty desktop is indistinguishable
+    // from a broken one — measured as a navy rectangle with nothing in it, which
+    // is exactly what a broken compositor looks like. So a fresh pane is opened
+    // with a browser in it, the way the strip's own button would, and
+    // `AIXODIA_PANE_APP` (or an empty value) says otherwise.
+    let program = std::env::var("AIXODIA_PANE_APP").unwrap_or_default();
+    let program = if program.trim().is_empty() {
+        "browser"
+    } else {
+        program.trim()
+    };
+    if program != "none" {
+        crate::panel::launch_in_compositor(program, pane.dir(), SOCKET);
+    }
+    Ok(pane)
+}
+
 /// A display of our own: the compositor, and the frame it has just composited.
 pub struct Pane {
-    compositor: Mutex<Compositor>,
+    compositor: Arc<Mutex<Compositor>>,
     dir: PathBuf,
+}
+
+/// Removes the runtime directories of compositors whose engine is gone.
+///
+/// Every start of the engine makes a new one — the directory is named after the
+/// pid — and nothing removes it when the engine is killed, so `/tmp` filled with
+/// nineteen of them in one afternoon of restarts. A directory whose pid has no
+/// `/proc` entry is a directory whose compositor cannot come back, so it is safe
+/// to remove and nothing else is touched.
+fn sweep_stale_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("aixodia-wayland-"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
 }
 
 impl Pane {
@@ -40,6 +108,7 @@ impl Pane {
     /// directory only its owner can read — the same rule a session's
     /// `XDG_RUNTIME_DIR` follows, and what a client checks before trusting it.
     pub fn open(width: u32, height: u32) -> Result<Self, ScreenError> {
+        sweep_stale_dirs();
         let dir = std::env::temp_dir().join(format!("aixodia-wayland-{}", std::process::id()));
         std::fs::create_dir_all(&dir)
             .map_err(|e| ScreenError::Open(format!("cannot make {}: {e}", dir.display())))?;
@@ -53,10 +122,37 @@ impl Pane {
         let height = height.clamp(240, 4096);
         let compositor = Compositor::new(&dir, SOCKET, width, height)
             .map_err(|e| ScreenError::Open(e.to_string()))?;
-        Ok(Self {
-            compositor: Mutex::new(compositor),
-            dir,
-        })
+        let compositor = Arc::new(Mutex::new(compositor));
+        // The compositor is a running thing, not a camera: a client draws only
+        // while its requests are being answered, and a client that is waiting for
+        // a configure nobody sends has not drawn a window yet. Tying that
+        // progress to a viewer asking for a picture made a browser take as many
+        // seconds to appear as the viewer sent updates — measured: the window
+        // arrived on the fourth request, not on the first. So the pane turns the
+        // wheel itself and a frame is a copy of whatever it last composited.
+        {
+            let ticked = Arc::clone(&compositor);
+            std::thread::Builder::new()
+                .name("aixodia-wayland".into())
+                .spawn(move || loop {
+                    {
+                        let mut compositor = ticked.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Err(err) = compositor.poll(TICK_MS) {
+                            tracing::warn!("wayland: the compositor stopped: {err}");
+                            return;
+                        }
+                    }
+                    // A client with something to say every turn makes `poll`
+                    // return at once, and this loop would then take the lock again
+                    // before anything else could have it — measured as a viewer
+                    // waiting fifteen seconds for a frame while the compositor
+                    // spun. A short sleep hands the lock back to whoever is
+                    // waiting, which is what the frame behind that viewer is.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                })
+                .map_err(|e| ScreenError::Open(format!("cannot start the compositor: {e}")))?;
+        }
+        Ok(Self { compositor, dir })
     }
 
     /// The directory a launched program must be given as `XDG_RUNTIME_DIR`.
@@ -97,21 +193,7 @@ impl Pane {
         let mut compositor = self.lock();
         compositor.poll(0).map_err(|e| ScreenError::Gone)?;
         let (width, height) = compositor.size();
-        let pixels = compositor
-            .frame()
-            .iter()
-            .flat_map(|pixel| {
-                // The frame is ARGB in a u32; the encoder wants blue, green, red
-                // and a pad byte, which on a little-endian machine is exactly
-                // these four bytes in this order.
-                [
-                    (*pixel >> 16) as u8,
-                    (*pixel >> 8) as u8,
-                    *pixel as u8,
-                    0xff,
-                ]
-            })
-            .collect();
+        let pixels = frame_bytes(compositor.frame());
         Ok(Frame {
             width,
             height,
@@ -165,6 +247,27 @@ impl Pane {
         }
     }
 
+    /// A key as a VNC viewer sends it: a keysym number rather than a name.
+    ///
+    /// A printable keysym is the character's own number, and the rest are the
+    /// handful a viewer's keyboard has — so the number is read back into the name
+    /// the table above understands, and a key with no name types nothing.
+    pub fn keysym(&self, keysym: u32, pressed: bool) {
+        let Some((code, needs_shift)) = keysym_code(keysym) else {
+            return;
+        };
+        let mut compositor = self.lock();
+        let mut release_shift = false;
+        if needs_shift {
+            release_shift = true;
+            let _ = compositor.key(SHIFT, true);
+        }
+        let _ = compositor.key(code, pressed);
+        if release_shift && !pressed {
+            let _ = compositor.key(SHIFT, false);
+        }
+    }
+
     /// Types text one character at a time, through the keymap the client was
     /// given. A character the table cannot name is dropped rather than guessed
     /// at: a wrong key is worse than a missing one.
@@ -178,6 +281,22 @@ impl Pane {
         }
     }
 }
+
+/// The frame's ARGB words as the bytes the encoder reads: blue, green, red, pad.
+fn frame_bytes(argb: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(argb.len() * 4);
+    for pixel in argb {
+        bytes.push(*pixel as u8);
+        bytes.push((*pixel >> 8) as u8);
+        bytes.push((*pixel >> 16) as u8);
+        bytes.push(0xff);
+    }
+    bytes
+}
+
+/// How long one turn of the compositor waits for a client, in milliseconds. Long
+/// enough that an idle pane sleeps, short enough that a click is answered at once.
+const TICK_MS: i32 = 8;
 
 /// The left shift keycode, so a shifted character can be typed on a keymap that
 /// only knows what shift does.
@@ -250,6 +369,48 @@ pub fn keycode(name: &str) -> Option<(u32, bool)> {
     // A named keysym we do not know, e.g. one from `XStringToKeysym` that has no
     // key on this layout.
     None
+}
+
+/// The keycode an X keysym number stands for.
+///
+/// The X keysyms a keyboard can produce are mostly their own character's number:
+/// `0x61` is `a`, `0x20` is space. The rest are the named ones, which have numbers
+/// in the `0xff00` page.
+pub fn keysym_code(keysym: u32) -> Option<(u32, bool)> {
+    let named = match keysym {
+        0xff0d | 0xff8d => "Return",
+        0xff08 => "BackSpace",
+        0xff09 => "Tab",
+        0xff1b => "Escape",
+        0xffff => "Delete",
+        0xff63 => "Insert",
+        0xff50 => "Home",
+        0xff57 => "End",
+        0xff51 => "Left",
+        0xff53 => "Right",
+        0xff52 => "Up",
+        0xff54 => "Down",
+        0xff55 => "Page_Up",
+        0xff56 => "Page_Down",
+        0x0020 => "space",
+        0xffe1 => "Shift_L",
+        0xffe2 => "Shift_R",
+        0xffe3 => "Control_L",
+        0xffe4 => "Control_R",
+        0xffe9 => "Alt_L",
+        0xffea => "Alt_R",
+        0xffeb => "Super_L",
+        0xffe5 => "Caps_Lock",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return keycode(named);
+    }
+    let character = char::from_u32(keysym)?;
+    if character.is_control() {
+        return None;
+    }
+    keycode(&character.to_string())
 }
 
 /// The key a letter sits on, which is the same for both cases: the US layout's
@@ -377,6 +538,20 @@ mod tests {
     }
 
     #[test]
+    fn a_viewer_s_keysym_is_a_key_a_compositor_can_press() {
+        // RFC 6143 sends X keysym numbers; a viewer's Return, letters and
+        // digits are the ones that matter in practice.
+        assert_eq!(keysym_code(0xff0d), keycode("Return"));
+        assert_eq!(keysym_code(0x0061), Some((30, false)));
+        assert_eq!(keysym_code(0x0041), Some((30, true)));
+        assert_eq!(keysym_code(0x0021), Some((2, true)));
+        assert_eq!(keysym_code(0x0000), None);
+        // A Thai character has no key on a US keymap, and guessing would type
+        // something else.
+        assert_eq!(keysym_code(0x0e01), None);
+    }
+
+    #[test]
     fn a_name_this_layout_has_no_key_for_is_not_guessed_at() {
         // A phone's compose box can hold anything at all, and a keycode chosen
         // by guessing types something else.
@@ -391,17 +566,9 @@ mod tests {
         // 0xAARRGGBB in a u32; the four bytes on a little-endian machine are
         // blue, green, red, alpha, which is what `Frame::pixels` promises.
         let argb = [0xff11_2233u32, 0xffaa_bbccu32];
-        let bytes: Vec<u8> = argb
-            .iter()
-            .flat_map(|pixel| {
-                [
-                    (*pixel >> 16) as u8,
-                    (*pixel >> 8) as u8,
-                    *pixel as u8,
-                    0xff,
-                ]
-            })
-            .collect();
-        assert_eq!(bytes, vec![0x11, 0x22, 0x33, 0xff, 0xaa, 0xbb, 0xcc, 0xff]);
+        let bytes = frame_bytes(&argb);
+        // 0xff112233 is red 0x11, green 0x22, blue 0x33, and the encoder reads
+        // blue first.
+        assert_eq!(bytes, vec![0x33, 0x22, 0x11, 0xff, 0xcc, 0xbb, 0xaa, 0xff]);
     }
 }

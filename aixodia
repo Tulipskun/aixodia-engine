@@ -128,13 +128,14 @@ rotate_log() {
 
 # What the desktop is made of, when it is made of packages.
 #
-# The engine links X for the screen pane — capture, input, the cursor — and the
-# strip along the bottom launches Xvfb, xterm and a browser. A host that has none
-# of them cannot show a desktop, and a host with no X libraries cannot even load
-# the engine. These are installed the first time the engine starts, exactly as
-# cloudflared is, and never asked about again: an install of something already
-# present costs one apt call and changes nothing.
-PANE_PACKAGES="libx11-6 libxext6 libxtst6 libxfixes3 xvfb xterm xfonts-base"
+# The pane is a compositor this engine owns, so it asks a host for nothing at
+# all. The one exception is the engine binary itself: it still links the X
+# libraries for the old display, which `AIXODIA_PANE=x` selects, so without them
+# it cannot even load. Those four are installed the first time the engine starts,
+# exactly as cloudflared is, and never asked about again. Xvfb, xterm and the X
+# fonts belong to the old pane and are installed only when it is asked for.
+PANE_PACKAGES="libx11-6 libxext6 libxtst6 libxfixes3"
+X_PANE_PACKAGES="xvfb xterm xfonts-base"
 
 # True when the binary's shared libraries are all present. A script has no
 # dynamic dependencies at all, which is why the test engines pass.
@@ -160,26 +161,37 @@ package_installer() {
   return 1
 }
 
+# True when the old display was asked for by name.
+x_pane_wanted() {
+  case "${AIXODIA_PANE:-}" in
+    x|X|x11|X11) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 ensure_pane_packages() {
-  local missing="" installer="" attempt
+  local missing="" installer="" attempt packages="$PANE_PACKAGES"
   engine_libraries_ok "$ENGINE_RESOLVED" || missing=" libraries"
-  command -v Xvfb >/dev/null 2>&1 || missing="$missing Xvfb"
-  command -v xterm >/dev/null 2>&1 || missing="$missing xterm"
+  if x_pane_wanted; then
+    packages="$PANE_PACKAGES $X_PANE_PACKAGES"
+    command -v Xvfb >/dev/null 2>&1 || missing="$missing Xvfb"
+    command -v xterm >/dev/null 2>&1 || missing="$missing xterm"
+  fi
   [ -n "$missing" ] || return 0
   if ! installer="$(package_installer)"; then
     echo "aixodia: the screen pane needs$missing, and this host cannot install them." >&2
-    echo "aixodia: install them yourself (libx11-6 libxext6 libxtst6 libxfixes3 xvfb xterm)" >&2
+    echo "aixodia: install them yourself ($packages)" >&2
     return 0
   fi
-  echo "aixodia: the screen pane needs$missing; installing $PANE_PACKAGES"
+  echo "aixodia: the screen pane needs$missing; installing $packages"
   # shellcheck disable=SC2086
   for attempt in 1 2 3; do
     case "$installer" in
       *apt-get*) ${installer%|*} update -qq >/dev/null 2>&1 || true
                  DEBIAN_FRONTEND=noninteractive ${installer%|*} install -y -qq \
-                   $PANE_PACKAGES >/dev/null 2>&1 && break ;;
-      *apk*)     ${installer%|*} add --no-cache $PANE_PACKAGES >/dev/null 2>&1 && break ;;
-      *dnf*)     ${installer%|*} install -y -q $PANE_PACKAGES >/dev/null 2>&1 && break ;;
+                   $packages >/dev/null 2>&1 && break ;;
+      *apk*)     ${installer%|*} add --no-cache $packages >/dev/null 2>&1 && break ;;
+      *dnf*)     ${installer%|*} install -y -q $packages >/dev/null 2>&1 && break ;;
     esac
     echo "aixodia: install attempt $attempt failed; retrying" >&2
     sleep 5

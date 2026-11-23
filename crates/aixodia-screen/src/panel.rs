@@ -13,6 +13,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use x11::xlib;
 
@@ -441,9 +442,12 @@ pub fn launch(program: &str, display_name: &str) {
         // at all until the lock was removed by hand.
         clear_stale_lock();
     }
-    let started = Command::new(binary)
-        .args(args)
-        .env("DISPLAY", display_name)
+    let mut command = Command::new(binary);
+    command.args(args).env("DISPLAY", display_name);
+    if let Some(bus) = session_bus() {
+        command.env("DBUS_SESSION_BUS_ADDRESS", bus);
+    }
+    let started = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -464,5 +468,119 @@ pub fn launch(program: &str, display_name: &str) {
         Err(err) => {
             tracing::warn!("could not start {program} ({binary}) on {display_name}: {err}");
         }
+    }
+}
+
+/// A session bus for the programs this pane starts, once per engine.
+///
+/// chromium asks the session bus about the desktop portal, the secret service and
+/// power management many times a second and, with no bus at all, it retries every
+/// one of them: measured in the browser's own log, hundreds of
+/// "Failed to connect to the bus" lines in a few seconds of idle. A private bus
+/// costs one process and turns that noise into one answer — "nothing is there".
+fn session_bus() -> Option<String> {
+    static BUS: OnceLock<Option<String>> = OnceLock::new();
+    BUS.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("aixodia-bus-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let socket = dir.join("bus");
+        let address = format!("unix:path={}", socket.display());
+        // Not `--fork`: a daemon that detaches leaves this engine unable to say
+        // whether it is alive, and `--print-address` through a pipe from a
+        // forked child was measured as an empty string with no socket behind it.
+        Command::new("dbus-daemon")
+            .args(["--session", "--address"])
+            .arg(&address)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        // The socket is the proof: the address is worth nothing until it exists.
+        for _ in 0..50 {
+            if socket.exists() {
+                return Some(address);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        tracing::warn!("the pane's session bus did not come up; programs will retry one");
+        None
+    })
+    .clone()
+}
+
+/// Starts one of the strip's programs inside our own compositor.
+///
+/// A Wayland client is told two things: where the session's sockets live and
+/// which one of them is the display. `DISPLAY` is removed rather than left alone,
+/// because a chromium that can see an X server takes it and draws a window
+/// nothing composits.
+///
+/// A terminal is the one program this cannot start: `xterm` is an X client, and
+/// the compositor mode exists for hosts where X is not installed at all. It says
+/// so in the log instead of failing silently, which is the same rule the launcher
+/// follows when a shared library is missing.
+pub fn launch_in_compositor(program: &str, runtime_dir: &std::path::Path, socket: &str) {
+    let (binary, args): (&str, Vec<&str>) = match program {
+        "browser" => (
+            "chromium",
+            vec![
+                "--ozone-platform=wayland",
+                // There is no GPU here and the browser's own log says its GPU
+                // channel fails to open; asking it not to try is honest, and it
+                // keeps the software path the only path.
+                "--disable-gpu",
+                "--no-sandbox",
+                // The first run's "Welcome" dialog and its "restore pages?"
+                // bubble are windows on a desktop nobody is sitting at.
+                "--no-first-run",
+                "--hide-crash-restore-bubble",
+                "--window-size=1200,640",
+                // Without a page to open, chromium starts with no window at all:
+                // the pane then shows the desktop and nothing else, which looks
+                // exactly like a compositor that does not work.
+                "about:blank",
+            ],
+        ),
+        other => {
+            tracing::warn!("{other}: a terminal needs an X server, and this pane has none");
+            return;
+        }
+    };
+    if binary == "chromium" {
+        clear_stale_lock();
+    }
+    // What a client says when it dies belongs in a file. Measured: chromium was
+    // killed by its own SIGSEGV while typing into an address bar, and a log of
+    // nothing at all left nothing to read — the same silence as an xterm that
+    // exits with no window and no error.
+    let (out, err) = match std::fs::File::create(runtime_dir.join(format!("{program}.log"))) {
+        Ok(log) => match log.try_clone() {
+            Ok(clone) => (Stdio::from(clone), Stdio::from(log)),
+            Err(_) => (Stdio::from(log), Stdio::null()),
+        },
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("WAYLAND_DISPLAY", socket)
+        .env_remove("DISPLAY");
+    if let Some(bus) = session_bus() {
+        command.env("DBUS_SESSION_BUS_ADDRESS", bus);
+    }
+    let started = command.stdin(Stdio::null()).stdout(out).stderr(err).spawn();
+    match started {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                if let Ok(status) = child.wait() {
+                    if !status.success() {
+                        tracing::warn!("{binary} exited with {status}");
+                    }
+                }
+            });
+        }
+        Err(err) => tracing::warn!("could not start {program} ({binary}) in the compositor: {err}"),
     }
 }

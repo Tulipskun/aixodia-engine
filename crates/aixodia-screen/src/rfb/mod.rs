@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::capture::{Button, Input, Screen};
+use crate::capture::Button;
 use crate::encoder;
+use crate::pane::Events;
 use crate::rfb::protocol::{encoding, PixelFormat};
 
 /// The name a viewer shows for this display.
@@ -190,28 +191,19 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
     let mut shared = [0u8; 1];
     stream.read_exact(&mut shared)?;
 
-    let display_name = match crate::display::ensure() {
-        Ok(display) => display,
+    // The pane is whatever this engine shows: an X display somebody else owns,
+    // or the compositor this process made. Both doors into the screen ask for it
+    // here, so a viewer and the phone look at one desktop and move one pointer.
+    let panes = match crate::pane::open(0, 0) {
+        Ok(panes) => panes,
         Err(err) => {
-            tracing::warn!("rfb: no display to serve: {}", err.0);
+            tracing::warn!("rfb: no screen to serve: {err}");
             return Ok(());
         }
     };
-    let input = match Input::open(&display_name) {
-        Ok(input) => input,
-        Err(err) => {
-            tracing::warn!("rfb: cannot open {display_name}: {err}");
-            return Ok(());
-        }
-    };
+    let input = panes.events;
+    let mut screen = panes.source;
     let (width, height) = input.display_size();
-    let mut screen = match Screen::open(&display_name, width, height) {
-        Ok(screen) => screen,
-        Err(err) => {
-            tracing::warn!("rfb: cannot capture {display_name}: {err}");
-            return Ok(());
-        }
-    };
 
     // ServerInit: the size, the format this server works in, and a name.
     let mut init = Vec::with_capacity(24);
@@ -420,7 +412,7 @@ fn record_line(elapsed_ms: u128, kind: &str, mask: Option<u8>, x: i32, y: i32) -
 /// RFB sends the state of all eight buttons together, so what has changed since
 /// the last message is what has to be sent to X. The wheel is two of those bits,
 /// and X wants a notch as a press and a release.
-fn press_buttons(input: &Input, held: &mut u8, mask: u8) {
+fn press_buttons(input: &Events, held: &mut u8, mask: u8) {
     for (bit, button) in [(0u8, Button::Left), (1, Button::Middle), (2, Button::Right)] {
         let wanted = mask & (1 << bit) != 0;
         let had = *held & (1 << bit) != 0;
@@ -764,11 +756,8 @@ mod tests {
         // The mask is compared against what was held, so a held button is not
         // pressed twice; without an X server the calls are no-ops, which keeps
         // this a test of the arithmetic.
-        let display = match crate::display::ensure() {
-            Ok(display) => display,
-            Err(_) => return,
-        };
-        let Ok(input) = Input::open(&display) else {
+        // The arithmetic is the test; the pane is only there to hold a pointer.
+        let Ok(input) = crate::pane::open_events(0, 0) else {
             return;
         };
         let mut held = 0u8;
