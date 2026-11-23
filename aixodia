@@ -159,22 +159,27 @@ cmd_start() {
       pid_file="$AIXODIA_PID_FILE"
       engine="$AIXODIA_LAUNCH_ENGINE"
       state_dir="$AIXODIA_HOME"
-      printf "%s\n" "$$" > "$pid_file"
       cd "$state_dir" || exit 1
       while IFS= read -r variable; do unset "$variable"; done < <(compgen -A variable AIXODIA_)
       unset HF_TOKEN AUTH_WORKER_URL AUTH_SYNC_SECRET ACCESS_TEAM_DOMAIN ACCESS_APP_AUD \
         ALLOWED_ORIGINS ALLOWED_GITHUB_USERS AIXODIA_MCP_UPSTREAM \
         AIXODIA_DEVICE_TUNNELS AIXODIA_TMUX GITHUB_CLIENT_ID \
         GITHUB_CLIENT_SECRET GITHUB_REDIRECT_URI
-      # The engine is run, not exec'd, so that its death says so. It vanished
-      # once without a line in this log — no panic, no shutdown — and a status
-      # of 137 (killed) or 139 (crashed) printed here is the difference between
-      # a machine that ran out of something and a machine that was shot.
-      "$engine"
+      # The engine is given a session of its own and waited for, rather than
+      # reached through exec, so that its death is written down. It vanished once
+      # without a line in this log —
+      # no panic, no shutdown — and a status of 137 (killed) or 139 (crashed) is
+      # the difference between a machine that ran out of something and a machine
+      # that was shot. The pid file still names the engine, not this shell, which
+      # is what `status` and `stop` are about.
+      setsid "$engine" &
+      child=$!
+      printf "%s\n" "$child" > "$pid_file"
+      wait "$child"
       echo "aixodia: engine exited with status $?"
     ' >> "$(log_path)" 2>&1 < /dev/null &
 
-  # The child writes the pid file before it execs the engine, so a missing or
+  # The child writes the pid file as soon as the engine exists, so a missing or
   # unrecognised pid here means it is still coming up. Three beats of a pid that
   # is not there at all is the engine leaving: the launcher is its parent, so an
   # exited engine can wait on as a zombie, which still answers kill -0.

@@ -106,6 +106,23 @@ stop_engine() {
   wait_gone "$pid" || fail "test engine $pid outlived stop"
 }
 
+# A death has to be written down: the engine once vanished with nothing in its
+# log, and no exit status to say whether it was killed or crashed. Stopping it is
+# a death with a known cause, which is the one this can test.
+report_death() {
+  local log="$home/state/engine.log"
+  local waited=0
+  while [ "$waited" -lt 50 ]; do
+    if grep -q "engine exited with status" "$log" 2>/dev/null; then
+      pass "the engine's death is written to its log"
+      return 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  fail "no exit status in the log (last lines: $(tail -2 "$log" 2>/dev/null | tr '\n' ' '))"
+}
+
 # Missing credentials must fail before the engine is executed.
 setup
 bin="$fakebin/aixodia-engine"
@@ -151,8 +168,13 @@ if wait_for_file "$home/pid"; then
     fail "engine died with the launcher (pid $engine_pid)"
   fi
   read -r engine_ppid engine_sid engine_tty < <(ps -o ppid=,sid=,tty= -p "$engine_pid" 2>/dev/null | tr -s ' ')
-  if [ "$engine_ppid" = "1" ]; then
-    pass "detached engine is reparented to init"
+  # The engine's parent is the supervisor whose only job is to write down how it
+  # ended — a launcher that exec'd the engine could not: the process able to say
+  # "exited with status 137" had replaced itself with the one that died. What
+  # still matters is that the parent is not the shell that ran the launcher, so a
+  # closed terminal takes nothing with it.
+  if [ "$engine_ppid" != "$$" ] && [ "$engine_ppid" != "1" ]; then
+    pass "detached engine is not the launcher's child"
   else
     fail "detached engine still parented (ppid=$engine_ppid)"
   fi
@@ -264,6 +286,7 @@ fi
 kill "$squatter" 2>/dev/null || true
 wait "$squatter" 2>/dev/null
 stop_engine "$new_pid"
+report_death
 
 # A second start takes over an engine that is up but not answering healthz.
 setup
