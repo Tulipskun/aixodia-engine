@@ -49,6 +49,13 @@ pub mod encoding {
     pub const COPY_RECT: i32 = 1;
     /// Tiles with JPEG or zlib inside, segmented into fewer rectangles.
     pub const TIGHT: i32 = 7;
+    /// The cursor's shape, so the viewer can draw the pointer itself.
+    ///
+    /// A pseudo-encoding, and a negative number for that reason: it is not a
+    /// rectangle of the framebuffer. The rectangle's position is the cursor's hot
+    /// spot and its size is the cursor's size, and the pixels that follow are the
+    /// cursor's own, not the screen's.
+    pub const CURSOR: i32 = -239;
 }
 
 /// What this server will send, in the order it prefers them.
@@ -65,6 +72,39 @@ pub const PREFERENCE: [i32; 2] = [encoding::TIGHT, encoding::RAW];
 /// A viewer that offered nothing at all — an old client that never sends
 /// `SetEncodings` — gets Raw, which is the only encoding every viewer is
 /// required to understand.
+/// The bitmask of a cursor: one bit per pixel, 1 where the pixel is visible.
+///
+/// Scanlines are left to right, top to bottom, each padded to a whole number of
+/// bytes, and within a byte the most significant bit is the leftmost pixel.
+pub fn cursor_mask(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let stride = width.div_ceil(8) as usize;
+    let mut mask = vec![0u8; stride * height as usize];
+    for row in 0..height as usize {
+        for column in 0..width as usize {
+            let at = (row * width as usize + column) * 4;
+            if rgba.get(at + 3).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            mask[row * stride + column / 8] |= 0x80 >> (column % 8);
+        }
+    }
+    mask
+}
+
+/// A cursor's pixels in the viewer's own format.
+///
+/// The cursor arrives as straight RGBA and every viewer has its own idea of a
+/// pixel, so it goes through the same packing as a frame: one conversion, not
+/// two, so a 16-bit viewer sees a cursor the colour of its own pictures.
+pub fn cursor_pixels(rgba: &[u8], width: u32, height: u32, format: &PixelFormat) -> Vec<u8> {
+    // The frame layout the packer speaks is blue, green, red, pad.
+    let mut bgrx = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in rgba.chunks_exact(4) {
+        bgrx.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    extract(&bgrx, width, (0, 0, width, height), format)
+}
+
 pub fn choose(offered: &[i32]) -> i32 {
     PREFERENCE
         .iter()
@@ -412,6 +452,52 @@ mod tests {
         assert_eq!(tight_jpeg_control(7), 0x97);
         assert_eq!(tight_jpeg_control(0), 0x91);
         assert_eq!(tight_jpeg_control(99), 0x99);
+    }
+
+    #[test]
+    fn a_cursor_mask_marks_the_visible_pixels() {
+        // Two pixels across, the first and the third visible: the top bit of
+        // each row's byte, twice.
+        let rgba = [
+            255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0,
+        ];
+        assert_eq!(cursor_mask(&rgba, 2, 2), vec![0b1000_0000, 0b1000_0000]);
+    }
+
+    #[test]
+    fn a_cursor_wider_than_eight_pixels_pads_its_mask() {
+        // Nine pixels needs two bytes a row, and the ninth lands in the second.
+        let mut rgba = vec![0u8; 9 * 4];
+        rgba[8 * 4 + 3] = 255;
+        assert_eq!(cursor_mask(&rgba, 9, 1), vec![0b0000_0000, 0b1000_0000]);
+    }
+
+    #[test]
+    fn a_transparent_cursor_has_an_empty_mask() {
+        // An invisible cursor reads as nothing visible; drawing the dot that
+        // stands in for it is the viewer's business, not the wire's.
+        assert_eq!(cursor_mask(&[0u8; 4 * 4], 2, 2), vec![0, 0]);
+    }
+
+    #[test]
+    fn cursor_pixels_take_the_viewers_format() {
+        // The native format is blue, green, red, pad in memory.
+        let red = [255u8, 0, 0, 255];
+        assert_eq!(
+            cursor_pixels(&red, 1, 1, &PixelFormat::NATIVE),
+            vec![0, 0, 255, 255]
+        );
+        // A sixteen-bit viewer gets two bytes a pixel, not four.
+        let mut sixteen = PixelFormat::NATIVE;
+        sixteen.bits_per_pixel = 16;
+        sixteen.depth = 16;
+        sixteen.red_max = 31;
+        sixteen.green_max = 63;
+        sixteen.blue_max = 31;
+        sixteen.red_shift = 11;
+        sixteen.green_shift = 5;
+        sixteen.blue_shift = 0;
+        assert_eq!(cursor_pixels(&red, 1, 1, &sixteen).len(), 2);
     }
 
     #[test]

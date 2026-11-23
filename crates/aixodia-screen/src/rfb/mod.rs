@@ -197,7 +197,7 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
             return Ok(());
         }
     };
-    let mut input = match Input::open(&display_name) {
+    let input = match Input::open(&display_name) {
         Ok(input) => input,
         Err(err) => {
             tracing::warn!("rfb: cannot open {display_name}: {err}");
@@ -229,6 +229,10 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
     let mut whole = true;
     let mut format = PixelFormat::NATIVE;
     let mut encoding = encoding::RAW;
+    // Whether this viewer draws the cursor itself, and the shape it has already
+    // been given. Both are per connection: one viewer's change is not another's.
+    let mut cursor_wanted = false;
+    let mut cursor_serial: Option<u64> = None;
     let mut previous = vec![0u8; (width as usize) * (height as usize) * 4];
     let started = Instant::now();
     let mut buttons = 0u8;
@@ -244,6 +248,8 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
                 if let Some(asked) = PixelFormat::from_wire(&body[3..19]) {
                     format = asked;
                     whole = true;
+                    // The cursor already sent was packed for the old format.
+                    cursor_serial = None;
                 }
             }
             // SetEncodings
@@ -260,6 +266,10 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
                     ]));
                 }
                 encoding = protocol::choose(&offered);
+                // A viewer that asked for the cursor is declaring it can draw
+                // one itself, which is the whole point: the shape then travels
+                // once instead of being painted into every frame.
+                cursor_wanted = offered.contains(&protocol::encoding::CURSOR);
             }
             // FramebufferUpdateRequest
             3 => {
@@ -311,14 +321,38 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
         let frame = match screen.frame() {
             Ok(frame) => frame,
             Err(err) => {
-                tracing::debug!("rfb: frame failed: {err}");
+                tracing::warn!("rfb: frame failed: {err}");
                 continue;
             }
         };
         let tiles = protocol::changed_tiles(&frame.pixels, &previous, width, height, config.tile);
-        if !whole && tiles.is_empty() {
-            // Nothing has changed, and the viewer asked only for changes: the
-            // next request is the next chance to send anything.
+        // The cursor is checked on every request the viewer makes, which is
+        // how often a viewer can draw it. Only a change is sent: a cursor that
+        // has not moved is bytes nobody can see.
+        let cursor = if cursor_wanted {
+            input
+                .cursor_shape()
+                .filter(|now| cursor_serial != Some(now.serial) && now.width > 0 && now.height > 0)
+        } else {
+            None
+        };
+        if !whole && tiles.is_empty() && cursor.is_none() {
+            // Nothing has changed, but the viewer still asked: it is answered
+            // with an update of no rectangles. A viewer is entitled to wait for
+            // the reply before it asks again, and one that does would otherwise
+            // sit looking at a picture that never moves.
+            write_update(
+                &mut stream,
+                &Picture {
+                    frame: &frame.pixels,
+                    frame_width: width,
+                    tiles: &[],
+                    format: &format,
+                    encoding,
+                    quality: config.quality,
+                    cursor: None,
+                },
+            )?;
             requested = false;
             continue;
         }
@@ -337,13 +371,19 @@ fn serve(mut stream: TcpStream, config: &Config) -> std::io::Result<()> {
         };
         write_update(
             &mut stream,
-            &frame.pixels,
-            width,
-            &tiles,
-            &format,
-            encoding,
-            config.quality,
+            &Picture {
+                frame: &frame.pixels,
+                frame_width: width,
+                tiles: &tiles,
+                format: &format,
+                encoding,
+                quality: config.quality,
+                cursor: cursor.as_ref(),
+            },
         )?;
+        if let Some(now) = &cursor {
+            cursor_serial = Some(now.serial);
+        }
         previous.copy_from_slice(&frame.pixels);
         requested = false;
         whole = false;
@@ -404,20 +444,40 @@ fn press_buttons(input: &Input, held: &mut u8, mask: u8) {
     *held = mask;
 }
 
-/// Sends one `FramebufferUpdate` covering `tiles`.
-///
-/// Written through a `Write` so the bytes can be checked without a socket.
-fn write_update<W: Write>(
-    out: &mut W,
-    frame: &[u8],
+/// Everything one `FramebufferUpdate` says: the frame it is cut from, the tiles
+/// that changed, how to pack them, and the cursor if that is what changed.
+struct Picture<'a> {
+    frame: &'a [u8],
     frame_width: u32,
-    tiles: &[(u32, u32, u32, u32)],
-    format: &PixelFormat,
+    tiles: &'a [(u32, u32, u32, u32)],
+    format: &'a PixelFormat,
     encoding: i32,
     quality: u8,
-) -> std::io::Result<()> {
+    cursor: Option<&'a crate::cursor::Now>,
+}
+
+/// Sends one `FramebufferUpdate` describing `picture`.
+///
+/// Written through a `Write` so the bytes can be checked without a socket.
+fn write_update<W: Write>(out: &mut W, picture: &Picture) -> std::io::Result<()> {
+    let Picture {
+        frame,
+        frame_width,
+        tiles,
+        format,
+        encoding,
+        quality,
+        cursor,
+    } = *picture;
+    let rectangles = tiles.len() + usize::from(cursor.is_some());
     out.write_all(&[0, 0])?;
-    out.write_all(&(tiles.len() as u16).to_be_bytes())?;
+    out.write_all(&(rectangles as u16).to_be_bytes())?;
+    // The cursor goes first. RFB does not order the rectangles of an update, but
+    // a viewer that has just been told a size reads the shape it must draw
+    // before the pixels it must draw under it.
+    if let Some(cursor) = cursor {
+        write_cursor(out, cursor, format)?;
+    }
     for &(x, y, width, height) in tiles {
         out.write_all(&(x as u16).to_be_bytes())?;
         out.write_all(&(y as u16).to_be_bytes())?;
@@ -428,6 +488,7 @@ fn write_update<W: Write>(
             encoding::TIGHT => {
                 let pixels = region(frame, frame_width, (x, y, width, height));
                 let Some(jpeg) = encoder::encode_tile(&pixels, width, height, quality) else {
+                    tracing::warn!("rfb: tile {width}x{height} would not encode as JPEG");
                     // A tile that will not encode must still be sent, or the
                     // picture on the viewer would keep the state it had.
                     let raw = protocol::extract(frame, frame_width, (x, y, width, height), format);
@@ -445,6 +506,29 @@ fn write_update<W: Write>(
         }
     }
     out.flush()
+}
+
+/// Sends the cursor as one pseudo-rectangle of the update.
+///
+/// The rectangle's position carries the hot spot rather than a place on the
+/// screen, and what follows the header is the cursor's own pixels and then a
+/// bitmask of which of them are visible. A viewer that asked for this draws the
+/// pointer itself, which is why the arrow then follows the phone's thumb
+/// without a frame of lag.
+fn write_cursor<W: Write>(
+    out: &mut W,
+    cursor: &crate::cursor::Now,
+    format: &PixelFormat,
+) -> std::io::Result<()> {
+    out.write_all(&(cursor.hot_x as u16).to_be_bytes())?;
+    out.write_all(&(cursor.hot_y as u16).to_be_bytes())?;
+    out.write_all(&(cursor.width as u16).to_be_bytes())?;
+    out.write_all(&(cursor.height as u16).to_be_bytes())?;
+    out.write_all(&protocol::encoding::CURSOR.to_be_bytes())?;
+    let pixels = protocol::cursor_pixels(&cursor.rgba, cursor.width, cursor.height, format);
+    out.write_all(&pixels)?;
+    let mask = protocol::cursor_mask(&cursor.rgba, cursor.width, cursor.height);
+    out.write_all(&mask)
 }
 
 /// Raw pixels: the bytes themselves, with nothing in front of them.
@@ -518,12 +602,15 @@ mod tests {
         let mut out = Vec::new();
         write_update(
             &mut out,
-            &frame,
-            8,
-            &tiles,
-            &PixelFormat::NATIVE,
-            encoding::RAW,
-            70,
+            &Picture {
+                frame: &frame,
+                frame_width: 8,
+                tiles: &tiles,
+                format: &PixelFormat::NATIVE,
+                encoding: encoding::RAW,
+                quality: 70,
+                cursor: None,
+            },
         )
         .expect("written");
         assert_eq!(&out[..2], &[0, 0], "message type and padding");
@@ -547,12 +634,15 @@ mod tests {
         let mut out = Vec::new();
         write_update(
             &mut out,
-            &frame,
-            8,
-            &tiles[..1],
-            &PixelFormat::NATIVE,
-            encoding::TIGHT,
-            70,
+            &Picture {
+                frame: &frame,
+                frame_width: 8,
+                tiles: &tiles[..1],
+                format: &PixelFormat::NATIVE,
+                encoding: encoding::TIGHT,
+                quality: 70,
+                cursor: None,
+            },
         )
         .expect("written");
         assert_eq!(
@@ -576,6 +666,87 @@ mod tests {
             "JPEG start-of-image marker"
         );
         assert_eq!(out.len(), at + length);
+    }
+
+    #[test]
+    fn an_update_can_carry_nothing_but_the_cursor() {
+        // A cursor that changed over an unchanged picture is still a reason to
+        // send an update: one rectangle, and it is the pointer rather than a
+        // piece of the screen.
+        let cursor = crate::cursor::Now {
+            serial: 7,
+            width: 2,
+            height: 2,
+            hot_x: 1,
+            hot_y: 0,
+            rgba: vec![
+                255, 255, 255, 255, // opaque white, top left
+                0, 0, 0, 0, // transparent, top right
+                0, 0, 0, 0, // transparent, bottom left
+                255, 0, 0, 255, // opaque red, bottom right
+            ],
+        };
+        let mut out = Vec::new();
+        write_update(
+            &mut out,
+            &Picture {
+                frame: &[0u8; 8 * 8 * 4],
+                frame_width: 8,
+                tiles: &[],
+                format: &PixelFormat::NATIVE,
+                encoding: encoding::RAW,
+                quality: 70,
+                cursor: Some(&cursor),
+            },
+        )
+        .expect("written");
+        assert_eq!(u16::from_be_bytes([out[2], out[3]]), 1, "one rectangle");
+        // The header carries the hot spot and the size, not a place on screen.
+        assert_eq!(u16::from_be_bytes([out[4], out[5]]), 1, "hot spot x");
+        assert_eq!(u16::from_be_bytes([out[6], out[7]]), 0, "hot spot y");
+        assert_eq!(u16::from_be_bytes([out[8], out[9]]), 2, "width");
+        assert_eq!(u16::from_be_bytes([out[10], out[11]]), 2, "height");
+        assert_eq!(
+            i32::from_be_bytes([out[12], out[13], out[14], out[15]]),
+            protocol::encoding::CURSOR
+        );
+        // Blue, green, red, pad for each pixel in the native format.
+        let pixels = [
+            255, 255, 255, 255, //
+            0, 0, 0, 255, //
+            0, 0, 0, 255, //
+            0, 0, 255, 255,
+        ];
+        assert_eq!(&out[16..32], &pixels, "the cursor's own pixels");
+        // A mask of one byte a row: top left visible, then bottom right.
+        assert_eq!(&out[32..34], &[0b1000_0000, 0b0100_0000], "the mask");
+        assert_eq!(out.len(), 34, "and nothing else");
+    }
+
+    #[test]
+    fn an_update_with_nothing_to_say_is_still_an_update() {
+        // A viewer that asked is answered even when the screen has not moved:
+        // RealVNC Viewer waits for the reply before it asks again, and a server
+        // that says nothing leaves it with a picture that never changes.
+        let mut out = Vec::new();
+        write_update(
+            &mut out,
+            &Picture {
+                frame: &[0u8; 8 * 8 * 4],
+                frame_width: 8,
+                tiles: &[],
+                format: &PixelFormat::NATIVE,
+                encoding: encoding::RAW,
+                quality: 70,
+                cursor: None,
+            },
+        )
+        .expect("written");
+        assert_eq!(
+            out,
+            vec![0, 0, 0, 0],
+            "a type, a padding byte, and no rectangles"
+        );
     }
 
     #[test]
