@@ -465,27 +465,46 @@ impl Screen {
     /// takes the CLIPBOARD selection, puts the string on it, and presses the
     /// paste chord. Plane keys — Enter, Tab — are pressed directly, because
     /// pasting them would insert a character rather than press a key.
+    /// Types a string, in whatever language it is written in.
+    ///
+    /// A character the machine's own keyboard has is pressed as a key: it
+    /// arrives in the app that has the focus without any paste, so it works in
+    /// a terminal as well as in a browser. Only what the layout has no key for —
+    /// a Thai letter on an American keyboard — rides the clipboard, because X
+    /// will not carry such a character as a keystroke.
+    ///
+    /// Plane keys — Enter, Tab — are pressed directly, because pasting them
+    /// would insert a character rather than press a key.
     pub fn type_text(&mut self, text: &str) -> Result<(), ScreenError> {
         if self.display.is_null() {
             return Err(ScreenError::Gone);
         }
-        let mut plain = String::new();
+        let mut carried = String::new();
         for character in text.chars() {
             match character {
                 '\n' | '\r' => {
                     // Whatever is before the newline goes on the clipboard
                     // first, or the paste and the Enter land out of order.
-                    self.paste(&std::mem::take(&mut plain));
+                    self.paste(&std::mem::take(&mut carried));
                     self.key("Return", &[]);
                 }
                 '\t' => {
-                    self.paste(&std::mem::take(&mut plain));
+                    self.paste(&std::mem::take(&mut carried));
                     self.key("Tab", &[]);
                 }
-                other => plain.push(other),
+                other => match character_key(self.display, other) {
+                    Some((code, shift)) => {
+                        let carried = std::mem::take(&mut carried);
+                        if !carried.is_empty() {
+                            self.paste(&carried);
+                        }
+                        press_code(self.display, code, shift);
+                    }
+                    None => carried.push(other),
+                },
             }
         }
-        self.paste(&plain);
+        self.paste(&carried);
         Ok(())
     }
 
@@ -548,37 +567,8 @@ impl Screen {
         if keysym == 0 {
             return;
         }
-        let code = unsafe { xlib::XKeysymToKeycode(self.display, keysym) };
-        if code == 0 {
-            return;
-        }
-
-        // Modifiers are held for the duration of the press, then released in
-        // reverse order, so a chord reads exactly as it would on the machine.
-        let mut held = Vec::new();
-        for modifier in mods {
-            let Ok(cname) = std::ffi::CString::new(modifier.as_str()) else {
-                continue;
-            };
-            let sym = unsafe { xlib::XStringToKeysym(cname.as_ptr()) };
-            if sym == 0 {
-                continue;
-            }
-            let mcode = unsafe { xlib::XKeysymToKeycode(self.display, sym) };
-            if mcode == 0 {
-                continue;
-            }
-            unsafe { xtest::XTestFakeKeyEvent(self.display, mcode as u32, xlib::True, 0) };
-            held.push(mcode);
-        }
-        unsafe {
-            xtest::XTestFakeKeyEvent(self.display, code as u32, xlib::True, 0);
-            xtest::XTestFakeKeyEvent(self.display, code as u32, xlib::False, 0);
-        }
-        for mcode in held.into_iter().rev() {
-            unsafe { xtest::XTestFakeKeyEvent(self.display, mcode as u32, xlib::False, 0) };
-        }
-        unsafe { xlib::XFlush(self.display) };
+        let held: Vec<&str> = mods.iter().map(|word| modifier_name(word)).collect();
+        chord(self.display, keysym, &held);
     }
 }
 
@@ -661,6 +651,111 @@ unsafe fn libc_malloc(size: usize) -> *mut c_void {
 
 unsafe fn libc_free(ptr: *mut c_void) {
     free(ptr)
+}
+
+/// The keysym name a modifier word means.
+///
+/// A viewer says `ctrl`; X knows `Control_L`. Asking X for `ctrl` finds
+/// nothing and answers politely with NoSymbol, so a paste chord silently became
+/// the bare letter `v` — measured, not assumed. Anything already spelled as a
+/// keysym name is left alone, so a viewer may send `Control_L` too.
+fn modifier_name(word: &str) -> &str {
+    match word.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => "Control_L",
+        "shift" => "Shift_L",
+        "alt" => "Alt_L",
+        "meta" => "Meta_L",
+        "super" | "win" | "windows" | "cmd" | "command" => "Super_L",
+        _ => word,
+    }
+}
+
+/// The keysym that names `character`.
+///
+/// Latin-1 characters are their own keysyms. Above that a keysym carries its
+/// code point in the Unicode block (`0x01000000 + code point`), which a server
+/// resolves only if the layout maps that character at all.
+fn character_keysym(character: char) -> xlib::KeySym {
+    let code = character as u32;
+    if (0x20..0x100).contains(&code) {
+        code as xlib::KeySym
+    } else {
+        0x0100_0000 | code as xlib::KeySym
+    }
+}
+
+/// The keycode that types `character`, and whether it needs Shift.
+///
+/// `None` when the machine's keyboard has no key for it, which is the caller's
+/// signal to carry the character on the clipboard instead.
+fn character_key(display: *mut xlib::Display, character: char) -> Option<(u8, bool)> {
+    let keysym = character_keysym(character);
+    let code = unsafe { xlib::XKeysymToKeycode(display, keysym) };
+    if code == 0 {
+        return None;
+    }
+    // A capital letter sits on level two of a lowercase key, so pressing the
+    // bare keycode would type the other case.
+    let plain = unsafe { xlib::XkbKeycodeToKeysym(display, code, 0, 0) };
+    let shifted = unsafe { xlib::XkbKeycodeToKeysym(display, code, 0, 1) };
+    Some((code, plain != keysym && shifted == keysym))
+}
+
+/// Presses and releases one keycode, holding Shift for a shifted character.
+fn press_code(display: *mut xlib::Display, code: u8, shift: bool) {
+    let mut held = Vec::new();
+    if shift {
+        let name = c"Shift_L";
+        let sym = unsafe { xlib::XStringToKeysym(name.as_ptr()) };
+        let mcode = unsafe { xlib::XKeysymToKeycode(display, sym) };
+        if mcode != 0 {
+            unsafe { xtest::XTestFakeKeyEvent(display, mcode as u32, xlib::True, 0) };
+            held.push(mcode);
+        }
+    }
+    unsafe {
+        xtest::XTestFakeKeyEvent(display, code as u32, xlib::True, 0);
+        xtest::XTestFakeKeyEvent(display, code as u32, xlib::False, 0);
+    }
+    for mcode in held.into_iter().rev() {
+        unsafe { xtest::XTestFakeKeyEvent(display, mcode as u32, xlib::False, 0) };
+    }
+    unsafe { xlib::XFlush(display) };
+}
+
+/// Presses one key with modifiers held, then lets go in reverse.
+///
+/// Holding the modifier for the press and releasing it afterwards is what makes
+/// a chord a chord: Ctrl+V is a paste only while Ctrl is down.
+fn chord(display: *mut xlib::Display, keysym: xlib::KeySym, mods: &[&str]) {
+    let code = unsafe { xlib::XKeysymToKeycode(display, keysym) };
+    if code == 0 {
+        return;
+    }
+    let mut held = Vec::new();
+    for modifier in mods {
+        let Ok(name) = std::ffi::CString::new(*modifier) else {
+            continue;
+        };
+        let sym = unsafe { xlib::XStringToKeysym(name.as_ptr()) };
+        if sym == 0 {
+            continue;
+        }
+        let mcode = unsafe { xlib::XKeysymToKeycode(display, sym) };
+        if mcode == 0 {
+            continue;
+        }
+        unsafe { xtest::XTestFakeKeyEvent(display, mcode as u32, xlib::True, 0) };
+        held.push(mcode);
+    }
+    unsafe {
+        xtest::XTestFakeKeyEvent(display, code as u32, xlib::True, 0);
+        xtest::XTestFakeKeyEvent(display, code as u32, xlib::False, 0);
+    }
+    for mcode in held.into_iter().rev() {
+        unsafe { xtest::XTestFakeKeyEvent(display, mcode as u32, xlib::False, 0) };
+    }
+    unsafe { xlib::XFlush(display) };
 }
 
 #[cfg(test)]
@@ -861,61 +956,42 @@ impl Input {
         if keysym == 0 {
             return;
         }
-        let code = unsafe { xlib::XKeysymToKeycode(self.display, keysym) };
-        if code == 0 {
-            return;
-        }
-        // Held for the press and let go in reverse, so a chord reads as it would
-        // on the machine itself.
-        let mut held = Vec::new();
-        for modifier in mods {
-            let Ok(cname) = std::ffi::CString::new(modifier.as_str()) else {
-                continue;
-            };
-            let sym = unsafe { xlib::XStringToKeysym(cname.as_ptr()) };
-            if sym == 0 {
-                continue;
-            }
-            let mcode = unsafe { xlib::XKeysymToKeycode(self.display, sym) };
-            if mcode == 0 {
-                continue;
-            }
-            unsafe { xtest::XTestFakeKeyEvent(self.display, mcode as u32, xlib::True, 0) };
-            held.push(mcode);
-        }
-        unsafe {
-            xtest::XTestFakeKeyEvent(self.display, code as u32, xlib::True, 0);
-            xtest::XTestFakeKeyEvent(self.display, code as u32, xlib::False, 0);
-        }
-        for mcode in held.into_iter().rev() {
-            unsafe { xtest::XTestFakeKeyEvent(self.display, mcode as u32, xlib::False, 0) };
-        }
-        unsafe { xlib::XFlush(self.display) };
+        let held: Vec<&str> = mods.iter().map(|word| modifier_name(word)).collect();
+        chord(self.display, keysym, &held);
     }
 
     /// Types a string, in whatever language it is written in.
     ///
-    /// Same reasoning as `Screen::type_text`: the clipboard carries text, and a
-    /// remapped keycode does not reach clients that read the keyboard once.
+    /// Same reasoning as `Screen::type_text`: a character the layout has is a
+    /// key press, and only what it has no key for rides the clipboard.
     pub fn type_text(&mut self, text: &str) -> Result<(), ScreenError> {
         if self.display.is_null() {
             return Err(ScreenError::Gone);
         }
-        let mut plain = String::new();
+        let mut carried = String::new();
         for character in text.chars() {
             match character {
                 '\n' | '\r' => {
-                    self.paste(&std::mem::take(&mut plain));
+                    self.paste(&std::mem::take(&mut carried));
                     self.key("Return", &[]);
                 }
                 '\t' => {
-                    self.paste(&std::mem::take(&mut plain));
+                    self.paste(&std::mem::take(&mut carried));
                     self.key("Tab", &[]);
                 }
-                other => plain.push(other),
+                other => match character_key(self.display, other) {
+                    Some((code, shift)) => {
+                        let carried = std::mem::take(&mut carried);
+                        if !carried.is_empty() {
+                            self.paste(&carried);
+                        }
+                        press_code(self.display, code, shift);
+                    }
+                    None => carried.push(other),
+                },
             }
         }
-        self.paste(&plain);
+        self.paste(&carried);
         Ok(())
     }
 
@@ -1145,5 +1221,32 @@ fn serve_selection(
 
     unsafe {
         xlib::XCloseDisplay(display);
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn a_viewers_word_becomes_a_keysym_name() {
+        // X answers NoSymbol for these words, so they have to be translated
+        // before the lookup or the modifier is dropped without a word.
+        assert_eq!("Control_L", modifier_name("ctrl"));
+        assert_eq!("Control_L", modifier_name("Control"));
+        assert_eq!("Alt_L", modifier_name("alt"));
+        assert_eq!("Shift_L", modifier_name("shift"));
+        assert_eq!("Super_L", modifier_name("win"));
+        // A viewer that already spells the keysym is not second-guessed.
+        assert_eq!("Control_L", modifier_name("Control_L"));
+        assert_eq!("F5", modifier_name("F5"));
+    }
+
+    #[test]
+    fn a_character_carries_its_code_point() {
+        assert_eq!(0x61, character_keysym('a'));
+        assert_eq!(0xe9, character_keysym('é'));
+        // A Thai letter has no Latin-1 name, so it travels as a Unicode keysym.
+        assert_eq!(0x0100_0e01, character_keysym('ก'));
     }
 }
