@@ -59,8 +59,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Separate keys per target, or one architecture's artifacts evict the
-          # other's from the same cache entry.
-          key: ${{ matrix.suffix }}
+          # other's from the same cache entry — and per runner image, because
+          # crate `cache-on-failure` artifacts built against 24.04's headers were
+          # reused on a 22.04 runner and failed to link with `undefined symbol:
+          # __isoc23_sscanf`, a glibc 2.38 symbol that 22.04 does not have.
+          key: ${{ matrix.suffix }}-${{ matrix.runner }}
           # The release profile is a distinct artifact set from the test profile.
           cache-on-failure: false
 
