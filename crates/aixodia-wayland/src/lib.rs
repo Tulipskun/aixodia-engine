@@ -186,9 +186,9 @@ impl Compositor {
                 self.state.pointer.over = None;
             }
         }
-        if let Some((client, _surface)) = self.state.focus {
+        if let Some((client, _surface)) = self.state.keyboard_focus {
             if client >= index {
-                self.state.focus = None;
+                self.state.keyboard_focus = None;
             }
         }
         self.state.dirty = true;
@@ -207,6 +207,16 @@ impl Compositor {
     /// A scroll, in notches.
     pub fn pointer_axis(&mut self, notches: f64) -> io::Result<()> {
         self.state.pointer_axis(notches)
+    }
+
+    /// A scroll sideways, in notches.
+    pub fn pointer_axis_across(&mut self, notches: f64) -> io::Result<()> {
+        self.state.pointer_axis_along(notches, false)
+    }
+
+    /// Where the pointer is, in the frame's coordinates.
+    pub fn pointer_position(&self) -> (f64, f64) {
+        (self.state.pointer.x, self.state.pointer.y)
     }
 
     /// A key, by evdev code.
@@ -243,6 +253,30 @@ mod tests {
         (object, opcode, body)
     }
 
+    /// Reads one event if one is waiting, and gives up rather than blocking.
+    fn next_message(theirs: &UnixStream) -> Option<(u32, u16, Vec<u8>)> {
+        use std::io::Read;
+        theirs.set_nonblocking(true).ok()?;
+        let mut header = [0u8; 8];
+        let mut reader = theirs;
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(_) => {
+                theirs.set_nonblocking(false).ok()?;
+                return None;
+            }
+        }
+        let object = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let opcode = u16::from_le_bytes([header[4], header[5]]);
+        let size = u16::from_le_bytes([header[6], header[7]]) as usize;
+        let mut body = vec![0u8; size - 8];
+        if !body.is_empty() {
+            reader.read_exact(&mut body).ok()?;
+        }
+        theirs.set_nonblocking(false).ok()?;
+        Some((object, opcode, body))
+    }
+
     /// Sends one request with an optional fd beside it.
     fn request(theirs: &UnixStream, writer: Writer) {
         let bytes = writer.bytes();
@@ -251,7 +285,12 @@ mod tests {
 
     /// A compositor and a client on the two ends of one socket.
     fn setup(size: u32) -> (Compositor, UnixStream) {
-        let dir = std::env::temp_dir().join(format!("aixodia-wl-{}-{size}", std::process::id()));
+        // A socket of its own per call: tests run in parallel, and two of them
+        // binding one path is `Address already in use`.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("aixodia-wl-{}-{size}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut compositor = Compositor::new(&dir, "wayland-0", size, size).unwrap();
         let (ours, theirs) = UnixStream::pair().unwrap();
@@ -406,6 +445,100 @@ mod tests {
         let (object, opcode, body) = next_event(&theirs);
         assert_eq!((object, opcode), (5, 0));
         assert!(Args::new(&body).uint() >= 1);
+    }
+
+    /// A compositor with one client that already has a pointer and a keyboard,
+    /// and one window under (0,0)-(64,64), so input can be pointed at it.
+    fn with_input(size: u32) -> (Compositor, UnixStream) {
+        let (mut compositor, theirs) = setup(size);
+        compositor.state.clients[0]
+            .objects
+            .insert(20, state::Object::Pointer);
+        compositor.state.clients[0]
+            .objects
+            .insert(21, state::Object::Keyboard);
+        compositor.state.windows.push(Window {
+            client: 0,
+            surface: 7,
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            title: "test".into(),
+            app_id: "test".into(),
+            mapped: true,
+        });
+        (compositor, theirs)
+    }
+
+    #[test]
+    fn a_keyboard_says_when_it_enters_a_window_and_when_it_leaves() {
+        let (mut compositor, theirs) = with_input(128);
+        compositor.pointer_motion(10.0, 10.0).unwrap();
+        // wl_pointer enter is opcode 0 on the pointer; wl_keyboard enter is opcode
+        // 1 on the keyboard. Both are sent, and the keyboard's names a surface —
+        // a null one is a protocol error.
+        let mut keyboard_entered = None;
+        while let Some((object, opcode, body)) = next_message(&theirs) {
+            if object == 21 && opcode == 1 {
+                let mut args = Args::new(&body);
+                let _serial = args.uint();
+                keyboard_entered = Some(args.object());
+            }
+        }
+        assert_eq!(keyboard_entered, Some(7), "the keyboard entered our window");
+
+        // Leaving for the desktop tells the keyboard too.
+        compositor.pointer_motion(120.0, 120.0).unwrap();
+        let mut left = false;
+        while let Some((object, opcode, _body)) = next_message(&theirs) {
+            if object == 21 && opcode == 2 {
+                left = true;
+            }
+        }
+        assert!(left, "the keyboard was told the pointer left the window");
+    }
+
+    #[test]
+    fn shift_is_reported_as_the_modifier_the_keymap_binds() {
+        let (mut compositor, theirs) = with_input(128);
+        compositor.pointer_motion(10.0, 10.0).unwrap();
+        // Read past the enter, then press shift: 42 is the left shift keycode.
+        while next_message(&theirs).is_some() {}
+        compositor.key(42, true).unwrap();
+        assert_eq!(modifiers_sent(&theirs), Some(1), "shift is modifier bit 0");
+        compositor.key(42, false).unwrap();
+        assert_eq!(
+            modifiers_sent(&theirs),
+            Some(0),
+            "and releasing it clears the bit"
+        );
+    }
+
+    /// The depressed-modifier word of the last `wl_keyboard.modifiers` event.
+    fn modifiers_sent(theirs: &UnixStream) -> Option<u32> {
+        let mut depressed = None;
+        while let Some((object, opcode, body)) = next_message(theirs) {
+            if object == 21 && opcode == 4 {
+                let mut args = Args::new(&body);
+                let _serial = args.uint();
+                depressed = Some(args.uint());
+            }
+        }
+        depressed
+    }
+
+    #[test]
+    fn a_key_with_no_focus_goes_nowhere() {
+        let (mut compositor, theirs) = with_input(128);
+        // The pointer is outside the window, so the keyboard has no surface.
+        compositor.pointer_motion(120.0, 120.0).unwrap();
+        while next_message(&theirs).is_some() {}
+        compositor.key(30, true).unwrap();
+        assert!(
+            next_message(&theirs).is_none(),
+            "nothing was sent to anyone"
+        );
     }
 
     #[test]

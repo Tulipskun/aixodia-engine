@@ -140,10 +140,14 @@ pub struct State {
     pub pointer: Pointer,
     /// Set by anything that must be recomposited before the next frame.
     pub dirty: bool,
-    /// The keyboard's focus, and the client that owns it.
-    pub focus: Option<(usize, u32)>,
+    /// The surface the keyboard types into, and the client that owns it.
+    pub keyboard_focus: Option<(usize, u32)>,
     keymap: Option<std::fs::File>,
     keymap_size: u32,
+    /// The modifier bits the client has been told about: bit 0 shift, 1 caps
+    /// lock, 2 control, 3 alt, 6 logo — the xkb indices the keymap in `keymap`
+    /// actually uses.
+    pub mods: u32,
     /// Counters for the log: a compositor that is asked for buffers and never
     /// commits one is a compositor whose client is stuck, and the log should say.
     pub commits: u64,
@@ -161,9 +165,10 @@ impl State {
             windows: Vec::new(),
             pointer: Pointer::default(),
             dirty: true,
-            focus: None,
+            keyboard_focus: None,
             keymap: None,
             keymap_size: 0,
+            mods: 0,
             commits: 0,
             configures: 0,
         }
@@ -622,6 +627,44 @@ impl State {
         Ok(())
     }
 
+    /// Moves the keyboard's focus and tells the keyboards on both sides of the
+    /// change. Without `wl_keyboard.enter` a client never believes it is
+    /// focused, and ignores every key: Chrome takes the keystrokes only after the
+    /// surface it drew has been entered.
+    fn set_keyboard_focus(&mut self, next: Option<(usize, u32)>) -> std::io::Result<()> {
+        let previous = self.keyboard_focus;
+        self.keyboard_focus = next;
+        if previous == next {
+            return Ok(());
+        }
+        if let Some((client, surface)) = previous {
+            if let Some(keyboard) = self.keyboard_id(client) {
+                let serial = self.next_serial();
+                self.send(
+                    client,
+                    Writer::new(keyboard, 2)
+                        .uint(serial)
+                        .object(surface)
+                        .finish(),
+                )?;
+            }
+        }
+        if let Some((client, surface)) = next {
+            if let Some(keyboard) = self.keyboard_id(client) {
+                let serial = self.next_serial();
+                self.send(
+                    client,
+                    Writer::new(keyboard, 1)
+                        .uint(serial)
+                        .object(surface)
+                        .array(&[])
+                        .finish(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn send_keymap(&mut self, index: usize, keyboard: u32) -> std::io::Result<()> {
         if self.keymap.is_none() {
             let (file, size) = keymap::write()?;
@@ -814,8 +857,11 @@ impl State {
                             .finish(),
                     )?;
                 }
-                self.focus = over;
             }
+            // The keyboard changes hands wherever the pointer goes, including
+            // nowhere: leaving a window for the desktop is a leave for the
+            // keyboard as well, or it types into a window nobody is looking at.
+            self.set_keyboard_focus(over)?;
         }
         if let Some((client, _surface)) = over {
             if let Some(pointer) = self.pointer_id(client) {
@@ -853,6 +899,12 @@ impl State {
 
     /// A scroll, in Wayland's own units: ten to a notch.
     pub fn pointer_axis(&mut self, notches: f64) -> std::io::Result<()> {
+        self.pointer_axis_along(notches, true)
+    }
+
+    /// A scroll along one axis: the vertical one for a wheel, the horizontal one
+    /// for a sideways two-finger drag.
+    pub fn pointer_axis_along(&mut self, notches: f64, vertical: bool) -> std::io::Result<()> {
         let Some((client, _surface)) = self.pointer.over else {
             return Ok(());
         };
@@ -863,7 +915,7 @@ impl State {
             client,
             Writer::new(pointer, 4)
                 .uint(0)
-                .uint(0)
+                .uint(if vertical { 0 } else { 1 })
                 .fixed(notches * 10.0)
                 .finish(),
         )?;
@@ -872,7 +924,8 @@ impl State {
 
     /// A key, by evdev code, which is what Wayland's key event carries.
     pub fn key(&mut self, evdev: u32, pressed: bool) -> std::io::Result<()> {
-        let Some((client, _surface)) = self.focus.or(self.pointer.over) else {
+        self.set_modifier(evdev, pressed);
+        let Some((client, _surface)) = self.keyboard_focus else {
             return Ok(());
         };
         let Some(keyboard) = self.keyboard_id(client) else {
@@ -887,7 +940,39 @@ impl State {
                 .uint(evdev)
                 .uint(if pressed { 1 } else { 0 })
                 .finish(),
+        )?;
+        // The depressed-modifier word after every key: a client that missed one
+        // event then still knows what is held, and shift a moment late is a
+        // capital typed as a small letter.
+        let serial = self.next_serial();
+        self.send(
+            client,
+            Writer::new(keyboard, 4)
+                .uint(serial)
+                .uint(self.mods)
+                .uint(0)
+                .uint(0)
+                .uint(0)
+                .finish(),
         )
+    }
+
+    /// Tracks the eight modifier bits xkb's evdev keycodes produce. Only the ones
+    /// our keymap binds are needed: shift, caps lock, control, alt and logo.
+    fn set_modifier(&mut self, evdev: u32, pressed: bool) {
+        let bit = match evdev {
+            42 | 54 => 1 << 0,   // shift
+            58 => 1 << 1,        // caps lock, a lock rather than a hold
+            29 | 97 => 1 << 2,   // control
+            56 | 100 => 1 << 3,  // alt
+            125 | 126 => 1 << 6, // logo
+            _ => return,
+        };
+        if pressed {
+            self.mods |= bit;
+        } else {
+            self.mods &= !bit;
+        }
     }
 
     fn pointer_id(&self, index: usize) -> Option<u32> {

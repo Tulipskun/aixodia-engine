@@ -68,6 +68,13 @@ impl Pool {
     }
 }
 
+// SAFETY: the mapping is owned by this pool, never written, and only read
+// through `bytes`, so sending one to another thread sends an address that is
+// still valid and still ours. Nothing else can unmap it: `Drop` is the only
+// unmapper, and it needs the pool.
+unsafe impl Send for Pool {}
+unsafe impl Sync for Pool {}
+
 impl Drop for Pool {
     fn drop(&mut self) {
         // SAFETY: the address and size are exactly what mmap returned and asked

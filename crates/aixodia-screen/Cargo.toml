@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aixodia-wayland = { path = "../aixodia-wayland" }
 aixodia-wsock = { path = "../aixodia-wsock" }
 axum = { workspace = true }
 tokio = { workspace = true }

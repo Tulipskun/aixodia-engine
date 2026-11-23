@@ -26,9 +26,10 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::capture::{Button, Input, Screen};
+use crate::capture::{Button, Frame, Input, Screen, ScreenError};
 use crate::cursor;
 use crate::encoder::{self, EncodeSettings, H264Encoder};
+use crate::wayland;
 
 /// How the picture is produced. Every field can change while the engine runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,116 @@ pub struct Settings {
     /// picture — measured at 3.7 KB against 237 KB for a scrolled screen here —
     /// so it is worth having where the client can decode it.
     pub codec: Codec,
+}
+
+/// Whether this engine shows an X display or its own compositor.
+///
+/// X is still the default while the compositor is proved: the moment a host
+/// says `AIXODIA_PANE=wayland` it needs no X server, no X libraries and no
+/// package installed for them, and the picture comes out of a framebuffer this
+/// engine owns.
+fn compositor_mode() -> bool {
+    std::env::var("AIXODIA_PANE")
+        .map(|value| value.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false)
+}
+
+/// What the pane is showing: a display somebody else owns, or one of ours.
+enum ScreenSource {
+    X(Box<Screen>),
+    Wayland(Arc<wayland::Pane>),
+}
+
+impl ScreenSource {
+    fn frame(&mut self) -> Result<Frame, ScreenError> {
+        match self {
+            Self::X(screen) => screen.frame(),
+            Self::Wayland(pane) => pane.frame(),
+        }
+    }
+
+    fn width(&self) -> u32 {
+        match self {
+            Self::X(screen) => screen.width(),
+            Self::Wayland(pane) => pane.width(),
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            Self::X(screen) => screen.height(),
+            Self::Wayland(pane) => pane.height(),
+        }
+    }
+
+    fn using_shm(&self) -> bool {
+        match self {
+            Self::X(screen) => screen.using_shm(),
+            Self::Wayland(pane) => pane.using_shm(),
+        }
+    }
+}
+
+/// Where a finger's events go.
+enum Events {
+    X(Box<Input>),
+    Wayland(Arc<wayland::Pane>),
+}
+
+impl Events {
+    fn display_size(&self) -> (u32, u32) {
+        match self {
+            Self::X(input) => input.display_size(),
+            Self::Wayland(pane) => pane.display_size(),
+        }
+    }
+
+    fn pointer_position(&self) -> Option<(i32, i32)> {
+        match self {
+            Self::X(input) => input.pointer_position(),
+            Self::Wayland(pane) => pane.pointer_position(),
+        }
+    }
+
+    /// No cursor of the machine's own: a compositor has no pointer art to read,
+    /// and the phone already draws the arrow the user is holding.
+    fn cursor_shape(&self) -> Option<cursor::Now> {
+        match self {
+            Self::X(input) => input.cursor_shape(),
+            Self::Wayland(_) => None,
+        }
+    }
+
+    fn move_pointer(&self, x: i32, y: i32) {
+        match self {
+            Self::X(input) => input.move_pointer(x, y),
+            Self::Wayland(pane) => pane.move_pointer(x, y),
+        }
+    }
+
+    fn button(&self, button: Button, pressed: bool) {
+        match self {
+            Self::X(input) => input.button(button, pressed),
+            Self::Wayland(pane) => pane.button(button, pressed),
+        }
+    }
+
+    fn key(&self, keysym: &str, mods: &[String]) {
+        match self {
+            Self::X(input) => input.key(keysym, mods),
+            Self::Wayland(pane) => pane.key(keysym, mods),
+        }
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<(), ScreenError> {
+        match self {
+            Self::X(input) => input.type_text(text),
+            Self::Wayland(pane) => {
+                pane.type_text(text);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// How often the pointer's cursor is looked at, in milliseconds.
@@ -330,12 +441,12 @@ pub struct ScreenHub {
     token: String,
     tickets: aixodia_wsock::Tickets,
     settings: Mutex<Settings>,
-    screen: Mutex<Option<Screen>>,
+    screen: Mutex<Option<ScreenSource>>,
     /// A separate connection, used only for input.
     ///
     /// Never held while a frame is being read, which is the whole point: an
     /// event that had to wait behind a grab arrived in jerks.
-    input: Arc<Mutex<Option<Input>>>,
+    input: Arc<Mutex<Option<Events>>>,
     /// How many clients are watching.
     ///
     /// The capture loop must run exactly while somebody is looking and stop
@@ -442,6 +553,9 @@ impl ScreenHub {
 
     /// Opens the display if it is not open yet, at the current settings.
     fn ensure_screen(&self) -> Result<(), String> {
+        if compositor_mode() {
+            return self.open_compositor();
+        }
         // A server with no monitor is the ordinary case. Before the capture
         // display is opened, the engine brings up one of its own if the
         // machine has none, so the screen window works wherever the engine
@@ -452,7 +566,9 @@ impl ScreenHub {
         {
             let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
             if input.is_none() {
-                *input = Input::open(&display).ok();
+                *input = Input::open(&display)
+                    .ok()
+                    .map(|input| Events::X(Box::new(input)));
             }
         }
         let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
@@ -462,7 +578,38 @@ impl ScreenHub {
         let settings = self.settings_now();
         let screen =
             Screen::open(&display, settings.width, settings.height).map_err(|e| e.to_string())?;
-        *guard = Some(screen);
+        *guard = Some(ScreenSource::X(Box::new(screen)));
+        Ok(())
+    }
+
+    /// Opens our own compositor instead of an X display, and gives the input
+    /// handle the same pane so a finger goes where the picture came from.
+    fn open_compositor(&self) -> Result<(), String> {
+        let mut guard = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+        let pane = match guard.as_ref() {
+            Some(ScreenSource::Wayland(pane)) => Arc::clone(pane),
+            Some(ScreenSource::X(_)) => {
+                return Err("the pane is already open as an X display".into())
+            }
+            None => {
+                let settings = self.settings_now();
+                let pane = Arc::new(
+                    wayland::Pane::open(settings.width, settings.height)
+                        .map_err(|e| e.to_string())?,
+                );
+                *guard = Some(ScreenSource::Wayland(Arc::clone(&pane)));
+                pane
+            }
+        };
+        drop(guard);
+        // A client started by the engine finds the compositor through these two
+        // variables, and nobody else's display through them.
+        std::env::set_var("XDG_RUNTIME_DIR", pane.dir());
+        std::env::set_var("WAYLAND_DISPLAY", wayland::SOCKET);
+        let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        if input.is_none() {
+            *input = Some(Events::Wayland(pane));
+        }
         Ok(())
     }
 
@@ -501,11 +648,23 @@ impl ScreenHub {
             // stream running across the change.
             if guard.is_none() {
                 let settings = self.settings_now();
-                let display = crate::display::ensure().map_err(|e| e.0)?;
-                *guard = Some(
-                    Screen::open(&display, settings.width, settings.height)
-                        .map_err(|e| e.to_string())?,
-                );
+                if compositor_mode() {
+                    let pane = Arc::new(
+                        wayland::Pane::open(settings.width, settings.height)
+                            .map_err(|e| e.to_string())?,
+                    );
+                    let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                    if input.is_none() {
+                        *input = Some(Events::Wayland(Arc::clone(&pane)));
+                    }
+                    *guard = Some(ScreenSource::Wayland(pane));
+                } else {
+                    let display = crate::display::ensure().map_err(|e| e.0)?;
+                    *guard = Some(ScreenSource::X(Box::new(
+                        Screen::open(&display, settings.width, settings.height)
+                            .map_err(|e| e.to_string())?,
+                    )));
+                }
             }
             let screen = guard.as_mut().ok_or("display is not open")?;
             let frame = screen.frame().map_err(|e| e.to_string())?;

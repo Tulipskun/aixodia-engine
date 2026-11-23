@@ -280,6 +280,7 @@ dependencies = [
 name = "aixodia-screen"
 version = "0.1.0"
 dependencies = [
+ "aixodia-wayland",
  "aixodia-wsock",
  "axum",
  "base64 0.22.1",

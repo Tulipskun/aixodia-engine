@@ -24,8 +24,10 @@ pub mod encoder;
 pub mod panel;
 pub mod rfb;
 pub mod server;
+pub mod wayland;
 pub mod wm;
 
 pub use capture::{Button, Frame, Input, Screen, ScreenError};
 pub use encoder::{diff_and_encode, TileUpdate};
 pub use server::{router, ScreenHub, Settings};
+pub use wayland::Pane;
