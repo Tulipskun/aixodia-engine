@@ -14,9 +14,8 @@
 //! new one), which would strand the KV keys and tunnel provisioned under the
 //! old name; the machine id stays with the disk.
 //!
-//! An operator who wants a readable name in the public URL sets
-//! `AIXODIA_INSTANCE` (lower-case letters, digits, single hyphens). It is an
-//! override, never a requirement.
+//! The name is the machine id and nothing else: an install reads `CF_TOKEN` and
+//! no other variable, so there is nothing here for a person to type.
 //!
 //! The name is all this module decides. The tunnel and the hostname behind it
 //! are made by [`crate::provision`] on the first start, so a fresh host needs
@@ -35,8 +34,7 @@ pub struct Keys {
 }
 
 impl Keys {
-    /// The keys of this machine, named from `AIXODIA_INSTANCE` when it is set
-    /// and from the machine identity otherwise.
+    /// The keys of this machine, named from its machine identity.
     pub fn for_this_machine() -> anyhow::Result<Self> {
         Ok(Self {
             name: machine_name()?,
@@ -56,28 +54,8 @@ impl Keys {
 
 /// The name of this machine, as it appears in a KV key and a public URL.
 pub fn machine_name() -> anyhow::Result<String> {
-    if let Some(override_name) = override_name()? {
-        return Ok(override_name);
-    }
     let tag = machine_tag()?;
     Ok(format!("m-{tag}"))
-}
-
-/// `AIXODIA_INSTANCE`, when the operator set it.
-fn override_name() -> anyhow::Result<Option<String>> {
-    let Some(name) = std::env::var("AIXODIA_INSTANCE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-    if !aixodia_state::valid_instance_name(&name) {
-        return Err(anyhow!(
-            "AIXODIA_INSTANCE must be lower-case letters, digits and single hyphens, 1-32 characters: {name}"
-        ));
-    }
-    Ok(Some(name))
 }
 
 /// Eight hex digits of the machine id: stable across reboots, boots of the same
@@ -112,7 +90,7 @@ fn machine_tag() -> anyhow::Result<String> {
         }
     }
     Err(anyhow!(
-        "this machine has no /etc/machine-id and no hostname to name itself by; set AIXODIA_INSTANCE"
+        "this machine has no /etc/machine-id and no hostname to name itself by"
     ))
 }
 
@@ -142,7 +120,6 @@ mod tests {
 
     #[test]
     fn a_name_is_a_path_segment_and_never_changes_between_lookups() {
-        std::env::remove_var("AIXODIA_INSTANCE");
         let name = machine_name().expect("this machine can name itself");
         assert!(aixodia_state::valid_instance_name(&name), "{name}");
         assert_eq!(
@@ -158,7 +135,6 @@ mod tests {
 
     #[test]
     fn the_name_follows_the_machine_id_not_the_hostname() {
-        std::env::remove_var("AIXODIA_INSTANCE");
         let Some(mid) = read_first_line("/etc/machine-id") else {
             return; // a host with no machine id falls back to the hostname
         };
@@ -180,18 +156,14 @@ mod tests {
     }
 
     #[test]
-    fn the_override_names_the_machine_and_is_validated() {
-        let saved = std::env::var_os("AIXODIA_INSTANCE");
+    fn no_variable_can_rename_this_machine() {
+        // An install reads `CF_TOKEN` and nothing else; a name that could be set
+        // from outside would be a second variable to get wrong, and two machines
+        // pointed at one name is exactly what the machine id avoids.
         std::env::set_var("AIXODIA_INSTANCE", "phone-2");
-        assert_eq!(machine_name().unwrap(), "phone-2");
-        std::env::set_var("AIXODIA_INSTANCE", "Phone_2");
-        assert!(
-            machine_name().is_err(),
-            "a name that could break a key or a URL is refused, not escaped"
-        );
-        match saved {
-            Some(value) => std::env::set_var("AIXODIA_INSTANCE", value),
-            None => std::env::remove_var("AIXODIA_INSTANCE"),
-        }
+        let name = machine_name().expect("this machine can name itself");
+        std::env::remove_var("AIXODIA_INSTANCE");
+        assert!(name.starts_with("m-"), "{name}");
+        assert_eq!(name, machine_name().unwrap(), "the name is not settable");
     }
 }

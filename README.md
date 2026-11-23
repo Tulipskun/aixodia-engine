@@ -93,9 +93,8 @@ API keys are in Workers KV.
 
 ## Configuration
 
-`CF_TOKEN` is the only application configuration environment variable.
-Two optional variables exist for a deployment of several machines
-(`AIXODIA_INSTANCE`, `AIXODIA_STATE_DIR`) and are never required — see
+`CF_TOKEN` is the only application configuration environment variable. A name
+for the machine is derived from its `/etc/machine-id`, not asked for — see
 [Many machines, one public domain](#many-machines-one-public-domain).
 The operating system's `HOME` and `PATH` are used only for the local state
 directory and executable discovery. Runtime settings are read from Cloudflare
@@ -162,10 +161,6 @@ answered and which keys belong to it. `auth/*`, `access/*`, `client/*` and
 The deployment's domain is `aixodia.dpdns.org`. So a fresh host needs
 `CF_TOKEN` and nothing else: it registers itself under a name nothing else can
 have.
-
-An operator who wants a readable name in the public URL sets `AIXODIA_INSTANCE`
-(lower-case letters, digits and single hyphens, at most 32 characters). It is an
-override, never a requirement.
 
 One hostname serves them all through the `aixodia-engine-gateway` Worker, which
 lives with the other Workers in [Tulipskun/aixodia-workers](https://github.com/Tulipskun/aixodia-workers)

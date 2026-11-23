@@ -3,7 +3,7 @@
 //! Every engine is reachable as `https://<engine host>/<public name>/…`, the same
 //! shape droidime uses for its devices (`mcp…/<device name>/…`). The name is not
 //! derived from the machine here: it is whatever the registry has room for, so
-//! two machines that were set up with the same `AIXODIA_INSTANCE` get `work` and
+//! two machines that were cloned from one disk get `work` and
 //! `work-1` instead of overwriting each other.
 //!
 //! The row is found again by `origin_host` — the tunnel hostname this engine

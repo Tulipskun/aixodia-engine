@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::capacity;
 use aixodia_provider::{Message, Registry};
 use aixodia_session::{
     AgentPatch, Error as SessionError, NewSession, Session, Turn, TurnInput, UnfinishedTurn,
@@ -574,13 +575,33 @@ struct SystemMetrics {
     uptime_seconds: Option<f64>,
 }
 
-/// The used and total size of the filesystem holding `/`, from `statvfs`.
+/// The memory this process may allocate, and how much of it is in use.
+///
+/// The cgroup's ceiling is the machine this engine actually lives in; `/proc`
+/// describes the host, and a container with eight gigabytes reads a hundred and
+/// twenty-six. When nothing limits this process the host *is* the answer.
+async fn allowed_memory() -> Option<(u64, u64)> {
+    let ceiling = tokio::fs::read_to_string("/sys/fs/cgroup/memory.max").await;
+    let charge = tokio::fs::read_to_string("/sys/fs/cgroup/memory.current").await;
+    if let (Ok(ceiling), Ok(charge)) = (ceiling, charge) {
+        if let Some(allowed) = capacity::memory_used_total(&ceiling, &charge) {
+            return Some(allowed);
+        }
+    }
+    let memory = tokio::fs::read_to_string("/proc/meminfo").await.ok()?;
+    memory_bytes(&memory)
+}
+
+/// The used and total size of the filesystem the engine writes to, from
+/// `statvfs`.
 ///
 /// The engine's own files are what the disk is for — sessions, uploads, backups —
 /// so this is the number worth showing next to CPU and memory, not the size of
-/// every mount on the machine.
+/// every mount on the machine. When a container's storage is quota'd, statvfs
+/// reports the quota: the usable size, not the volume's.
 fn disk_usage() -> Option<(u64, u64)> {
-    let path = std::ffi::CString::new("/").ok()?;
+    let dir = aixodia_state::state_dir();
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
     // SAFETY: `stat` is owned here and only written by statvfs, and the path is a
     // valid C string that outlives the call.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -682,9 +703,8 @@ fn memory_bytes(contents: &str) -> Option<(u64, u64)> {
 
 /// The CPU percentage of the last background sample, kept warm once per second.
 ///
-/// The sample costs a 180ms wait (two reads of `/proc/stat`), which belongs in a
-/// task of its own, not in the request that asks for it. `None` until the first
-/// sample lands.
+/// The sample costs a 180ms wait (two reads), which belongs in a task of its own,
+/// not in the request that asks for it. `None` until the first sample lands.
 fn cpu_percent() -> Option<f64> {
     static SHARED: OnceLock<Arc<std::sync::RwLock<Option<f64>>>> = OnceLock::new();
     let shared = SHARED.get_or_init(|| {
@@ -703,9 +723,55 @@ fn cpu_percent() -> Option<f64> {
     *shared.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Reads `/proc/stat` twice, 180ms apart, so the percentage is measured rather
-/// than guessed.
+/// The cores this process may keep busy: its cgroup quota, else the machine's.
+async fn usable_cores() -> f64 {
+    let quota = tokio::fs::read_to_string("/sys/fs/cgroup/cpu.max")
+        .await
+        .ok()
+        .and_then(|text| capacity::cores_from_cpu_max(&text));
+    quota.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|count| count.get() as f64)
+            .unwrap_or(1.0)
+    })
+}
+
+/// The percentage of the cores this process may use, measured rather than
+/// guessed: the cgroup's own CPU time twice, 180ms apart.
+///
+/// The cgroup's usage is the honest numerator — `/proc/stat` counts every other
+/// container on the host — and its quota is the honest denominator, so a
+/// container with four cores of a thirty-two-core machine reads 100 % when it is
+/// using all four rather than 12 %.
 async fn sample_cpu() -> Option<f64> {
+    let cores = usable_cores().await;
+    let before = cgroup_usage_usec().await;
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    let after = cgroup_usage_usec().await;
+    match (before, after) {
+        (Some(before), Some(after)) => capacity::percent_of_allowance(
+            after.saturating_sub(before),
+            Duration::from_millis(180),
+            cores,
+        ),
+        _ => sample_cpu_from_proc(cores).await,
+    }
+}
+
+/// The CPU time this cgroup has spent, in microseconds.
+async fn cgroup_usage_usec() -> Option<u64> {
+    tokio::fs::read_to_string("/sys/fs/cgroup/cpu.stat")
+        .await
+        .ok()
+        .and_then(|text| capacity::usage_usec(&text))
+}
+
+/// The machine's own busy fraction, for a host that has no cgroup to ask.
+///
+/// The whole machine's CPU time is the only numerator available there, and the
+/// whole machine's cores the only denominator, so the answer is the same shape
+/// as the cgroup's: how much of the computer the engine can reach is busy.
+async fn sample_cpu_from_proc(cores: f64) -> Option<f64> {
     let before = cpu_ticks(&tokio::fs::read_to_string("/proc/stat").await.ok()?)?;
     tokio::time::sleep(Duration::from_millis(180)).await;
     let after = cpu_ticks(&tokio::fs::read_to_string("/proc/stat").await.ok()?)?;
@@ -714,7 +780,14 @@ async fn sample_cpu() -> Option<f64> {
     if total == 0 {
         return None;
     }
-    Some(((total - idle) as f64 / total as f64 * 100.0).clamp(0.0, 100.0))
+    // The ticks are whole-machine jiffies; dividing by the core count turns them
+    // into the same "cores busy" the cgroup reports.
+    let busy_cores = (total - idle) as f64;
+    capacity::percent_of_allowance(
+        (busy_cores * 1_000_000.0 / cores.max(1.0)) as u64,
+        Duration::from_millis(180),
+        cores,
+    )
 }
 
 async fn system_metrics() -> SystemMetrics {
@@ -723,13 +796,11 @@ async fn system_metrics() -> SystemMetrics {
         ..SystemMetrics::default()
     };
 
-    if let Ok(memory) = tokio::fs::read_to_string("/proc/meminfo").await {
-        if let Some((used, total)) = memory_bytes(&memory) {
-            metrics.memory_used_bytes = Some(used);
-            metrics.memory_total_bytes = Some(total);
-            if total > 0 {
-                metrics.memory_percent = Some(used as f64 / total as f64 * 100.0);
-            }
+    if let Some((used, total)) = allowed_memory().await {
+        metrics.memory_used_bytes = Some(used);
+        metrics.memory_total_bytes = Some(total);
+        if total > 0 {
+            metrics.memory_percent = Some(used as f64 / total as f64 * 100.0);
         }
     }
 

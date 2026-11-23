@@ -13,6 +13,7 @@ pub mod attach;
 pub mod auto_backup;
 pub mod backup;
 pub mod breaker;
+pub mod capacity;
 pub mod chat;
 pub mod files;
 pub mod gateway;

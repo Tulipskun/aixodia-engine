@@ -167,6 +167,7 @@ dependencies = [
  "aixodia-net",
  "aixodia-provider",
  "aixodia-session",
+ "aixodia-state",
  "aixodia-tools",
  "anyhow",
  "async-trait",
