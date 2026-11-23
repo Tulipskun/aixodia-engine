@@ -28,15 +28,21 @@ jobs:
   # Each architecture is built on a runner of that architecture. Cross-compiling
   # arm64 from an x86 runner meant a second full C build of BoringSSL through an
   # emulated-aarch64 sysroot, which was the largest single cost of a release.
+  #
+  # The runners are deliberately not the newest ones: a binary links against the
+  # glibc of the machine that built it. Built on 24.04 it asked for
+  # GLIBC_2.38/2.39 and died at start on a Debian 12 host — "version `GLIBC_2.38'
+  # not found" — after installing cleanly. Built on 22.04 it asks for 2.35 and
+  # loads from Debian 12 and Ubuntu 22.04 onwards.
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             suffix: amd64
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             suffix: arm64
     runs-on: ${{ matrix.runner }}
@@ -92,6 +98,24 @@ jobs:
             echo "the no-screen build still links X" >&2
             exit 1
           fi
+
+      - name: The binaries must load on a host older than this runner
+        run: |
+          # The floor this project promises: the glibc of Ubuntu 22.04. A runner
+          # upgrade raises it silently — not a build error, a binary that dies at
+          # start on the user's machine — so it is checked here instead of being
+          # discovered there.
+          floor=2.35
+          for name in aixodia-engine-linux-${{ matrix.suffix }} \
+                      aixodia-engine-linux-${{ matrix.suffix }}-noscreen; do
+            worst=$(objdump -T "$name" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' |
+                    sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "$name asks for GLIBC_$worst"
+            if [ "$(printf '%s\n%s\n' "$floor" "$worst" | sort -V | tail -1)" != "$floor" ]; then
+              echo "$name asks for GLIBC_$worst, above the promised floor $floor" >&2
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v4
         with:

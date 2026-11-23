@@ -84,6 +84,22 @@ engine_can_load() {
   ! ldd "$1" 2>/dev/null | grep -q "not found"
 }
 
+# glibc_required <binary> — the newest GLIBC_x.y the binary asks the loader for,
+# or nothing. A minimal host may have none of these tools, and an installer that
+# died because `objdump` was absent would be worse than one that says nothing.
+glibc_required() {
+  command -v objdump >/dev/null 2>&1 || command -v readelf >/dev/null 2>&1 || return 0
+  { objdump -T "$1" 2>/dev/null || readelf -sW "$1" 2>/dev/null; } 2>/dev/null |
+    grep -oE 'GLIBC_[0-9]+\.[0-9]+' 2>/dev/null | sed 's/GLIBC_//' |
+    sort -uV 2>/dev/null | tail -1 || true
+}
+
+# glibc_host — the glibc this machine runs.
+glibc_host() {
+  { ldd --version 2>/dev/null || getconf GNU_LIBC_VERSION 2>/dev/null; } 2>/dev/null |
+    grep -oE '[0-9]+\.[0-9]+' 2>/dev/null | head -1 || true
+}
+
 # Installs the X libraries the screen pane links, if this host has a package
 # manager that knows them. Returns non-zero when it cannot.
 install_x_libraries() {
@@ -102,6 +118,15 @@ install_x_libraries() {
 }
 
 fetch "$ENGINE_URL" "$PREFIX/aixodia-engine"
+needed_glibc="$(glibc_required "$PREFIX/aixodia-engine")"
+host_glibc="$(glibc_host)"
+if [ -n "$needed_glibc" ] && [ -n "$host_glibc" ] &&
+  [ "$(printf '%s\n%s\n' "$needed_glibc" "$host_glibc" | sort -V | tail -1)" != "$host_glibc" ]; then
+  # Not a missing library: this build was linked against a newer C library than
+  # this machine has, and no package will fix that. Measured as "installed
+  # cleanly, then died at start with 'version `GLIBC_2.38' not found'".
+  die "this build needs glibc $needed_glibc and this host has $host_glibc; build the engine on this machine (cargo build --release) or install on a host with glibc $needed_glibc or newer"
+fi
 if ! engine_can_load "$PREFIX/aixodia-engine"; then
   log "the screen pane needs X libraries this host does not have"
   if install_x_libraries && engine_can_load "$PREFIX/aixodia-engine"; then
