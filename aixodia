@@ -166,7 +166,12 @@ cmd_start() {
         ALLOWED_ORIGINS ALLOWED_GITHUB_USERS AIXODIA_MCP_UPSTREAM \
         AIXODIA_DEVICE_TUNNELS AIXODIA_TMUX GITHUB_CLIENT_ID \
         GITHUB_CLIENT_SECRET GITHUB_REDIRECT_URI
-      exec "$engine"
+      # The engine is run, not exec'd, so that its death says so. It vanished
+      # once without a line in this log — no panic, no shutdown — and a status
+      # of 137 (killed) or 139 (crashed) printed here is the difference between
+      # a machine that ran out of something and a machine that was shot.
+      "$engine"
+      echo "aixodia: engine exited with status $?"
     ' >> "$(log_path)" 2>&1 < /dev/null &
 
   # The child writes the pid file before it execs the engine, so a missing or
