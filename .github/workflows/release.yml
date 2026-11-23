@@ -80,11 +80,25 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} -p aixodia-engine
           cp target/${{ matrix.target }}/release/aixodia-engine aixodia-engine-linux-${{ matrix.suffix }}
+          # The same engine with the screen pane left out, for a machine with no
+          # X libraries: the pane links libX11/libXext/libXtst/libXfixes, and a
+          # binary that needs them cannot load at all on a host without them —
+          # measured, the whole engine died over a pane that host could not have
+          # used anyway. This build mentions no X.
+          cargo build --release --target ${{ matrix.target }} -p aixodia-engine --no-default-features
+          cp target/${{ matrix.target }}/release/aixodia-engine \
+             aixodia-engine-linux-${{ matrix.suffix }}-noscreen
+          if ldd aixodia-engine-linux-${{ matrix.suffix }}-noscreen | grep -qE 'libX11|libXfixes'; then
+            echo "the no-screen build still links X" >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: engine-${{ matrix.suffix }}
-          path: aixodia-engine-linux-${{ matrix.suffix }}
+          path: |
+            aixodia-engine-linux-${{ matrix.suffix }}
+            aixodia-engine-linux-${{ matrix.suffix }}-noscreen
           if-no-files-found: error
 
   publish:
@@ -109,6 +123,7 @@ jobs:
               --title "engine-latest" --notes "Rolling build of main"
           gh release upload engine-latest \
             dist/aixodia-engine-linux-amd64 dist/aixodia-engine-linux-arm64 \
+            dist/aixodia-engine-linux-amd64-noscreen dist/aixodia-engine-linux-arm64-noscreen \
             --repo "$GITHUB_REPOSITORY" --clobber
           # The installer fetches the plain name on the architecture it runs on,
           # so the amd64 build is also published under it.

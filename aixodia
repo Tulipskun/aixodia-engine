@@ -207,6 +207,17 @@ cmd_start() {
   fi
   echo "aixodia: engine exited during startup; last log lines:" >&2
   tail -n 20 "$(log_path)" >&2 || true
+  # A loader that could not find a library is not a crash, and the fix is a
+  # package rather than a bug report: the screen pane links X, and a host without
+  # it cannot load the engine at all.
+  if tail -n 20 "$(log_path)" 2>/dev/null | grep -q "error while loading shared libraries"; then
+    echo >&2
+    echo "aixodia: a shared library the engine needs is missing, so it could not start." >&2
+    echo "aixodia: the screen pane links X. Either install it:" >&2
+    echo "aixodia:   apt-get install -y libx11-6 libxext6 libxtst6 libxfixes3" >&2
+    echo "aixodia: or run install.sh again on this host — it picks the build" >&2
+    echo "aixodia: without the screen pane when the libraries are not there." >&2
+  fi
   rm -f "$file"
   exit 1
 }

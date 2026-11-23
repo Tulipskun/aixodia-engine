@@ -123,6 +123,29 @@ report_death() {
   fail "no exit status in the log (last lines: $(tail -2 "$log" 2>/dev/null | tr '\n' ' '))"
 }
 
+# A loader error is a missing package, not a crash: a host without X cannot load
+# an engine built with the screen pane, and the answer is the package name, not
+# the last twenty log lines on their own.
+setup
+bin="$fakebin/aixodia-engine"
+cat > "$bin" <<'STUB'
+#!/usr/bin/env bash
+echo "/usr/local/bin/aixodia-engine: error while loading shared libraries: libX11.so.6: cannot open shared object file: No such file or directory" >&2
+exit 127
+STUB
+chmod +x "$bin"
+out_file="$home/out"
+env CF_TOKEN=test-token AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
+  AIXODIA_LOCAL_URL="$DEAD_URL" PATH="$fakebin:$PATH" \
+  ENGINE_PID_FILE="$home/pid" ENGINE_CWD_FILE="$home/cwd" \
+  ENGINE_HOME_FILE="$home/engine-home" ENGINE_STOP_FILE="$home/stopped" \
+  bash "$LAUNCHER" start >"$out_file" 2>&1
+if grep -q "apt-get install -y libx11-6" "$out_file"; then
+  pass "a missing shared library names the package that fixes it"
+else
+  fail "a loader error is not explained (output=$(tr '\n' ' ' < "$out_file"))"
+fi
+
 # Missing credentials must fail before the engine is executed.
 setup
 bin="$fakebin/aixodia-engine"

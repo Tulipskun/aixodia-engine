@@ -10,6 +10,14 @@ repository.workspace = true
 name = "aixodia-engine"
 path = "src/main.rs"
 
+[features]
+# The screen pane needs X11 linked into the binary, and a machine without those
+# libraries cannot load the engine at all — the terminal and the chat die with a
+# feature that machine could not have used anyway. Off, the same source builds a
+# program that mentions no X.
+default = ["screen"]
+screen = ["dep:aixodia-screen"]
+
 [dependencies]
 aixodia-net = { path = "../aixodia-net" }
 aixodia-state = { path = "../aixodia-state" }
@@ -23,7 +31,7 @@ aixodia-relay = { path = "../aixodia-relay" }
 aixodia-run = { path = "../aixodia-run" }
 aixodia-selfupdate = { path = "../aixodia-selfupdate" }
 aixodia-session = { path = "../aixodia-session" }
-aixodia-screen = { path = "../aixodia-screen" }
+aixodia-screen = { path = "../aixodia-screen", optional = true }
 aixodia-terminal = { path = "../aixodia-terminal" }
 aixodia-tools = { path = "../aixodia-tools" }
 anyhow.workspace = true

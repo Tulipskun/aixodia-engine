@@ -58,6 +58,10 @@ case "$os/$arch" in
 esac
 
 ENGINE_URL="https://github.com/$REPO_SLUG/releases/download/engine-latest/aixodia-engine-$PLATFORM"
+# The same engine with the screen pane left out. The pane links X libraries, and
+# a host without them cannot load the engine at all — the terminal and the chat
+# die over a tab that host could not have used anyway.
+ENGINE_URL_NOSCREEN="$ENGINE_URL-noscreen"
 CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-$PLATFORM"
 
 mkdir -p "$PREFIX"
@@ -75,7 +79,38 @@ fetch() {
   mv -f "$TMP/download" "$dest"
 }
 
+# engine_can_load <binary> — false when a shared library it needs is missing.
+engine_can_load() {
+  ! ldd "$1" 2>/dev/null | grep -q "not found"
+}
+
+# Installs the X libraries the screen pane links, if this host has a package
+# manager that knows them. Returns non-zero when it cannot.
+install_x_libraries() {
+  command -v apt-get >/dev/null 2>&1 || return 1
+  local attempt
+  for attempt in 1 2 3; do
+    if apt-get update -qq >/dev/null 2>&1 &&
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        libx11-6 libxext6 libxtst6 libxfixes3 >/dev/null 2>&1; then
+      return 0
+    fi
+    log "apt attempt $attempt for the X libraries failed; retrying in 5s"
+    sleep 5
+  done
+  return 1
+}
+
 fetch "$ENGINE_URL" "$PREFIX/aixodia-engine"
+if ! engine_can_load "$PREFIX/aixodia-engine"; then
+  log "the screen pane needs X libraries this host does not have"
+  if install_x_libraries && engine_can_load "$PREFIX/aixodia-engine"; then
+    log "installed the X libraries; the screen pane is available"
+  else
+    log "installing the build without the screen pane instead (terminal, chat and tunnel are unaffected)"
+    fetch "$ENGINE_URL_NOSCREEN" "$PREFIX/aixodia-engine"
+  fi
+fi
 fetch "$RAW_BASE/aixodia" "$PREFIX/aixodia"
 
 if command -v cloudflared >/dev/null 2>&1; then

@@ -62,3 +62,13 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -p aixodia-engine --bin aixodia-engine --no-deps -- -D warnings
+
+      # The pane is a feature so a machine without X can still run the engine.
+      # That promise is a property of the binary, so it is checked on the binary.
+      - name: The no-screen build needs no X
+        run: |
+          cargo build -p aixodia-engine --no-default-features
+          if ldd target/debug/aixodia-engine | grep -qE 'libX11|libXfixes|libXext'; then
+            echo "the no-screen build still links X" >&2
+            exit 1
+          fi
