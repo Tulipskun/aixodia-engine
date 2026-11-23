@@ -36,12 +36,15 @@ pub struct Now {
 ///
 /// A viewer wants to know whether a tap lands in something text can be typed
 /// into, because that is when the phone's keyboard belongs on screen. X tells
-/// us with the cursor: a widget that takes text sets an I-beam, and nothing
-/// else on the display is a glyph that is much taller than it is wide.
+/// us with the cursor: a widget that takes text sets an I-beam, and the arrow
+/// every other widget sets is a different glyph.
 ///
 /// Measured on this display, which has no cursor theme — so the names are all
-/// empty and the shape itself has to answer: the arrow is 24×24, the hourglass
-/// 16×16, and the I-beam an xterm asks for is 9×16.
+/// empty and the shape itself has to answer: the arrow is 24×24 with its hot
+/// spot at the tip, xterm's I-beam is 9×16, and Chromium's address bar, once it
+/// has the focus, is 24×24 — the same glyph drawn bigger. Size alone cannot
+/// separate those, which is why a pressed address bar used to leave the
+/// keyboard down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Text can be typed where the pointer is.
@@ -61,16 +64,62 @@ impl Role {
 
 impl Now {
     /// The role this shape plays.
-    ///
-    /// Three halves of the width is the line the I-beam crosses and an arrow
-    /// does not: 16 ≥ 13.5 for the I-beam, 24 < 36 for the arrow. A shape too
-    /// small to be either is left as a pointer rather than guessed at.
     pub fn role(&self) -> Role {
-        if self.height >= 12 && self.height * 2 >= self.width * 3 {
+        if self.is_a_bar() {
             Role::Text
         } else {
             Role::Pointer
         }
+    }
+
+    /// Whether the shape is an I-beam: a narrow stem with wider bars above and
+    /// below it, and the hot spot on the middle of the stem.
+    ///
+    /// Three things are true of an I-beam and false of an arrow, an hourglass
+    /// and a hand, whatever their size:
+    ///
+    /// * the hot spot — the pixel that types — is the glyph's middle, not a tip
+    ///   in a corner; the arrow's is three pixels in from the left and one down;
+    /// * the middle rows are the *narrowest*, at most two fifths of the width,
+    ///   and they are all the same width, because a stem is a stem and not a
+    ///   taper (an hourglass narrows row by row);
+    /// * the rows at the very top and bottom are at least twice as wide as the
+    ///   stem, which is the bar of the I.
+    fn is_a_bar(&self) -> bool {
+        let (width, height) = (self.width as usize, self.height as usize);
+        if width < 3 || height < 12 || self.rgba.len() != width * height * 4 {
+            return false;
+        }
+        let centre = |hot: u32, of: usize| (hot as usize) * 4 >= of && (hot as usize) * 2 <= of * 3;
+        if !centre(self.hot_x, width) || !centre(self.hot_y, height) {
+            return false;
+        }
+
+        // Opaque pixels in each row: alpha, not colour, because a cursor's
+        // colour says nothing about what it is.
+        let mut rows = vec![0usize; height];
+        for y in 0..height {
+            for x in 0..width {
+                if self.rgba[(y * width + x) * 4 + 3] >= 128 {
+                    rows[y] += 1;
+                }
+            }
+        }
+
+        let stem = &rows[height / 3..height * 2 / 3];
+        let stem_width = stem[0];
+        let uniform = stem.iter().all(|&row| row == stem_width);
+        if stem_width == 0 || stem_width * 5 > width * 2 || !uniform {
+            return false;
+        }
+
+        let bar = rows[..height / 6]
+            .iter()
+            .chain(&rows[height * 5 / 6..])
+            .copied()
+            .max()
+            .unwrap_or(0);
+        bar >= stem_width * 2
     }
 }
 
@@ -179,18 +228,138 @@ mod tests {
         }
     }
 
+    /// A cursor drawn from `#` and `.`, with its hot spot where it types.
+    fn drawn(art: &[&str], hot_x: u32, hot_y: u32) -> Now {
+        let height = art.len() as u32;
+        let width = art[0].chars().count() as u32;
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for (y, row) in art.iter().enumerate() {
+            for (x, cell) in row.chars().enumerate() {
+                if cell == '#' {
+                    let at = (y * width as usize + x) * 4;
+                    rgba[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+        }
+        Now {
+            serial: 1,
+            width,
+            height,
+            hot_x,
+            hot_y,
+            rgba,
+        }
+    }
+
+    /// The I-beam xterm asks for, read off the display at 9×16.
+    const XTERM_I_BEAM: [&str; 16] = [
+        "####.####",
+        "#########",
+        "#########",
+        "..#####..",
+        "...###...",
+        "...###...",
+        "...###...",
+        "...###...",
+        "...###...",
+        "...###...",
+        "...###...",
+        "...###...",
+        "..#####..",
+        "#########",
+        "#########",
+        "####.####",
+    ];
+
+    /// The I-beam Chromium's address bar shows once it has the focus, read off
+    /// the display at 24×24. Pressing the address bar is what this exists for:
+    /// the keyboard has to come up on the biggest text widget on the machine.
+    const CHROMIUM_I_BEAM: [&str; 24] = [
+        "........................",
+        "........................",
+        "......#########.........",
+        "......#########.........",
+        "......#########.........",
+        ".........####...........",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        ".........###............",
+        "......#########.........",
+        "......#########.........",
+        "......#########.........",
+        "........................",
+        "........................",
+    ];
+
     #[test]
     fn an_i_beam_is_text() {
-        // Measured on this display over an xterm.
-        assert_eq!(Role::Text, shape(9, 16).role());
+        assert_eq!(Role::Text, drawn(&XTERM_I_BEAM, 4, 8).role());
+        // The same glyph a size bigger, hot spot in the middle: this is the one
+        // whose miss left the keyboard down when a reader pressed an address bar.
+        assert_eq!(Role::Text, drawn(&CHROMIUM_I_BEAM, 11, 12).role());
     }
 
     #[test]
-    fn an_arrow_and_an_hourglass_are_not_text() {
-        assert_eq!(Role::Pointer, shape(24, 24).role());
-        assert_eq!(Role::Pointer, shape(16, 16).role());
-        // A hand over a link is square too.
-        assert_eq!(Role::Pointer, shape(24, 26).role());
+    fn an_arrow_is_not_text_however_large() {
+        // The arrow this display shows, 24×24, hot spot at its tip.
+        let arrow = [
+            "##......................",
+            "###.....................",
+            "####....................",
+            "#####...................",
+            "######..................",
+            "#######.................",
+            "########................",
+            "#########...............",
+            "##########..............",
+            "###########.............",
+            "############............",
+            "#####.......#...........",
+            "####.........#..........",
+            "###...........#.........",
+            "##.............#........",
+            "#...............#.......",
+            ".................#......",
+            ".................#......",
+            "..................#.....",
+            "..................#.....",
+            "...................#....",
+            "...................#....",
+            "....................#...",
+            "........................",
+        ];
+        assert_eq!(Role::Pointer, drawn(&arrow, 3, 1).role());
+    }
+
+    #[test]
+    fn an_hourglass_is_not_text() {
+        // A shape that also widens towards its ends, but tapers row by row:
+        // a stem is a stem, and an hourglass is not one.
+        let watch = [
+            "#########",
+            "#########",
+            ".#######.",
+            "..#####..",
+            "...###...",
+            "....#....",
+            "...###...",
+            "..#####..",
+            ".#######.",
+            "#########",
+            "#########",
+            "#########",
+        ];
+        assert_eq!(Role::Pointer, drawn(&watch, 4, 6).role());
     }
 
     #[test]
