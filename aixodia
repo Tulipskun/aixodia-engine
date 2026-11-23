@@ -10,6 +10,11 @@ PID_FILE="${AIXODIA_PID_FILE:-aixodia.pid}"
 LOG_FILE="${AIXODIA_LOG_FILE:-engine.log}"
 LOG_MAX_KB="${AIXODIA_LOG_MAX_KB:-8192}"
 START_WAIT="${AIXODIA_START_WAIT:-30}"
+# Set to 1 to keep `start` from installing anything: the screen pane's packages
+# are otherwise installed on the first start, the way cloudflared is at install
+# time, so a host that was rebuilt from a bare image still shows a desktop.
+# AIXODIA_SKIP_DEPENDENCIES=1
+#
 # The token and nothing else. Written with mode 600 by `autostart on` so the
 # engine can be started by something that did not inherit an exported CF_TOKEN.
 ENV_FILE="${AIXODIA_ENV_FILE:-$AIXODIA_HOME/cf.env}"
@@ -121,6 +126,71 @@ rotate_log() {
   echo "aixodia: rotated $file ($size bytes) to $file.1"
 }
 
+# What the desktop is made of, when it is made of packages.
+#
+# The engine links X for the screen pane — capture, input, the cursor — and the
+# strip along the bottom launches Xvfb, xterm and a browser. A host that has none
+# of them cannot show a desktop, and a host with no X libraries cannot even load
+# the engine. These are installed the first time the engine starts, exactly as
+# cloudflared is, and never asked about again: an install of something already
+# present costs one apt call and changes nothing.
+PANE_PACKAGES="libx11-6 libxext6 libxtst6 libxfixes3 xvfb xterm xfonts-base"
+
+# True when the binary's shared libraries are all present. A script has no
+# dynamic dependencies at all, which is why the test engines pass.
+engine_libraries_ok() {
+  ! ldd "$1" 2>/dev/null | grep -q "not found"
+}
+
+# A package manager this process may use, or nothing.
+package_installer() {
+  [ "${AIXODIA_SKIP_DEPENDENCIES:-0}" = "1" ] && return 1
+  if [ "$(id -u)" -eq 0 ]; then
+    command -v apt-get >/dev/null 2>&1 && { echo "apt-get|"; return 0; }
+    command -v apk >/dev/null 2>&1 && { echo "apk|"; return 0; }
+    command -v dnf >/dev/null 2>&1 && { echo "dnf|"; return 0; }
+    return 1
+  fi
+  # Not root: only an unattended sudo counts. A password prompt in a start
+  # command would hang whatever ran it.
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    command -v apt-get >/dev/null 2>&1 && { echo "sudo apt-get|"; return 0; }
+    command -v dnf >/dev/null 2>&1 && { echo "sudo dnf|"; return 0; }
+  fi
+  return 1
+}
+
+ensure_pane_packages() {
+  local missing="" installer="" attempt
+  engine_libraries_ok "$ENGINE_RESOLVED" || missing=" libraries"
+  command -v Xvfb >/dev/null 2>&1 || missing="$missing Xvfb"
+  command -v xterm >/dev/null 2>&1 || missing="$missing xterm"
+  [ -n "$missing" ] || return 0
+  if ! installer="$(package_installer)"; then
+    echo "aixodia: the screen pane needs$missing, and this host cannot install them." >&2
+    echo "aixodia: install them yourself (libx11-6 libxext6 libxtst6 libxfixes3 xvfb xterm)" >&2
+    return 0
+  fi
+  echo "aixodia: the screen pane needs$missing; installing $PANE_PACKAGES"
+  # shellcheck disable=SC2086
+  for attempt in 1 2 3; do
+    case "$installer" in
+      *apt-get*) ${installer%|*} update -qq >/dev/null 2>&1 || true
+                 DEBIAN_FRONTEND=noninteractive ${installer%|*} install -y -qq \
+                   $PANE_PACKAGES >/dev/null 2>&1 && break ;;
+      *apk*)     ${installer%|*} add --no-cache $PANE_PACKAGES >/dev/null 2>&1 && break ;;
+      *dnf*)     ${installer%|*} install -y -q $PANE_PACKAGES >/dev/null 2>&1 && break ;;
+    esac
+    echo "aixodia: install attempt $attempt failed; retrying" >&2
+    sleep 5
+  done
+  if engine_libraries_ok "$ENGINE_RESOLVED"; then
+    echo "aixodia: the screen pane's packages are in place"
+  else
+    echo "aixodia: the screen pane's libraries are still missing" >&2
+  fi
+}
+
 require_prerequisites() {
   load_env
   [ -n "${CF_TOKEN:-}" ] || die "CF_TOKEN is not set — export it, or run 'aixodia autostart on' while it is"
@@ -128,6 +198,7 @@ require_prerequisites() {
   command -v cloudflared >/dev/null 2>&1 || die "cloudflared not found in PATH — reinstall with the install script"
   mkdir -p "$AIXODIA_HOME" || die "cannot create $AIXODIA_HOME"
   export AIXODIA_HOME
+  ensure_pane_packages
 }
 
 cmd_start() {

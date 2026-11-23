@@ -84,6 +84,10 @@ wait_gone() {
   return 1
 }
 
+# The tests never install anything: `start` would otherwise reach for the package
+# manager, which is a different machine's business and not a test's.
+export AIXODIA_SKIP_DEPENDENCIES=1
+
 run_launcher() {
   CF_TOKEN=test-token HF_TOKEN=test-backup-token \
     AIXODIA_HOME="$home/state" AIXODIA_ENGINE_BIN="$bin" \
