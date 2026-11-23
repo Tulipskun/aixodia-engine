@@ -227,7 +227,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
             (token, url)
         }
         _ => {
-            let target = provision::Target::new(keys.name(), &provision::domain());
+            let target = provision::Target::new(keys.name(), provision::DOMAIN);
             tracing::info!(
                 tunnel = %target.tunnel,
                 host = %target.host,

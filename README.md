@@ -159,8 +159,7 @@ that name:
 answered and which keys belong to it. `auth/*`, `access/*`, `client/*` and
 `mcp/upstream` stay shared: they describe the deployment, not one machine.
 
-The deployment's domain is `aixodia.dpdns.org` unless `AIXODIA_DOMAIN` names
-another one the account's token may publish into. So a fresh host needs
+The deployment's domain is `aixodia.dpdns.org`. So a fresh host needs
 `CF_TOKEN` and nothing else: it registers itself under a name nothing else can
 have.
 

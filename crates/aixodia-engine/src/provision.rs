@@ -18,19 +18,12 @@ use serde_json::{json, Value};
 /// Where the tunnel's traffic goes: the engine's own listening port.
 pub const SERVICE: &str = "http://127.0.0.1:8787";
 
-/// The base domain a machine's hostname lives under, when nothing says otherwise.
-pub const DEFAULT_DOMAIN: &str = "aixodia.dpdns.org";
-
-/// `AIXODIA_DOMAIN`, when the operator set one. The deployment's domain is the
-/// only thing about a machine's address a person chooses, so it is the only
-/// thing beside its name that arrives from outside.
-pub fn domain() -> String {
-    std::env::var("AIXODIA_DOMAIN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_DOMAIN.to_string())
-}
+/// The base domain every machine's hostname lives under.
+///
+/// It is a constant, not a variable: an install reads `CF_TOKEN` and nothing
+/// else, and a machine that needed a second variable to get an address would be
+/// asking its operator the question this module exists to answer.
+pub const DOMAIN: &str = "aixodia.dpdns.org";
 
 /// What the engine needs before it can start cloudflared.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,9 +197,7 @@ async fn find_zone(db: &aixodia_db::Client, host: &str) -> anyhow::Result<ZoneRo
             return Ok(zone);
         }
     }
-    anyhow::bail!(
-        "no zone of this account contains {host}: set AIXODIA_DOMAIN to a domain it serves"
-    )
+    anyhow::bail!("no zone of this account contains {host}: the token cannot publish {DOMAIN}")
 }
 
 async fn tunnel_token(
@@ -314,8 +305,20 @@ mod tests {
     }
 
     #[test]
+    fn an_install_reads_one_variable() {
+        // The address a machine answers on is not configuration: it is its own
+        // name under the deployment's domain. Nothing here reads the environment
+        // except the token that pays for the call.
+        assert_eq!(DOMAIN, "aixodia.dpdns.org");
+        assert_eq!(
+            Target::new("m-900e51e3", DOMAIN).host,
+            "m-900e51e3.aixodia.dpdns.org"
+        );
+    }
+
+    #[test]
     fn a_target_names_one_tunnel_on_the_default_port() {
-        let target = Target::new("m-900e51e3", DEFAULT_DOMAIN);
+        let target = Target::new("m-900e51e3", DOMAIN);
         assert_eq!(target.tunnel, "m-900e51e3");
         assert_eq!(target.host, "m-900e51e3.aixodia.dpdns.org");
         assert_eq!(target.service, "http://127.0.0.1:8787");
