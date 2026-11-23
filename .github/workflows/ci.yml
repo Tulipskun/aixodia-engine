@@ -38,6 +38,12 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A new prefix empties the cache the X build left behind: a restored
+          # target directory still carried `-lX11 -lXext -lXtst` from the crate
+          # graph that no longer exists, and the link failed on a runner where
+          # those libraries are no longer installed.
+          prefix-key: v2-no-x
 
       - name: Install the C toolchain the bundled codecs build with
         run: |
