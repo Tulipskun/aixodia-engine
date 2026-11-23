@@ -16,6 +16,10 @@ fn main() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(40);
     let mut last: Option<u64> = None;
+    // A shape is easier to name from its picture than from its size: an I-beam
+    // and a hand can be the same number of pixels. `MAP=1` prints the alpha as a
+    // coarse grid so a rule about shapes can be argued from what X hands over.
+    let map = std::env::var("MAP").is_ok();
     for _ in 0..rounds {
         match input.cursor_shape() {
             Some(now) => {
@@ -25,6 +29,16 @@ fn main() {
                         "serial {} {}x{} hot {}x{} opaque pixels {}",
                         now.serial, now.width, now.height, now.hot_x, now.hot_y, opaque
                     );
+                    if map {
+                        for y in 0..now.height {
+                            let mut line = String::new();
+                            for x in 0..now.width {
+                                let i = ((y * now.width + x) * 4 + 3) as usize;
+                                line.push(if now.rgba[i] > 127 { '#' } else { '.' });
+                            }
+                            println!("{line}");
+                        }
+                    }
                     last = Some(now.serial);
                 }
             }

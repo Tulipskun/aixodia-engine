@@ -302,6 +302,10 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>, owner: u32) {
         // requests, so the request can arrive while there is no frame to apply it
         // to; without this it is dropped and the window lives at the placeholder.
         let mut pending: HashMap<xlib::Window, (i32, i32)> = HashMap::new();
+        // Passes of the loop between looks at the pointer, at 8 ms a pass: about a
+        // tenth of a second, which is shorter than the gap between a click and the
+        // first key of what is typed after it.
+        let mut tick: u64 = 0;
 
         // The desktop itself: the root painted, and the strip along the bottom.
         // Both are best-effort — a display that refuses them still streams, it
@@ -474,6 +478,16 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>, owner: u32) {
             if bar.as_ref().is_some_and(|strip| strip.clock_moved()) {
                 repaint_panel(display, &mut bar, &frames);
             }
+            // The keyboard follows the pointer, and the pointer has to be asked
+            // about: a press inside a client is handed to that client and never
+            // reaches this manager, and this server sends no enter event for a
+            // child to the root that asked for one — measured, neither arrives.
+            // A question on a slow clock is what is left, and one round trip a
+            // fifth of a second costs less than a keystroke in the wrong window.
+            tick += 1;
+            if tick % POINTER_CHECK_TICKS == 0 {
+                follow_pointer(display, root, &frames);
+            }
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
 
@@ -508,6 +522,9 @@ pub fn run(display_name: &str, stop: Arc<AtomicBool>, owner: u32) {
 fn alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
+
+/// Passes of the event loop between looks at where the pointer is.
+const POINTER_CHECK_TICKS: u64 = 12;
 
 /// `BadAccess`: the selection this manager needs is already somebody else's.
 const BAD_ACCESS: i32 = 10;
@@ -883,6 +900,80 @@ unsafe fn press(
             dy: event.y_root - attrs.y,
         }
     };
+}
+
+/// Gives the keyboard to the window the pointer is over, if it is one of ours.
+///
+/// The pointer can be over any depth of child — a client's own widgets are
+/// windows too — so the window it is over is walked up towards the root until it
+/// meets a frame this manager built. A pointer over the bare desktop changes
+/// nothing: there is nothing there to type into, and taking the keyboard away
+/// from the last window would make every click on the wallpaper a decision about
+/// where the next keystroke goes.
+unsafe fn follow_pointer(display: *mut xlib::Display, root: xlib::Window, frames: &[Frame]) {
+    let mut asked_root: xlib::Window = 0;
+    let mut child: xlib::Window = 0;
+    let (mut root_x, mut root_y, mut win_x, mut win_y) = (0, 0, 0, 0);
+    let mut mask = 0;
+    if xlib::XQueryPointer(
+        display,
+        root,
+        &mut asked_root,
+        &mut child,
+        &mut root_x,
+        &mut root_y,
+        &mut win_x,
+        &mut win_y,
+        &mut mask,
+    ) == 0
+    {
+        return;
+    }
+    let mut under = child;
+    // A handful of levels is every window manager's worth of nesting: deeper than
+    // that is a toolkit's business, and the walk stops long before the loop could
+    // spin on a tree that changed underneath it.
+    for _ in 0..8 {
+        if under == 0 || under == root {
+            return;
+        }
+        if let Some(frame) = frames
+            .iter()
+            .find(|f| f.frame == under || f.client == under)
+        {
+            let mut focused: xlib::Window = 0;
+            let mut revert = 0;
+            xlib::XGetInputFocus(display, &mut focused, &mut revert);
+            if focused != frame.client {
+                xlib::XSetInputFocus(
+                    display,
+                    frame.client,
+                    xlib::RevertToPointerRoot,
+                    xlib::CurrentTime,
+                );
+            }
+            return;
+        }
+        let mut query_root: xlib::Window = 0;
+        let mut parent: xlib::Window = 0;
+        let mut children: *mut xlib::Window = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        if xlib::XQueryTree(
+            display,
+            under,
+            &mut query_root,
+            &mut parent,
+            &mut children,
+            &mut count,
+        ) == 0
+        {
+            return;
+        }
+        if !children.is_null() {
+            xlib::XFree(children as *mut std::ffi::c_void);
+        }
+        under = parent;
+    }
 }
 
 unsafe fn motion(display: *mut xlib::Display, event: &xlib::XMotionEvent, frames: &mut [Frame]) {
