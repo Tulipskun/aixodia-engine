@@ -32,6 +32,48 @@ pub struct Now {
     pub rgba: Vec<u8>,
 }
 
+/// What the pointer is over, as far as its shape can say.
+///
+/// A viewer wants to know whether a tap lands in something text can be typed
+/// into, because that is when the phone's keyboard belongs on screen. X tells
+/// us with the cursor: a widget that takes text sets an I-beam, and nothing
+/// else on the display is a glyph that is much taller than it is wide.
+///
+/// Measured on this display, which has no cursor theme — so the names are all
+/// empty and the shape itself has to answer: the arrow is 24×24, the hourglass
+/// 16×16, and the I-beam an xterm asks for is 9×16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Text can be typed where the pointer is.
+    Text,
+    /// Anything else: an arrow, a hand, a watch.
+    Pointer,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Text => "text",
+            Role::Pointer => "pointer",
+        }
+    }
+}
+
+impl Now {
+    /// The role this shape plays.
+    ///
+    /// Three halves of the width is the line the I-beam crosses and an arrow
+    /// does not: 16 ≥ 13.5 for the I-beam, 24 < 36 for the arrow. A shape too
+    /// small to be either is left as a pointer rather than guessed at.
+    pub fn role(&self) -> Role {
+        if self.height >= 12 && self.height * 2 >= self.width * 3 {
+            Role::Text
+        } else {
+            Role::Pointer
+        }
+    }
+}
+
 /// Whether this display can report its cursor at all.
 ///
 /// XFixes is an extension: a display without it simply never changes the arrow,
@@ -125,6 +167,36 @@ pub fn straighten(argb: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shape(width: u32, height: u32) -> Now {
+        Now {
+            serial: 1,
+            width,
+            height,
+            hot_x: 0,
+            hot_y: 0,
+            rgba: vec![0; (width * height * 4) as usize],
+        }
+    }
+
+    #[test]
+    fn an_i_beam_is_text() {
+        // Measured on this display over an xterm.
+        assert_eq!(Role::Text, shape(9, 16).role());
+    }
+
+    #[test]
+    fn an_arrow_and_an_hourglass_are_not_text() {
+        assert_eq!(Role::Pointer, shape(24, 24).role());
+        assert_eq!(Role::Pointer, shape(16, 16).role());
+        // A hand over a link is square too.
+        assert_eq!(Role::Pointer, shape(24, 26).role());
+    }
+
+    #[test]
+    fn a_shape_with_no_size_is_not_text() {
+        assert_eq!(Role::Pointer, shape(0, 0).role());
+    }
 
     #[test]
     fn an_opaque_pixel_is_unchanged() {

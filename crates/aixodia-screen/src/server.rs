@@ -694,14 +694,7 @@ impl ScreenHub {
             return;
         }
         state.cursor_serial = Some(cursor.serial);
-        let message = serde_json::json!({
-            "type": "cursor",
-            "width": cursor.width,
-            "height": cursor.height,
-            "hot_x": cursor.hot_x,
-            "hot_y": cursor.hot_y,
-            "rgba": base64::engine::general_purpose::STANDARD.encode(&cursor.rgba),
-        });
+        let message = cursor_message(&cursor);
         let _ = self
             .frames
             .send(Arc::new(Message::Text(message.to_string().into())));
@@ -958,6 +951,26 @@ async fn socket(
     ws.on_upgrade(move |socket| connection(socket, hub))
 }
 
+/// The cursor, as a viewer reads it: its pixels, its hot spot, and what it says
+/// about the thing under the pointer.
+///
+/// One builder for both the first message of a connection and every change
+/// afterwards, so a viewer can never be told two different things about the
+/// same shape.
+fn cursor_message(cursor: &cursor::Now) -> serde_json::Value {
+    serde_json::json!({
+        "type": "cursor",
+        "width": cursor.width,
+        "height": cursor.height,
+        "hot_x": cursor.hot_x,
+        "hot_y": cursor.hot_y,
+        // Whether a tap here lands in something text can be typed into, which
+        // is what brings a phone's keyboard up — and puts it away again.
+        "role": cursor.role().as_str(),
+        "rgba": base64::engine::general_purpose::STANDARD.encode(&cursor.rgba),
+    })
+}
+
 /// One numeric query parameter, or `None` when it is missing or not a number.
 fn query_param(query: &str, name: &str) -> Option<u32> {
     query
@@ -1002,14 +1015,7 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
     // an arrow until the cursor happened to change, and a hand over a link can
     // stand still for a minute.
     if let Some(cursor) = hub.cursor_now() {
-        let message = serde_json::json!({
-            "type": "cursor",
-            "width": cursor.width,
-            "height": cursor.height,
-            "hot_x": cursor.hot_x,
-            "hot_y": cursor.hot_y,
-            "rgba": base64::engine::general_purpose::STANDARD.encode(&cursor.rgba),
-        });
+        let message = cursor_message(&cursor);
         if socket
             .send(Message::Text(message.to_string().into()))
             .await
