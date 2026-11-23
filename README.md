@@ -109,8 +109,8 @@ namespace `AIXODIA_CONFIG`:
 
 | Key | Purpose | Writes |
 |---|---|---|
-| `tunnel_token` | Cloudflare Named Tunnel connector token | Operator-managed |
-| `tunnel_url` | Stable public HTTPS hostname | Operator-managed |
+| `tunnel_token` | Cloudflare Named Tunnel connector token | Written on first start |
+| `tunnel_url` | Stable public HTTPS hostname | Written on first start |
 | `daemon/url` | Engine endpoint discovered by the phone | Only when changed |
 | `daemon/version` | Engine start/boot metadata used for uptime | Only when changed |
 | `auth/worker_url` | Auth Worker HTTPS base URL used to verify user tokens | Operator-managed |
@@ -122,12 +122,15 @@ namespace `AIXODIA_CONFIG`:
 | `mcp/upstream` | MCP upstream HTTPS URL; defaults to the built-in upstream when absent | Operator-managed |
 | `runtime/tmux_enabled` | Enable tmux terminal sessions (`true`/ `false`); defaults to enabled | Operator-managed |
 
-Create `AIXODIA_CONFIG` in Cloudflare Workers KV before starting the engine,
-then add `tunnel_token`, `tunnel_url`, and the authentication keys required by
-the sign-in flow. The engine never creates this
-sensitive namespace or overwrites those operator-managed values. It reads both
-at startup, starts `cloudflared tunnel run`, waits for an edge registration,
-and only then publishes `daemon/url`. There is no `daemon/heartbeat` key or
+Create `AIXODIA_CONFIG` in Cloudflare Workers KV before starting the engine and
+add the authentication keys the sign-in flow needs. The machine's own
+`tunnel_token` and `tunnel_url` are **made on first start**: the engine asks for
+a tunnel named after the machine, creates it when it is absent, points its
+ingress at `127.0.0.1:8787`, publishes `<name>.<domain>` as a proxied CNAME to
+the tunnel, and writes the two keys. Every step is a query before it is a write,
+so a machine that already has them changes nothing. It reads both at startup,
+starts `cloudflared tunnel run`, waits for an edge registration, and only then
+publishes `daemon/url`. There is no `daemon/heartbeat` key or
 heartbeat task. `daemon/url` is compared with its stored value before a write,
 so ordinary restarts do not write it again. `CF_TOKEN` needs D1 Edit and Workers
 KV read/write access; the Android client needs Workers KV read access.
@@ -155,6 +158,11 @@ that name:
 `/healthz` reports the name as `instance`, so an operator can see which machine
 answered and which keys belong to it. `auth/*`, `access/*`, `client/*` and
 `mcp/upstream` stay shared: they describe the deployment, not one machine.
+
+The deployment's domain is `aixodia.dpdns.org` unless `AIXODIA_DOMAIN` names
+another one the account's token may publish into. So a fresh host needs
+`CF_TOKEN` and nothing else: it registers itself under a name nothing else can
+have.
 
 An operator who wants a readable name in the public URL sets `AIXODIA_INSTANCE`
 (lower-case letters, digits and single hyphens, at most 32 characters). It is an

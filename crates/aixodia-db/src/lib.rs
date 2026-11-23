@@ -969,6 +969,55 @@ impl Client {
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str, cred: &str) -> Result<T> {
         self.get_page(path, cred).await.map(|(value, _)| value)
     }
+
+    /// A GET/POST/PUT whose answer this process reads as raw JSON.
+    ///
+    /// The Named Tunnel endpoints do not all answer with an envelope's `result`
+    /// of one shape — a token is a bare string, a configuration is an echo of
+    /// what was written — so the caller decides what the result is.
+    pub async fn api_call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let token = self.token();
+        if token.is_empty() || self.account_id().is_empty() {
+            return Err(Error::NotVerified);
+        }
+        let mut request = self
+            .inner
+            .http
+            .request(method.clone(), format!("{API_BASE}{path}"))
+            .headers(self.auth_headers(&token));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let raw = read_limited(response, 1 << 20).await?;
+        let envelope: ApiResponse = serde_json::from_slice(&raw).map_err(|e| Error::Decode {
+            what: path.to_string(),
+            source: e.into(),
+        })?;
+        if !(200..300).contains(&status) || !envelope.success {
+            return Err(api_error_message(
+                &format!("{method} {path}"),
+                status as i32,
+                &envelope.errors,
+            ));
+        }
+        Ok(envelope.result)
+    }
+
+    /// The account this process writes under, once `verify` has run.
+    pub fn account(&self) -> Result<String> {
+        let account = self.account_id();
+        if account.is_empty() {
+            return Err(Error::NotVerified);
+        }
+        Ok(account)
+    }
 }
 
 async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {

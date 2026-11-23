@@ -17,6 +17,10 @@
 //! An operator who wants a readable name in the public URL sets
 //! `AIXODIA_INSTANCE` (lower-case letters, digits, single hyphens). It is an
 //! override, never a requirement.
+//!
+//! The name is all this module decides. The tunnel and the hostname behind it
+//! are made by [`crate::provision`] on the first start, so a fresh host needs
+//! `CF_TOKEN` and nothing a person has to type.
 
 use anyhow::anyhow;
 

@@ -11,6 +11,7 @@ mod d1log;
 mod devices;
 mod handover;
 mod instance;
+mod provision;
 mod registry;
 mod screen;
 mod tunnel;
@@ -214,26 +215,32 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // current every minute so a token issued while this process was down still
     // works (see auth_system.md's sync rules).
     client_auth.spawn_sync_task();
-    let tunnel_token = db
-        .config_kv_get(&keys.key("tunnel_token"))
-        .await?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Workers KV key {} is missing or empty",
-                keys.key("tunnel_token")
-            )
-        })?;
-    let tunnel_url = db
-        .config_kv_get(&keys.key("tunnel_url"))
-        .await?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Workers KV key {} is missing or empty",
-                keys.key("tunnel_url")
-            )
-        })?;
+    // A machine's tunnel and hostname are its own to create. The first start on a
+    // fresh host used to fail here with a missing Workers KV key, which is a
+    // provisioning step dressed up as an error; now the missing keys are the
+    // reason to make them.
+    let (tunnel_token, tunnel_url) = match (
+        db.config_kv_get(&keys.key("tunnel_token")).await?,
+        db.config_kv_get(&keys.key("tunnel_url")).await?,
+    ) {
+        (Some(token), Some(url)) if !token.trim().is_empty() && !url.trim().is_empty() => {
+            (token, url)
+        }
+        _ => {
+            let target = provision::Target::new(keys.name(), &provision::domain());
+            tracing::info!(
+                tunnel = %target.tunnel,
+                host = %target.host,
+                "this machine has no tunnel yet; provisioning one"
+            );
+            let made = provision::ensure(&db, &target).await?;
+            db.config_kv_put(&keys.key("tunnel_token"), &made.token)
+                .await?;
+            db.config_kv_put(&keys.key("tunnel_url"), &made.url).await?;
+            tracing::info!(tunnel = %made.tunnel_id, url = %made.url, "tunnel provisioned");
+            (made.token, made.url)
+        }
+    };
     let parsed_tunnel_url = url::Url::parse(tunnel_url.trim()).map_err(|_| {
         anyhow::anyhow!(
             "Workers KV key {} is not a valid URL",
