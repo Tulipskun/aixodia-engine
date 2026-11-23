@@ -375,6 +375,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aixodia-wayland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "aixodia-wsock"
 version = "0.1.0"
 dependencies = [

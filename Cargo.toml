@@ -16,6 +16,7 @@ members = [
     "crates/aixodia-wsock",
     "crates/aixodia-terminal",
     "crates/aixodia-screen",
+    "crates/aixodia-wayland",
     "crates/aixodia-relay",
     "crates/aixodia-mobile",
     "crates/aixodia-selfupdate",
