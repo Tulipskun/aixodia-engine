@@ -600,7 +600,21 @@ async fn allowed_memory() -> Option<(u64, u64)> {
 /// every mount on the machine. When a container's storage is quota'd, statvfs
 /// reports the quota: the usable size, not the volume's.
 fn disk_usage() -> Option<(u64, u64)> {
-    let dir = aixodia_state::state_dir();
+    // The state directory may not exist yet on a first start; the filesystem it
+    // will live on is still the right answer, so the walk goes up until statvfs
+    // recognises a directory.
+    let mut dir = aixodia_state::state_dir();
+    loop {
+        if let Some(usage) = statvfs(&dir) {
+            return Some(usage);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn statvfs(dir: &std::path::Path) -> Option<(u64, u64)> {
     let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
     // SAFETY: `stat` is owned here and only written by statvfs, and the path is a
     // valid C string that outlives the call.
@@ -1236,9 +1250,21 @@ mod system_metrics_tests {
     }
 
     #[test]
-    fn the_disk_is_the_machines_real_root() {
-        let (used, total) = super::disk_usage().expect("statvfs on /");
-        assert!(total > 0, "a root filesystem has size");
+    fn the_disk_is_the_filesystem_the_engine_writes_to() {
+        let (used, total) = super::disk_usage().expect("statvfs on the state directory");
+        assert!(total > 0, "a filesystem has size");
         assert!(used <= total, "used {used} cannot exceed total {total}");
+    }
+
+    #[test]
+    fn a_state_directory_that_does_not_exist_yet_still_has_a_filesystem() {
+        // A first start: the walk finds the nearest directory that does exist,
+        // because that is the filesystem the state directory will be created on.
+        let missing = std::path::Path::new("/tmp/aixodia-not-created-yet/deeper");
+        assert_eq!(super::statvfs(missing), None);
+        assert!(
+            super::statvfs(std::path::Path::new("/tmp")).is_some(),
+            "the parent of a missing directory is the answer"
+        );
     }
 }
