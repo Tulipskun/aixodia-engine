@@ -547,6 +547,7 @@ async fn healthz(State(g): State<Arc<Gateway>>) -> Response {
             "update": "signal:USR1",
             "idle": idle,
             "cpu_percent": metrics.cpu_percent,
+            "cpu_cores": metrics.cpu_cores,
             "memory_used_bytes": metrics.memory_used_bytes,
             "memory_total_bytes": metrics.memory_total_bytes,
             "memory_percent": metrics.memory_percent,
@@ -563,6 +564,10 @@ async fn healthz(State(g): State<Arc<Gateway>>) -> Response {
 #[derive(Debug, Default)]
 struct SystemMetrics {
     cpu_percent: Option<f64>,
+    /// The cores the percentage is a share of: the cgroup quota when there is
+    /// one, else the machine's own. A card that says "12 %" without saying of
+    /// what is a number nobody can act on.
+    cpu_cores: Option<f64>,
     memory_used_bytes: Option<u64>,
     memory_total_bytes: Option<u64>,
     memory_percent: Option<f64>,
@@ -805,8 +810,10 @@ async fn sample_cpu_from_proc(cores: f64) -> Option<f64> {
 }
 
 async fn system_metrics() -> SystemMetrics {
+    let cores = usable_cores().await;
     let mut metrics = SystemMetrics {
         cpu_percent: cpu_percent(),
+        cpu_cores: Some(cores),
         ..SystemMetrics::default()
     };
 
