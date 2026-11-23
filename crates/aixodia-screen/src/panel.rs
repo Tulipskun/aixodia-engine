@@ -11,6 +11,7 @@
 //! adopted itself into a frame with a title bar would be a comedy of errors — and
 //! it lives as long as the manager does.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use x11::xlib;
@@ -267,9 +268,82 @@ pub fn shorten(title: &str, limit: usize) -> String {
     }
 }
 
+/// Whether the process that wrote a Chrome profile lock is gone.
+///
+/// Chrome's lock is a symlink whose target is `<hostname>-<pid>`. A lock left by
+/// a machine that no longer exists, or by a pid that is not running, is stale:
+/// nothing is holding the profile and Chrome would still refuse to start.
+fn lock_is_stale(target: &str, host: &str, alive: impl Fn(u32) -> bool) -> bool {
+    let Some((holder, pid)) = target.rsplit_once('-') else {
+        // A lock that is not a host and a pid is not one this can judge.
+        return false;
+    };
+    if holder != host {
+        return true;
+    }
+    match pid.parse::<u32>() {
+        Ok(pid) => !alive(pid),
+        Err(_) => false,
+    }
+}
+
+/// Removes the profile locks a dead Chrome left behind.
+///
+/// The three links Chrome writes are removed together: a leftover socket or
+/// cookie with no lock makes Chrome fail in a different way.
+fn clear_stale_lock() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let profile = Path::new(&home).join(".config/google-chrome");
+    let lock = profile.join("SingletonLock");
+    let Ok(target) = std::fs::read_link(&lock) else {
+        return;
+    };
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default();
+    let stale = lock_is_stale(&target.to_string_lossy(), &host, |pid| {
+        Path::new(&format!("/proc/{pid}")).exists()
+    });
+    if !stale {
+        return;
+    }
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let _ = std::fs::remove_file(profile.join(name));
+    }
+    tracing::info!("browser: cleared a lock left by a Chrome that is gone ({target:?})");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lock_from_a_machine_that_is_gone_is_stale() {
+        // Measured after a container was recreated: the old hostname, a pid that
+        // cannot exist here, and Chrome refusing to start.
+        assert!(lock_is_stale("7d167a919da1-361937", "0f5fe2a9b582", |_| {
+            true
+        }));
+    }
+
+    #[test]
+    fn a_lock_from_a_dead_pid_on_this_machine_is_stale() {
+        assert!(lock_is_stale("box-4242", "box", |pid| pid != 4242));
+    }
+
+    #[test]
+    fn a_live_chrome_keeps_its_lock() {
+        // Taking the lock from a running Chrome would let two of them corrupt the
+        // profile, which is worse than not starting.
+        assert!(!lock_is_stale("box-4242", "box", |pid| pid == 4242));
+    }
+
+    #[test]
+    fn a_lock_that_is_not_a_host_and_a_pid_is_left_alone() {
+        assert!(!lock_is_stale("nonsense", "box", |_| false));
+    }
 
     #[test]
     fn a_short_title_is_kept_as_it_is() {
@@ -337,14 +411,18 @@ pub fn launch(program: &str, display_name: &str) {
                 "--window-position=40,40",
             ],
         ),
-        // A core font and an explicit geometry: `-fa` needs fontconfig, and
-        // without a usable font xterm opens at a handful of pixels, which is a
-        // window nobody can use on a phone.
+        // A fontconfig family rather than a core font: `-fn fixed` needs an X
+        // font path that a bare Xvfb does not have, and asking for it makes
+        // xterm exit without a word — measured here, where `-fn fixed` produced
+        // no window and no error at all. `-fa` goes through fontconfig, which
+        // resolves the alias to whatever monospace the machine has.
         _ => (
             "xterm",
             vec![
-                "-fn",
-                "fixed",
+                "-fa",
+                "monospace",
+                "-fs",
+                "12",
                 "-geometry",
                 "100x28+24+24",
                 "-bg",
@@ -354,6 +432,15 @@ pub fn launch(program: &str, display_name: &str) {
             ],
         ),
     };
+    if binary == "chromium" {
+        // Chrome refuses to start while its profile says it is in use, and the
+        // lock that says so outlives the Chrome that wrote it: measured after a
+        // container restart, every launch from the strip died with "The profile
+        // appears to be in use by another Google Chrome process (361937) on
+        // another computer (7d167a919da1)" and the browser could not be opened
+        // at all until the lock was removed by hand.
+        clear_stale_lock();
+    }
     let started = Command::new(binary)
         .args(args)
         .env("DISPLAY", display_name)
