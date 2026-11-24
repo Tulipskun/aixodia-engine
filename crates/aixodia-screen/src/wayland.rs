@@ -62,7 +62,65 @@ pub fn shared(width: u32, height: u32) -> Result<Arc<Pane>, ScreenError> {
     if program != "none" {
         crate::launch::launch_in_compositor(program, pane.dir(), SOCKET);
     }
+    // Two things keep the desktop from being an empty rectangle: a browser that
+    // exits is started again, and the launcher tile drawn on the desktop starts
+    // one when there is none.
+    let (asked, requests) = std::sync::mpsc::channel();
+    {
+        let mut compositor = pane.compositor.lock().unwrap_or_else(|e| e.into_inner());
+        compositor.set_launcher(asked);
+    }
+    let watched = Arc::clone(&pane);
+    std::thread::Builder::new()
+        .name("aixodia-desktop".into())
+        .spawn(move || watch_desktop(&watched, requests))
+        .map_err(|e| ScreenError::Open(format!("cannot watch the desktop: {e}")))?;
     Ok(pane)
+}
+
+/// Keeps the desktop furnished: a launcher click starts a browser, and a browser
+/// that is gone with nothing on screen is started again.
+///
+/// The wait between attempts grows, because a browser that dies on the first
+/// keystroke would otherwise be restarted in a tight loop; and a relaunch never
+/// happens while a window is showing, so a browser the viewer closed by hand is
+/// not brought back from under them.
+fn watch_desktop(pane: &Pane, requests: std::sync::mpsc::Receiver<()>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut wait = std::time::Duration::from_secs(2);
+    loop {
+        let asked = match requests.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(()) => true,
+            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        if asked {
+            // A browser that is already there is the answer to a launcher click:
+            // a second one would share the profile and corrupt it.
+            if crate::launch::browser_running() || pane.shown_windows() > 0 {
+                tracing::info!("desktop: the launcher was clicked; a browser is already open");
+                continue;
+            }
+            tracing::info!("desktop: the launcher was clicked; opening a browser");
+            crate::launch::launch_in_compositor("browser", pane.dir(), SOCKET);
+            wait = std::time::Duration::from_secs(2);
+            continue;
+        }
+        if crate::launch::browser_running() || pane.shown_windows() > 0 {
+            wait = std::time::Duration::from_secs(2);
+            continue;
+        }
+        std::thread::sleep(wait);
+        if crate::launch::browser_running() || pane.shown_windows() > 0 {
+            continue;
+        }
+        tracing::info!(
+            "desktop: nothing is open and the browser is gone; starting it again in {}s",
+            wait.as_secs()
+        );
+        crate::launch::launch_in_compositor("browser", pane.dir(), SOCKET);
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
 }
 
 /// A display of our own: the compositor, and the frame it has just composited.
@@ -156,6 +214,20 @@ impl Pane {
     /// The directory a launched program must be given as `XDG_RUNTIME_DIR`.
     pub fn dir(&self) -> &PathBuf {
         &self.dir
+    }
+
+    /// How many windows the compositor is actually showing.
+    ///
+    /// A window that has been created but never confirmed by its client is not
+    /// showing, so this is what is on the picture, not what was asked for.
+    pub fn shown_windows(&self) -> usize {
+        let compositor = self.compositor.lock().unwrap_or_else(|e| e.into_inner());
+        compositor
+            .state
+            .arrangement()
+            .iter()
+            .filter(|(_, _, _, _, shown)| *shown)
+            .count()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Compositor> {

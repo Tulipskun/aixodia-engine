@@ -239,6 +239,12 @@ impl Writer {
 
     /// Attaches an fd to this message. The caller keeps ownership of it; the
     /// send duplicates it into the socket.
+    ///
+    /// An fd takes a place in the message's signature and **no space in its
+    /// body**: the four bytes some protocol descriptions promise are not read by
+    /// libwayland, and writing them shifts every argument after the fd by one.
+    /// Measured both ways against libwayland-client — with the extra bytes a
+    /// `wl_keyboard.keymap` of 195 bytes was read as a keymap of zero.
     pub fn fd(mut self, fd: i32) -> Self {
         self.fds.push(fd);
         self
@@ -278,6 +284,24 @@ mod tests {
         assert_eq!(taken.opcode, 3);
         let mut args = Args::new(taken.body);
         assert_eq!(args.uint(), 0x11223344);
+        assert!(args.finished());
+    }
+
+    #[test]
+    fn a_file_descriptor_travels_beside_the_body_and_not_in_it() {
+        // wl_keyboard.keymap is (format, fd, size). Measured against
+        // libwayland-client reading a real compositor's message: the fd takes a
+        // place in the signature but *no space in the body*. Three uints of body
+        // there and the client reads the size out of the wrong place — a keymap
+        // of zero bytes, and the client's keyboard state never comes up.
+        let message = Writer::new(21, 0).uint(1).fd(9).uint(1024).finish();
+        assert_eq!(message.bytes().len(), 16, "header, the format and the size");
+        assert_eq!(message.fds, vec![9]);
+        let (taken, used) = take(message.bytes()).unwrap().unwrap();
+        assert_eq!(used, 16);
+        let mut args = Args::new(taken.body);
+        assert_eq!(args.uint(), 1, "the format");
+        assert_eq!(args.uint(), 1024, "the size lands where the client looks");
         assert!(args.finished());
     }
 

@@ -76,6 +76,9 @@ pub enum Object {
         /// True between `enable` and `disable`: the client has a text field
         /// waiting for characters.
         enabled: bool,
+        /// The surface this input method was last told it was over, so `enter`
+        /// and `leave` are said once each and not once per commit.
+        told: Option<u32>,
     },
 }
 
@@ -247,6 +250,10 @@ pub struct State {
     /// When the compositor started, for the time field of input events.
     started: std::time::Instant,
     pub configures: u64,
+    /// Where a click on the desktop's own launcher is announced. The compositor
+    /// draws the tile; what it opens is not the compositor's to know — the pane
+    /// that owns this display listens here and starts the program.
+    pub launcher: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl State {
@@ -270,6 +277,7 @@ impl State {
             commits: 0,
             started: std::time::Instant::now(),
             configures: 0,
+            launcher: None,
         }
     }
 
@@ -620,7 +628,14 @@ impl State {
             // and this compositor dropped it for asking.
             (Interface::TextInputManager, 1) => {
                 let text_input = Args::new(body).new_id();
-                self.insert(index, text_input, Object::TextInput { enabled: false });
+                self.insert(
+                    index,
+                    text_input,
+                    Object::TextInput {
+                        enabled: false,
+                        told: None,
+                    },
+                );
             }
             (Interface::TextInputManager, 0) => {
                 self.clients[index].objects.remove(&object);
@@ -634,7 +649,7 @@ impl State {
                     // enable and disable
                     1 | 2 => {
                         let enabled = opcode == 1;
-                        if let Some(Object::TextInput { enabled: slot }) =
+                        if let Some(Object::TextInput { enabled: slot, .. }) =
                             self.clients[index].objects.get_mut(&object)
                         {
                             *slot = enabled;
@@ -1199,14 +1214,20 @@ impl State {
 
     /// Tells an input method what it needs to know and nothing more.
     ///
-    /// The protocol wants `enter` and then a `done` with a serial, once per
+    /// The protocol wants `enter` once when the text field gains focus and
+    /// `leave` once when it loses it, and a `done` with a serial for every
     /// commit; a client waiting for `done` never shows its preedit or its caret.
-    /// Nothing is committed back: characters arrive as keys.
+    /// Saying `enter` again on every commit is not the protocol, and measured on
+    /// chromium 158 it is fatal: the browser's own log said "Unknown surrounding
+    /// text update is found" and the next keystroke was a null pointer. Nothing
+    /// is committed back: characters arrive as keys.
     fn text_input_commit(&mut self, index: usize, text_input: u32) -> std::io::Result<()> {
-        let enabled = matches!(
-            self.clients[index].objects.get(&text_input),
-            Some(Object::TextInput { enabled: true })
-        );
+        let Some(Object::TextInput { enabled, told }) =
+            self.clients[index].objects.get(&text_input)
+        else {
+            return Ok(());
+        };
+        let (enabled, told) = (*enabled, *told);
         let focus = self
             .keyboard_focus
             .filter(|(client, _)| *client == index)
@@ -1215,18 +1236,25 @@ impl State {
         // one, unlike v1's. Measured by libwayland's own words, "message too short,
         // object (18), message leave(o)" — a client told with an empty event reads
         // the next message's bytes as a surface.
-        match (enabled, focus) {
-            (true, Some(surface)) => {
-                self.send(index, Writer::new(text_input, 0).object(surface).finish())?;
+        let wanted = if enabled { focus } else { None };
+        if wanted != told {
+            match (wanted, told) {
+                (Some(surface), _) => {
+                    self.send(index, Writer::new(text_input, 0).object(surface).finish())?;
+                }
+                (None, Some(was)) => {
+                    self.send(index, Writer::new(text_input, 1).object(was).finish())?;
+                }
+                (None, None) => {}
             }
-            (_, Some(surface)) => {
-                self.send(index, Writer::new(text_input, 1).object(surface).finish())?;
+            if let Some(Object::TextInput { told: slot, .. }) =
+                self.clients[index].objects.get_mut(&text_input)
+            {
+                *slot = wanted;
             }
-            (_, None) => {}
         }
         let serial = self.next_serial();
-        self.send(index, Writer::new(text_input, 5).uint(serial).finish())?;
-        Ok(())
+        self.send(index, Writer::new(text_input, 5).uint(serial).finish())
     }
 
     /// Releases the buffers freed this turn, now that the client's own requests
@@ -1307,7 +1335,7 @@ impl State {
 
     /// Draws every mapped window into the frame, bottom first.
     pub fn compose(&mut self) {
-        self.frame.fill(0xff10_1a2b);
+        crate::desktop::draw(&mut self.frame, self.width, self.height);
         for index in 0..self.windows.len() {
             let window = self.windows[index].clone();
             if !window.mapped {
@@ -1484,7 +1512,19 @@ impl State {
     }
 
     /// A button, at the pointer's position.
+    ///
+    /// A press on the desktop's launcher belongs to no client: it is answered
+    /// here, by telling whoever owns this display to start a program. It is only
+    /// the press that counts, so a click is one launch and not two.
     pub fn pointer_button(&mut self, button: u32, pressed: bool) -> std::io::Result<()> {
+        if pressed
+            && crate::desktop::contains(self.pointer.x, self.pointer.y, self.width, self.height)
+        {
+            if let Some(launcher) = self.launcher.as_ref() {
+                let _ = launcher.send(());
+            }
+            return Ok(());
+        }
         let Some((client, _surface)) = self.pointer.over else {
             return Ok(());
         };

@@ -20,6 +20,7 @@
 //! * `shm` — the client's shared-memory pool, mapped and blitted.
 //! * `keymap` — the xkb keymap a keyboard is sent, so typing produces text.
 
+pub mod desktop;
 pub mod keymap;
 pub mod protocol;
 pub mod server;
@@ -59,6 +60,12 @@ impl Compositor {
 
     pub fn path(&self) -> &Path {
         self.server.path()
+    }
+
+    /// Where a click on the desktop's launcher is announced. The tile is drawn
+    /// here; the program it opens is started by the pane that owns the display.
+    pub fn set_launcher(&mut self, launcher: std::sync::mpsc::Sender<()>) {
+        self.state.launcher = Some(launcher);
     }
 
     pub fn size(&self) -> (u32, u32) {
