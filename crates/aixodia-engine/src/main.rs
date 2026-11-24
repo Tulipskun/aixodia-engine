@@ -15,6 +15,7 @@ mod provision;
 mod registry;
 mod screen;
 mod tunnel;
+mod update_api;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -430,13 +431,19 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // instead of being told the engine holds nothing.
     terminal.resume();
 
+    // The phone can ask for an update but cannot signal this process, so
+    // `POST /api/update` wakes the install loop through this instead of the
+    // loop waiting out its tick after a button press.
+    let update_wake = Arc::new(tokio::sync::Notify::new());
+
     // The relay dispatches rpc frames through this in-process mux, exactly as
     // the phone's direct HTTP calls reach the same routes.
     let rpc = gateway
         .router()
         .merge(aixodia_run::router(runs.clone()))
         .merge(screen::router(screen.clone()))
-        .merge(terminal.router());
+        .merge(terminal.router())
+        .merge(update_api::router(update_wake.clone()));
     let relay_cfg = Arc::new(aixodia_relay::Config {
         token: token.clone(),
         api_token: token.clone(),
@@ -458,6 +465,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         .merge(screen::router(screen.clone()))
         .merge(terminal.router())
         .merge(aixodia_relay::router(relay_cfg))
+        .merge(update_api::router(update_wake.clone()))
         .merge(client_auth.router())
         .merge(devices::Devices::new(db.clone()).await?.router())
         .route(
@@ -558,6 +566,7 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
     // got no answer and the screen read that as the engine being gone.
     let update_idle = idle.clone();
     let _update = selfupdate::notify_update(idle);
+    let update_loop_wake = update_wake.clone();
     let _update_loop = tokio::spawn(async move {
         // A request queued while a chat was in flight has to get its moment:
         // nothing else calls `apply_pending` except the end of a chat, and a
@@ -566,7 +575,12 @@ async fn run(cancel: CancellationToken) -> anyhow::Result<()> {
         // exists, so an idle install is still driven by `aixodia update` and
         // never by the clock.
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            // Either the clock, or a phone that has just asked for an update and
+            // should not have to wait out the rest of a tick for it.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = update_loop_wake.notified() => {}
+            }
             if selfupdate::is_pending() && update_idle() {
                 selfupdate::apply_pending().await;
             }
