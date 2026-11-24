@@ -1186,6 +1186,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cursor_shape_says_where_it_was_read() {
+        // The phone drew an I-beam over a tab strip because the shape arrived
+        // without the place it belonged to, and the client put it wherever its
+        // own arrow happened to be. The two numbers are what stop that.
+        let shape = cursor::Now {
+            serial: 7,
+            width: 9,
+            height: 16,
+            hot_x: 4,
+            hot_y: 8,
+            rgba: vec![0; 9 * 16 * 4],
+        };
+        let message = cursor_message(&shape, Some((120, 40)));
+        assert_eq!(message["x"], serde_json::json!(120));
+        assert_eq!(message["y"], serde_json::json!(40));
+        // An unreadable pointer is not a place of zero zero: a client that read
+        // that would draw every cursor in the corner.
+        let unknown = cursor_message(&shape, None);
+        assert!(unknown["x"].is_null());
+        assert!(unknown["y"].is_null());
+    }
+
+    #[test]
     fn a_wheel_notch_says_which_way_it_turns() {
         // Two fingers moving sideways must arrive as a horizontal notch: X
         // reports it on buttons 6 and 7, and a vertical button there would
