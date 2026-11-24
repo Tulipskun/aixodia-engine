@@ -573,6 +573,34 @@ mod tests {
     }
 
     #[test]
+    fn a_pointer_event_is_spoken_in_the_window_s_own_coordinates() {
+        // Measured on the engine's desktop: Chrome sat at (40, 40) and the app
+        // drew an I-beam over the tab strip while Chrome highlighted the omnibox
+        // and every click landed 40 pixels down and right. `wl_pointer.motion`
+        // names a point inside the surface the pointer is over, not a point on
+        // the screen, so a window that is not at the origin must be told its own
+        // coordinates.
+        let (mut compositor, theirs) = with_input(128);
+        let window = compositor.state.windows.first_mut().unwrap();
+        window.x = 16;
+        window.y = 24;
+        compositor.pointer_motion(40.0, 60.0).unwrap();
+        let mut motion = None;
+        while let Some((object, opcode, body)) = next_message(&theirs) {
+            if object == 20 && opcode == 2 {
+                let mut args = Args::new(&body);
+                let _serial = args.uint();
+                motion = Some((args.fixed(), args.fixed()));
+            }
+        }
+        let (x, y) = motion.expect("the pointer said it moved");
+        assert!(
+            (x - 24.0).abs() < 0.01 && (y - 36.0).abs() < 0.01,
+            "a window at (16, 24) was told {x}, {y} for a desktop point at 40, 60"
+        );
+    }
+
+    #[test]
     fn shift_is_reported_as_the_modifier_the_keymap_binds() {
         let (mut compositor, theirs) = with_input(128);
         compositor.pointer_motion(10.0, 10.0).unwrap();

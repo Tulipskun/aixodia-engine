@@ -453,7 +453,8 @@ impl State {
                 if let Some((client, surface)) = self.pointer.over {
                     if client == index {
                         let serial = self.next_serial();
-                        let (x, y) = (self.pointer.x, self.pointer.y);
+                        let (origin_x, origin_y) = self.surface_origin(client, surface);
+                        let (x, y) = (self.pointer.x - origin_x, self.pointer.y - origin_y);
                         self.send(
                             index,
                             Writer::new(pointer, 0)
@@ -1401,6 +1402,33 @@ impl State {
         None
     }
 
+    /// Where a surface's own (0, 0) sits on the desktop.
+    ///
+    /// A pointer event is spoken in the coordinates of the surface it lands on,
+    /// not of the screen: a client draws its own window and knows nothing about
+    /// where the compositor put it. Sending desktop coordinates to a window at
+    /// (40, 40) told Chrome the pointer was 40 pixels right and 40 below where
+    /// it was — it hovered the omnibox while the arrow was on the tab strip, and
+    /// every click landed in the wrong place. A window at (0, 0) hides the bug,
+    /// which is why only an inset window showed it.
+    fn surface_origin(&self, client: usize, surface: u32) -> (f64, f64) {
+        if let Some(window) = self
+            .windows
+            .iter()
+            .find(|window| window.client == client && window.surface == surface)
+        {
+            return (window.x as f64, window.y as f64);
+        }
+        if let Some(popup) = self
+            .popups
+            .iter()
+            .find(|popup| popup.client == client && popup.surface == surface)
+        {
+            return (popup.x as f64, popup.y as f64);
+        }
+        (0.0, 0.0)
+    }
+
     /// Moves the pointer and tells whichever surface it is over.
     pub fn pointer_motion(&mut self, x: f64, y: f64) -> std::io::Result<()> {
         self.pointer.x = x.clamp(0.0, self.width.saturating_sub(1) as f64);
@@ -1423,7 +1451,8 @@ impl State {
             if let Some((client, surface)) = over {
                 if let Some(pointer) = self.pointer_id(client) {
                     let serial = self.next_serial();
-                    let (px, py) = (self.pointer.x, self.pointer.y);
+                    let (origin_x, origin_y) = self.surface_origin(client, surface);
+                    let (px, py) = (self.pointer.x - origin_x, self.pointer.y - origin_y);
                     self.send(
                         client,
                         Writer::new(pointer, 0)
@@ -1440,9 +1469,10 @@ impl State {
             // keyboard as well, or it types into a window nobody is looking at.
             self.set_keyboard_focus(over)?;
         }
-        if let Some((client, _surface)) = over {
+        if let Some((client, surface)) = over {
             if let Some(pointer) = self.pointer_id(client) {
-                let (px, py) = (self.pointer.x, self.pointer.y);
+                let (origin_x, origin_y) = self.surface_origin(client, surface);
+                let (px, py) = (self.pointer.x - origin_x, self.pointer.y - origin_y);
                 self.send(
                     client,
                     Writer::new(pointer, 2).uint(0).fixed(px).fixed(py).finish(),
