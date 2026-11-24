@@ -124,10 +124,17 @@ impl Compositor {
         // windows.
         let mut gone = Vec::new();
         for index in 0..self.state.clients.len() {
-            let alive = self.state.clients[index].client.fill()?;
-            if !alive {
-                gone.push(index);
-                continue;
+            match self.state.clients[index].client.fill() {
+                Ok(true) => {}
+                Ok(false) => {
+                    gone.push(index);
+                    continue;
+                }
+                Err(err) => {
+                    tracing::info!("wayland: dropping a client after a read error: {err}");
+                    gone.push(index);
+                    continue;
+                }
             }
             if let Err(err) = self.state.handle_client(index) {
                 tracing::info!("wayland: dropping a client: {err}");
@@ -722,5 +729,39 @@ mod tests {
         compositor.pointer_motion(60.0, 60.0).unwrap();
         assert_eq!(compositor.state.pointer.over, None);
         drop(theirs);
+    }
+
+    #[test]
+    fn a_reset_client_is_dropped_without_stopping_the_compositor() {
+        let (mut compositor, theirs) = setup(8);
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                theirs.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "SO_LINGER must be available for the reset test");
+        drop(theirs);
+
+        assert!(
+            compositor.pump_ready().is_ok(),
+            "one reset client must not stop the compositor"
+        );
+        assert!(
+            compositor.state.clients.is_empty(),
+            "the reset client must be removed"
+        );
+
+        let (next, _peer) = UnixStream::pair().unwrap();
+        compositor.adopt(next).unwrap();
+        assert!(compositor.pump_ready().is_ok());
+        assert_eq!(compositor.state.clients.len(), 1);
     }
 }

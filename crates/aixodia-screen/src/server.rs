@@ -141,6 +141,10 @@ struct FrameState {
     cursor_serial: Option<u64>,
     /// When the shape was last looked at.
     cursor_checked: Option<std::time::Instant>,
+    /// The pixels the frames are being scaled to, so a cursor's place can be
+    /// said in the same pixels as the picture the client is looking at.
+    frame_width: u32,
+    frame_height: u32,
     /// Frames encoded since the last keyframe.
     ///
     /// A client that joins mid-stream has no earlier frame to predict from, and
@@ -159,6 +163,8 @@ impl FrameState {
             h264_keyframe_due: true,
             cursor_serial: None,
             cursor_checked: None,
+            frame_width: 0,
+            frame_height: 0,
             since_keyframe: 0,
         }
     }
@@ -510,6 +516,10 @@ impl ScreenHub {
         };
 
         let settings = self.settings_now();
+        // Remembered so the cursor's own message can be said in the same pixels
+        // as the picture this client is looking at.
+        state.frame_width = width;
+        state.frame_height = height;
         if settings.codec == Codec::H264 {
             return self.send_h264(&frame, width, height, state);
         }
@@ -691,7 +701,12 @@ impl ScreenHub {
             return;
         }
         state.cursor_serial = Some(cursor.serial);
-        let message = cursor_message(&cursor);
+        // The shape and its place travel together. A client that draws the shape
+        // at a place of its own making puts an I-beam over a tab strip: the shape
+        // is the machine's, the place was the client's, and the two were read at
+        // different moments.
+        let at = self.cursor_in(state.frame_width, state.frame_height);
+        let message = cursor_message(&cursor, at);
         let _ = self
             .frames
             .send(Arc::new(Message::Text(message.to_string().into())));
@@ -951,13 +966,17 @@ async fn socket(
 /// One builder for both the first message of a connection and every change
 /// afterwards, so a viewer can never be told two different things about the
 /// same shape.
-fn cursor_message(cursor: &cursor::Now) -> serde_json::Value {
+fn cursor_message(cursor: &cursor::Now, at: Option<(i32, i32)>) -> serde_json::Value {
     serde_json::json!({
         "type": "cursor",
         "width": cursor.width,
         "height": cursor.height,
         "hot_x": cursor.hot_x,
         "hot_y": cursor.hot_y,
+        // Where the pointer was when this shape was read, in the picture's own
+        // pixels. Without it the shape is an answer with no question.
+        "x": at.map(|(x, _)| x),
+        "y": at.map(|(_, y)| y),
         // Whether a tap here lands in something text can be typed into, which
         // is what brings a phone's keyboard up — and puts it away again.
         "role": cursor.role().as_str(),
@@ -1009,7 +1028,9 @@ async fn connection(mut socket: WebSocket, hub: Arc<ScreenHub>) {
     // an arrow until the cursor happened to change, and a hand over a link can
     // stand still for a minute.
     if let Some(cursor) = hub.cursor_now() {
-        let message = cursor_message(&cursor);
+        // The greeting's width and height are the picture this client is about to
+        // be shown, so the shape arrives with a place in those same pixels.
+        let message = cursor_message(&cursor, hub.cursor_in(width, height));
         if socket
             .send(Message::Text(message.to_string().into()))
             .await
