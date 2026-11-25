@@ -819,7 +819,42 @@ impl Server {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A slow link drops frames rather than growing without
+                    // bound, and `continue` left the client painting the rest of
+                    // its life from a screen that had lost a middle: the phone
+                    // showed a stale screen while the shell kept printing, and
+                    // only a resize (which asks for a repaint) put it right. So a
+                    // gap is repaired, not skipped: the client is cleared and
+                    // given the tail of the ring — the same frame an attach
+                    // sends — or, for a full-screen program, cleared and asked to
+                    // draw itself again.
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        let (resync, alt) = {
+                            let ring = writer_session
+                                .ring
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            let tracker = writer_session
+                                .modes
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            resync_frame(&tracker, &ring, eff_rows)
+                        };
+                        tracing::warn!(
+                            "terminal {}: the client fell {missed} frame(s) behind; resyncing its screen",
+                            writer_session.id
+                        );
+                        if writer.write_message(OP_BINARY, &resync).await.is_err() {
+                            return;
+                        }
+                        if alt {
+                            // The screen the program draws is the only one that
+                            // matters, so it is asked for rather than guessed.
+                            let _ = writer_session.pty.kick();
+                        }
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
                 if writer_session.cancel.is_cancelled() {
@@ -931,6 +966,25 @@ fn replay_frame(history: Option<Vec<u8>>, modes: &[u8], ring: &[u8], rows: u16) 
     let mut out = replay_reset(modes);
     out.extend_from_slice(&body);
     out
+}
+
+/// What a client that fell behind is sent, and whether it has to be asked to
+/// draw the screen it is on.
+///
+/// A subscriber's frames are dropped rather than queued without bound, so a slow
+/// link sees a gap in the middle of the stream. Continuing from there left the
+/// phone painting from a screen that no longer matched the shell, which read as
+/// a terminal that had stopped: no new lines, and the cursor in the wrong place.
+/// Only a resize — which asks for a repaint — put it right. The repair is the
+/// frame an attach sends: clear, then the modes and the tail of the ring, or for
+/// a full-screen program a clear and a kick.
+fn resync_frame(modes: &ModeTracker, ring: &[u8], rows: u16) -> (Vec<u8>, bool) {
+    let replay = modes.replay();
+    if modes.alt_screen() {
+        (replay_reset(&replay), true)
+    } else {
+        (replay_frame(None, &replay, ring, rows), false)
+    }
 }
 
 /// The bytes that clear a client's screen and put it in the modes the program
@@ -1119,6 +1173,7 @@ async fn close(
 #[cfg(test)]
 mod tests {
     use super::{reattach_kick, replay_frame};
+    use crate::modes::ModeTracker;
 
     #[test]
     fn a_resize_is_its_own_repaint() {
@@ -1237,6 +1292,29 @@ mod tests {
         let replay = replay_frame(None, b"", &wide, 3);
         let body = &replay[super::RIS_RESET.len()..];
         assert!(body.starts_with(b"\x1b[3"), "a byte cut began mid-sequence");
+    }
+
+    /// A client that fell 256 frames behind lost a piece of the middle of the
+    /// stream. Skipping the gap left it painting a screen that no longer matched
+    /// the shell; the repair is the frame an attach sends, so the resize that
+    /// used to be the only cure is no longer needed.
+    #[test]
+    fn a_client_that_fell_behind_is_given_the_screen_again() {
+        let modes = ModeTracker::new();
+        let (frame, alt) = super::resync_frame(&modes, b"last line\n", 24);
+        assert!(!alt, "a plain shell is repainted from its ring");
+        assert!(frame.starts_with(b"\x1bc"), "the client must clear first");
+        assert!(frame.ends_with(b"last line\n"), "and then be caught up");
+
+        let mut full_screen = ModeTracker::new();
+        full_screen.scan(b"\x1b[?1049h");
+        let (frame, alt) = super::resync_frame(&full_screen, b"cursor moves only", 24);
+        assert!(alt, "a full-screen program draws itself when asked");
+        assert_eq!(
+            frame,
+            b"\x1bc\x1b[?1049h".to_vec(),
+            "and its ring is not a screen to replay"
+        );
     }
 
     #[test]
