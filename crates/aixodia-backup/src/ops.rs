@@ -1891,6 +1891,19 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    /// A failed run used to keep its containers: twenty-two gigabytes per
+    /// failure on a tree this size. The scratch is a value now, so its drop is
+    /// the cleanup and no exit path can skip it.
+    #[test]
+    fn a_runs_containers_leave_with_the_run() {
+        let scratch = Scratch::new().expect("a scratch directory");
+        let path = scratch.path().to_path_buf();
+        std::fs::write(path.join("half.shard"), b"unfinished").unwrap();
+        assert!(path.is_dir());
+        drop(scratch);
+        assert!(!path.exists(), "the containers must not outlive the run");
+    }
+
     /// A scope that selects nothing used to publish an empty manifest over a
     /// good one and then prune the good one away. It must now stop before it
     /// touches the bucket at all — the endpoint below is never reachable, so a
