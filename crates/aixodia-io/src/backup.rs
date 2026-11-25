@@ -992,7 +992,8 @@ mod tests {
 
     /// An allowlist is stored and reported the way the exclusions are: an
     /// omitted field keeps what the engine holds, and an explicit empty list is
-    /// the operator answering "everything", not silence.
+    /// the operator answering "everything", not silence — and everything
+    /// really is the whole root, which is what the scan has to agree with.
     #[test]
     fn a_write_can_clear_all_selected_paths() {
         let previous: Stored =
@@ -1020,14 +1021,14 @@ mod tests {
             resolve(Some(&serde_json::to_string(&stored).unwrap()))
                 .includes
                 .is_empty(),
-            "and an empty selection resolves to no included paths"
+            "an empty list is stored as it was given"
         );
         assert!(
-            !aixodia_backup::scan::is_included(
+            aixodia_backup::scan::is_included(
                 "anything",
                 &resolve(Some(&serde_json::to_string(&stored).unwrap())).includes
             ),
-            "an empty selection must not include any path"
+            "an empty selection is no allowlist: the root itself is the scope"
         );
     }
 
