@@ -14,6 +14,15 @@ use crate::types::Turn;
 /// models the engine talks to, so the estimate has room to be wrong.
 pub const DEFAULT_MAX_TOKENS: i64 = 156_000;
 
+/// How much of the budget must be spent before a conversation is compacted.
+///
+/// Compacting only once the window was already over its budget meant every turn
+/// that reached it was answered by a provider refusing the request (or by a
+/// model silently truncating it) before the engine noticed. The window is
+/// trimmed while there is still room to answer in: one eighth of the budget is
+/// kept as slack for the next round's tool output.
+const COMPACT_DIVISOR: i64 = 8;
+
 /// What one attached picture is counted as.
 const IMAGE_TOKENS: i64 = 1_100;
 
@@ -172,7 +181,11 @@ pub fn compact(messages: &[Message], window: Window) -> (Vec<Message>, Option<Co
         window.max
     };
 
-    if window.size(messages) <= max {
+    // Nearly full is already too late to be free: the next round adds a tool
+    // output of unpredictable size, so the trim happens while an eighth of the
+    // budget is still unspent.
+    let trigger = max - max / COMPACT_DIVISOR;
+    if window.size(messages) <= trigger {
         return (messages.to_vec(), None);
     }
 
@@ -182,7 +195,10 @@ pub fn compact(messages: &[Message], window: Window) -> (Vec<Message>, Option<Co
     }
     let body = &messages[system..];
 
-    let budget = max - tokens(&messages[..system]);
+    // The trim leaves the window at the trigger point rather than at its brim:
+    // compacting back up to `max` would fill the room the trigger was meant to
+    // keep.
+    let budget = trigger - tokens(&messages[..system]);
     if budget <= 0 {
         return (messages.to_vec(), None);
     }
@@ -472,5 +488,28 @@ mod tests {
         let (compacted, report) = compact(&messages, Window::new(DEFAULT_MAX_TOKENS));
         assert_eq!(compacted.len(), messages.len());
         assert!(report.is_none());
+    }
+
+    /// The window is trimmed while it still fits, not after a provider has
+    /// refused the request: a conversation that has spent seven eighths of its
+    /// budget is compacted, one at half is not touched.
+    #[test]
+    fn a_window_that_is_nearly_full_is_compacted_before_it_overflows() {
+        // A 280-token budget is compacted from 245 tokens up: this history fits
+        // in the window and is still trimmed.
+        let old = user(&"old question ".repeat(40));
+        let new = user(&"new question ".repeat(40));
+        let sizes = tokens(&[old.clone(), new.clone()]);
+        assert!(sizes > 245 && sizes <= 280, "sizes = {sizes}");
+
+        let (kept, report) = compact(&[old.clone(), new.clone()], Window::new(280));
+        assert!(report.is_some(), "nearly full is compacted");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].content, new.content);
+
+        let small = vec![user("hi"), assistant("hello")];
+        let (untouched, none) = compact(&small, Window::new(280));
+        assert_eq!(untouched.len(), 2);
+        assert!(none.is_none());
     }
 }

@@ -150,6 +150,13 @@ pub trait ChatSink: Send {
     fn on_compact(&mut self, report: &aixodia_session::Compacted) {
         let _ = report;
     }
+    /// The goals and plans this chat is working through, as the request carries
+    /// them. It is said once per turn, at its start: the text does not change
+    /// while the turn runs, and a reader who joins the chat sees what the model
+    /// was told.
+    fn on_reminder(&mut self, text: &str) {
+        let _ = text;
+    }
     fn on_stored(&mut self, rows: &[Turn], error: Option<&str>) {
         let _ = (rows, error);
     }
@@ -961,6 +968,16 @@ impl ChatSink for SseSink {
         Ok(())
     }
 
+    fn on_reminder(&mut self, text: &str) {
+        write_sse(
+            &self.tx,
+            &json!({"tool_event": {
+                "stage": "reminder", "round": self.open_round,
+                "text": text,
+            }}),
+        );
+    }
+
     fn on_compact(&mut self, report: &aixodia_session::Compacted) {
         write_sse(
             &self.tx,
@@ -1135,6 +1152,9 @@ impl Gateway {
                 .await;
             if let Some(report) = compaction {
                 lock_sink(sink).on_compact(&report);
+            }
+            if round == 0 && !remind.text.is_empty() {
+                lock_sink(sink).on_reminder(&remind.text.clone());
             }
             conversation = messages.clone();
             let request = build_request(&current, &messages, options, sink, true);

@@ -1,9 +1,10 @@
-//! The transient goal and plan reminder.
+//! The goal and plan reminder.
 //!
-//! Port of the Go `io/gateway/remind.go`. The reminder is a transient user
-//! message: it is never stored in chat history or in the turn trail; it exists
-//! only in the request conversation, so the model sees the current lists without
-//! the phone showing an extra user bubble.
+//! Port of the Go `io/gateway/remind.go`. The reminder is a user message that
+//! lives in the request conversation only: it is never stored in chat history or
+//! in the turn trail. It used to be a tail note that was stripped and re-written
+//! every round; it is now placed once, at the head of the chat, and kept there
+//! for the whole conversation, so every round reads the same lists.
 
 use aixodia_goals::{Item, Kind};
 use aixodia_provider::Message;
@@ -44,13 +45,16 @@ pub fn strip_reminders(conversation: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-/// Puts one fresh reminder at the very end of the request, after room for it is
-/// left. The tail is the cache-friendly position: the next request keeps every
-/// earlier message as a prefix, so replacing the reminder only invalidates the
-/// last message instead of the user's question. The reminder is sized separately
-/// from the conversation so the newest turn always survives even when the window
-/// is tight.
-pub fn append_reminder(
+/// Puts the reminder at the head of the chat, after the identity block, and
+/// leaves it there for the whole conversation.
+///
+/// It used to be re-appended to the tail every round, which meant the model saw
+/// the goals and plans only from the round that wrote them on: an older copy was
+/// stripped away each time. A chat's goals are not a per-round note, they are
+/// what the chat is about, so the text stays where it is and every round reads
+/// it. The head is also a stable position — the prefix before it never moves, so
+/// the provider's prompt cache still covers the identity block.
+pub fn place_reminder(
     conversation: &[Message],
     text: &str,
     window: Window,
@@ -71,8 +75,14 @@ pub fn append_reminder(
     }
     let (compacted, report) = compact(&conversation, window);
     let whole = compacted.len() == conversation.len();
+    // After the identity block, before the first turn: the shortest prefix that
+    // can hold it, and the one that does not move when the thread grows.
+    let at = compacted
+        .iter()
+        .position(|message| message.role != "system")
+        .unwrap_or(compacted.len());
     let mut out = compacted;
-    out.push(reminder);
+    out.insert(at, reminder);
     (out, whole, report)
 }
 
@@ -126,7 +136,7 @@ impl Gateway {
         }
 
         if !state.text.is_empty() {
-            let (out, whole_conversation, report) = append_reminder(&base, &state.text, window);
+            let (out, whole_conversation, report) = place_reminder(&base, &state.text, window);
             let whole = whole_conversation && base.len() == conversation.len();
             return (out, whole, report);
         }
@@ -146,9 +156,14 @@ impl Gateway {
         if session_id.trim().is_empty() {
             return Ok((String::new(), false));
         }
-        let items = store.open(session_id).await?;
-        let active = !items.is_empty();
-        Ok((format_reminder(&items), active))
+        // Every item, whatever its status: a goal that was completed or dropped
+        // is still part of what this chat did, and removing it from the list
+        // made the model (and the reader) forget the work that had been done.
+        let items = store.all(session_id).await?;
+        // A chat whose goals are all done still has goals: the list is shown for
+        // as long as the chat has anything in it, because nothing is removed.
+        let wanted = !items.is_empty();
+        Ok((format_reminder(&items), wanted))
     }
 }
 
@@ -156,7 +171,14 @@ pub fn format_reminder(items: &[Item]) -> String {
     let mut goals_list: Vec<String> = Vec::new();
     let mut plans_list: Vec<String> = Vec::new();
     for item in items {
-        let line = format!("- [{}] {}", item.id, item.content);
+        // The status is on every line: "done" and "dropped" are how the work
+        // reads back, and they are kept rather than removed from the list.
+        let mark = match item.status.as_str() {
+            aixodia_goals::STATUS_DONE => "done",
+            aixodia_goals::STATUS_DROPPED => "dropped",
+            _ => "open",
+        };
+        let line = format!("- [{}] {} · {}", item.id, mark, item.content);
         if item.kind == Kind::Plan.as_str() {
             plans_list.push(line);
         } else {
@@ -167,9 +189,11 @@ pub fn format_reminder(items: &[Item]) -> String {
     let mut out = String::new();
     out.push_str(REMINDER_OPEN);
     out.push_str(
-        "\nActive goals and plans in this chat. Keep them in mind; call goal_* or plan_* when one changes. ",
+        "\nThis chat's goals and plans, with the status of each. Keep them in mind; call goal_* or plan_* when one changes. ",
     );
-    out.push_str("Completed and dropped items are removed from this list.\n");
+    out.push_str(
+        "Nothing is removed from this list: completed and dropped items keep their place.\n",
+    );
     out.push_str("\nGoals:\n");
     if goals_list.is_empty() {
         out.push_str("- none\n");
@@ -221,11 +245,13 @@ mod tests {
     #[test]
     fn the_reminder_goes_last() {
         let conversation = vec![user("hello"), user("again")];
-        let (out, whole, report) = append_reminder(&conversation, "REM", Window::new(0));
+        let (out, whole, report) = place_reminder(&conversation, "REM", Window::new(0));
         assert!(whole);
         assert!(report.is_none());
         assert_eq!(out.len(), 3);
-        assert_eq!(out.last().expect("reminder").content, "REM");
+        // The reminder leads the conversation: it is what the chat is about, and
+        // it stays for every round instead of being re-appended to the tail.
+        assert_eq!(out.first().expect("reminder").content, "REM");
     }
 
     #[test]
@@ -247,8 +273,46 @@ mod tests {
         let text = format_reminder(&items);
         assert!(text.starts_with(REMINDER_OPEN));
         assert!(text.ends_with(REMINDER_CLOSE));
-        assert!(text.contains("Goals:\n- [g1] ship it\n"));
-        assert!(text.contains("Plans:\n- [p1] write tests\n"));
+        assert!(text.contains("Goals:\n- [g1] open · ship it\n"));
+        assert!(text.contains("Plans:\n- [p1] open · write tests\n"));
+    }
+
+    #[test]
+    fn finished_items_keep_their_place_with_their_status() {
+        // The point of the change: a completed or dropped item is not deleted
+        // from the reminder, it is marked.
+        let items = vec![
+            Item {
+                id: "g1".to_string(),
+                kind: "goal".to_string(),
+                content: "ship it".to_string(),
+                status: aixodia_goals::STATUS_DONE.to_string(),
+            },
+            Item {
+                id: "p1".to_string(),
+                kind: "plan".to_string(),
+                content: "write tests".to_string(),
+                status: aixodia_goals::STATUS_DROPPED.to_string(),
+            },
+        ];
+        let text = format_reminder(&items);
+        assert!(text.contains("- [g1] done · ship it"), "{text}");
+        assert!(text.contains("- [p1] dropped · write tests"), "{text}");
+        assert!(text.contains("Nothing is removed"), "{text}");
+    }
+
+    #[test]
+    fn the_reminder_stays_at_the_head_and_is_not_duplicated() {
+        // Two rounds in a row: the text is placed once, at the head, and the
+        // earlier copy is replaced rather than kept beside the new one.
+        let note = |text: &str| format!("{REMINDER_OPEN}\n{text}\n{REMINDER_CLOSE}");
+        let first = vec![user("hello"), user("again")];
+        let (one, _, _) = place_reminder(&first, &note("REM-1"), Window::new(0));
+        let (two, _, _) = place_reminder(&one, &note("REM-2"), Window::new(0));
+        assert_eq!(two.len(), 3);
+        assert_eq!(two.iter().filter(|m| is_reminder(m)).count(), 1);
+        assert_eq!(two[0].content, note("REM-2"));
+        assert_eq!(two[1].content, "hello");
     }
 
     #[test]

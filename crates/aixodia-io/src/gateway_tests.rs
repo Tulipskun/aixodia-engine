@@ -2612,6 +2612,107 @@ async fn a_daemon_with_no_stored_settings_defaults_to_the_keyless_opencode() {
     );
 }
 
+/// A goal that is done is still part of the chat: the reminder the model reads
+/// keeps every item with its status, it sits at the head of the request rather
+/// than at the tail, and the same text is sent to the reader as a frame so the
+/// app can draw the list the model was given.
+#[tokio::test]
+async fn the_goal_reminder_keeps_finished_items_and_leads_the_request() {
+    use aixodia_goals::{Kind, MemoryStore, Store};
+    let _guard = config_lock().lock().unwrap();
+
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let captured = seen.clone();
+    let upstream = Router::new().fallback(move |request: Request<Body>| {
+        let captured = captured.clone();
+        async move {
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            *captured.lock().unwrap() = String::from_utf8_lossy(&body).to_string();
+            let sse = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}],",
+                "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":2,\"total_tokens\":102}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.to_string(),
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, upstream).await;
+    });
+    install_provider("mock", &format!("http://{addr}"), &["test-key"], "openai").await;
+
+    let objectives = Arc::new(MemoryStore::default());
+    let goal = objectives
+        .add("s1", Kind::Goal, "ship the reminder")
+        .await
+        .expect("add");
+    objectives
+        .complete("s1", Kind::Goal, &goal)
+        .await
+        .expect("complete");
+    objectives
+        .add("s1", Kind::Plan, "keep every item")
+        .await
+        .expect("add");
+
+    let store = Arc::new(MemStore::new());
+    let gateway = Arc::new(Gateway::new(
+        store,
+        Arc::new(aixodia_provider::Registry::new()),
+        tools_with(None),
+    ));
+    gateway.set_objective_store(objectives);
+    post_json(
+        &gateway.router(),
+        "/api/sessions",
+        r#"{"title":"t","model":"mock/test-model"}"#,
+    )
+    .await;
+    let (_, body) = post_json(
+        &gateway.router(),
+        "/api/chat/completions",
+        r#"{"session_id":"s1","model":"mock/test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+    )
+    .await;
+
+    // The request itself: the reminder is the second message, right after the
+    // daemon's own prompt, and it names the finished goal.
+    let request: Value = serde_json::from_str(&seen.lock().unwrap()).expect("request json");
+    let messages = request["messages"].as_array().expect("messages");
+    assert_eq!(messages[0]["role"], "system", "request = {request}");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("<system-remind>"),
+        "the reminder must follow the identity block: {request}"
+    );
+    let reminder = messages[1]["content"].as_str().unwrap_or_default();
+    assert!(reminder.contains("done · ship the reminder"), "{reminder}");
+    assert!(reminder.contains("open · keep every item"), "{reminder}");
+
+    // And the reader's copy: one frame carrying the same text.
+    let frames: Vec<Value> = sse_events(&body)
+        .into_iter()
+        .filter_map(|event| event.get("tool_event").cloned())
+        .filter(|event| event["stage"] == "reminder")
+        .collect();
+    assert_eq!(frames.len(), 1, "reminder frames = {frames:?}\n{body}");
+    assert_eq!(
+        frames[0]["text"], reminder,
+        "the frame is the request's text"
+    );
+}
+
 #[tokio::test]
 async fn the_objectives_endpoint_splits_goals_from_plans() {
     // The app's goals card reads this one route, so the split by kind and the
