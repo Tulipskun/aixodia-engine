@@ -108,8 +108,15 @@ fn selected_by_rules(rel: &str, includes: &[String]) -> bool {
 }
 
 /// true when rel is selected or is an ancestor needed to reach a selected path.
-/// An empty list selects nothing.
+///
+/// An empty list is no allowlist at all: the backup covers the root it was
+/// configured with. It used to select nothing, which made a fresh configuration
+/// publish an empty manifest over a good one — the bucket kept every object and
+/// the manifest named none of them.
 pub fn is_included(rel: &str, includes: &[String]) -> bool {
+    if includes.is_empty() {
+        return true;
+    }
     if selected_by_rules(rel, includes) {
         return true;
     }
@@ -537,11 +544,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_includes_selects_nothing() {
-        // No selection means no entries are selected.
+    fn empty_includes_selects_the_whole_root() {
+        // No allowlist means the root is the scope, not an empty set.
         let includes: Vec<String> = Vec::new();
-        assert!(!is_included("anything/at/all", &includes));
-        assert!(!is_included("target/x", &includes));
+        assert!(is_included("anything/at/all", &includes));
+        assert!(is_included("target/x", &includes));
     }
 
     #[test]

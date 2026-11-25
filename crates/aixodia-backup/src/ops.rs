@@ -148,23 +148,25 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
             cfg.root.display()
         )));
     }
-    let hub = Hub::new(cfg)?;
-
-    reporter.set(Phase::Scanning, "reading the previous manifest");
-    let previous = latest_manifest(&hub)?;
-    // Paths in a manifest are relative to its root. Reusing hashes or carrying
-    // entries forward across a root change would silently map old files elsewhere.
-    let compatible_previous = previous
-        .as_ref()
-        .filter(|manifest| manifest.root == cfg.root.display().to_string());
-    let mut known: HashSet<String> = HashSet::new();
-    match compatible_previous {
-        Some(manifest) => known.extend(manifest.absolute(&cfg.prefix)),
-        None => reporter.set(Phase::Scanning, "no previous backup: this one is full"),
-    }
-
     let mut skipped = Vec::new();
     let scanned: Vec<Scanned> = scan::scan(&cfg.root, &cfg.excludes, &cfg.includes, &mut skipped)?;
+    // A scope that selects nothing is not a backup of an empty machine, it is a
+    // mistake — an empty allowlist, or exclusions that swallowed the tree. It
+    // used to publish an empty manifest over a good one and then prune the good
+    // one away, so the bucket kept every object and the manifest named none of
+    // them: a restore would have rebuilt nothing. Refuse before anything is
+    // written, and say which knob to look at.
+    if scanned.is_empty() {
+        return Err(Error::Config(format!(
+            "nothing to back up: the scope selects no file under {}{}",
+            cfg.root.display(),
+            if cfg.includes.is_empty() {
+                " (the allowlist is empty, so no path is included)".to_string()
+            } else {
+                format!(" (allowlist: {})", cfg.includes.join(", "))
+            }
+        )));
+    }
     // Name the scope in the progress line. An operator who narrowed the allowlist
     // and sees the whole tree's count would assume their pick did nothing; the
     // number alone cannot tell a narrow scope from a broken one.
@@ -181,6 +183,21 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
             cfg.root.display()
         ),
     );
+
+    let hub = Hub::new(cfg)?;
+
+    reporter.set(Phase::Scanning, "reading the previous manifest");
+    let previous = latest_manifest(&hub)?;
+    // Paths in a manifest are relative to its root. Reusing hashes or carrying
+    // entries forward across a root change would silently map old files elsewhere.
+    let compatible_previous = previous
+        .as_ref()
+        .filter(|manifest| manifest.root == cfg.root.display().to_string());
+    let mut known: HashSet<String> = HashSet::new();
+    match compatible_previous {
+        Some(manifest) => known.extend(manifest.absolute(&cfg.prefix)),
+        None => reporter.set(Phase::Scanning, "no previous backup: this one is full"),
+    }
 
     let mut unreadable = Vec::new();
     let mut plan = scan::plan(
@@ -1853,6 +1870,43 @@ mod tests {
     use crate::ShardRef;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    /// A scope that selects nothing used to publish an empty manifest over a
+    /// good one and then prune the good one away. It must now stop before it
+    /// touches the bucket at all — the endpoint below is never reachable, so a
+    /// passing test also proves no request was made.
+    #[test]
+    fn a_scope_that_selects_nothing_is_refused_before_the_bucket_is_touched() {
+        let dir = std::env::temp_dir().join(format!(
+            "aixodia-empty-scope-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("kept")).unwrap();
+        std::fs::write(dir.join("kept/one.txt"), b"hello").unwrap();
+
+        let cfg = Config {
+            token: "hf_test".into(),
+            bucket: "nobody/nowhere".into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            root: dir.clone(),
+            prefix: "aixodia/root".into(),
+            excludes: Vec::new(),
+            includes: vec!["not-this-folder".into()],
+            timeout_secs: 10,
+        };
+        let err = backup(&cfg, &Reporter::default()).unwrap_err().to_string();
+        assert!(
+            err.contains("the scope selects no file"),
+            "the refusal must name the disease, got {err:?}"
+        );
+        assert!(
+            err.contains("not-this-folder"),
+            "the message must name the scope"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn sha(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};

@@ -22,6 +22,16 @@ use crate::{
 const BATCH_OPS: usize = 500;
 /// Paths per `/paths-info` request, which is what the hub itself uses.
 const PATHS_INFO_BATCH: usize = 1000;
+/// How many times a throttled metadata request is asked again, and the longest
+/// single wait it will accept. A bucket answers `429` under a burst — a
+/// `paths-info` on a thousand keys is exactly such a burst — and the run that
+/// met it has already walked and hashed the whole tree by then. Treating the
+/// first refusal as final threw that work away and made every backup of a large
+/// tree fail at the last step. The waits double, so six of them cover the two
+/// minutes a burst window lasts; the hub's own `Retry-After` wins when it names
+/// one.
+const RETRIES: usize = 6;
+const RETRY_WAIT_MAX_SECS: u64 = 60;
 
 /// One file as the bucket reports it.
 #[derive(Clone, Debug)]
@@ -166,6 +176,48 @@ impl Hub {
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
     }
 
+    /// Sends a request, and asks again while the hub says "too many too fast".
+    ///
+    /// The wait is the hub's own `Retry-After` when the reply names one, and
+    /// otherwise 2s, 4s, 8s, 16s — the same ladder a restore uses, because the
+    /// two are refused by the same limiter. `408`, `429` and `503` are the only
+    /// statuses retried: everything else is an answer, not a delay. The body is
+    /// returned whole so a caller can decide whether a successful status still
+    /// carries a refusal.
+    fn attempt(
+        &self,
+        operation: &str,
+        key: &str,
+        mut build: impl FnMut() -> reqwest::blocking::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, http::HeaderMap, Vec<u8>)> {
+        let mut retried = 0;
+        loop {
+            let response = build().send()?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .map(|secs| Duration::from_secs_f64(secs.clamp(0.0, RETRY_WAIT_MAX_SECS as f64)));
+            let body = response.bytes()?.to_vec();
+            let throttled = matches!(status.as_u16(), 408 | 429 | 503);
+            if !throttled || retried >= RETRIES {
+                return Ok((status, headers, body));
+            }
+            let wait = retry_after.unwrap_or_else(|| {
+                Duration::from_secs((2u64 << retried.min(5)).min(RETRY_WAIT_MAX_SECS))
+            });
+            tracing::warn!(
+                "backup: {operation} on {key} was refused with {status}; asking again in {}s",
+                wait.as_secs_f64()
+            );
+            std::thread::sleep(wait);
+            retried += 1;
+        }
+    }
+
     /// `key` must already be percent-encoded for the URL, and `operation` is
     /// what a failure names itself as.
     fn check(status: reqwest::StatusCode, body: String, operation: &str, key: &str) -> Result<()> {
@@ -186,13 +238,13 @@ impl Hub {
         let mut out = Vec::new();
         let mut url = format!("{}/tree/{}?recursive=true", self.api, encode_key(prefix));
         loop {
-            let response = self
-                .get(&url)
-                .header(USER_AGENT, "aixodia-engine-backup")
-                .send()?;
-            let status = response.status();
-            let link = link_next(response.headers());
-            let body = response.text()?;
+            let page_url = url.clone();
+            let (status, headers, raw) = self.attempt("list", prefix, || {
+                self.get(&page_url)
+                    .header(USER_AGENT, "aixodia-engine-backup")
+            })?;
+            let body = String::from_utf8_lossy(&raw).to_string();
+            let link = link_next(&headers);
             Self::check(status, body.clone(), "list", prefix)?;
             let page: Vec<TreeItem> = serde_json::from_str(&body)
                 .map_err(|e| Error::Manifest(prefix.to_string(), e.to_string()))?;
@@ -217,12 +269,14 @@ impl Hub {
     pub fn existing_keys(&self, keys: &[String]) -> Result<Vec<String>> {
         let mut found = Vec::new();
         for chunk in keys.chunks(PATHS_INFO_BATCH) {
-            let response = self
-                .post(&format!("{}/paths-info", self.api))
-                .json(&serde_json::json!({ "paths": chunk }))
-                .send()?;
-            let status = response.status();
-            let body = response.text()?;
+            let payload = serde_json::json!({ "paths": chunk }).to_string();
+            let (status, _, raw) =
+                self.attempt("paths-info", &format!("{} keys", chunk.len()), || {
+                    self.post(&format!("{}/paths-info", self.api))
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(payload.clone())
+                })?;
+            let body = String::from_utf8_lossy(&raw).to_string();
             Self::check(
                 status,
                 body.clone(),
@@ -249,25 +303,21 @@ impl Hub {
     /// as a failed run in seconds rather than as silence for two minutes.
     pub fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let url = format!("{}/{}", self.resolve, encode_key(key));
-        let response = self
-            .get(&url)
-            .timeout(Duration::from_secs(self.window))
-            .send()?;
-        let status = response.status();
+        let (status, _, body) = self.attempt("download", key, || {
+            self.get(&url).timeout(Duration::from_secs(self.window))
+        })?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !status.is_success() {
-            let body = response.text().unwrap_or_default();
             return Err(Error::Hub {
                 operation: "download".into(),
                 key: key.to_string(),
                 status: status.as_u16(),
-                body: trim_body(&body),
+                body: trim_body(&String::from_utf8_lossy(&body)),
             });
         }
-        let body = response.bytes()?;
-        Ok(Some(body.to_vec()))
+        Ok(Some(body))
     }
 
     /// Registers `items` as files: `(key, xet hash, modification time in
@@ -314,13 +364,12 @@ impl Hub {
     }
 
     fn batch(&self, operation: &str, payload: &str, sent: usize) -> Result<()> {
-        let response = self
-            .post(&format!("{}/batch", self.api))
-            .header(CONTENT_TYPE, "application/x-ndjson")
-            .body(payload.to_string())
-            .send()?;
-        let status = response.status();
-        let body = response.text()?;
+        let (status, _, raw) = self.attempt(operation, &format!("{sent} keys"), || {
+            self.post(&format!("{}/batch", self.api))
+                .header(CONTENT_TYPE, "application/x-ndjson")
+                .body(payload.to_string())
+        })?;
+        let body = String::from_utf8_lossy(&raw).to_string();
         // A bucket batch answers 200 with the operations it refused, so the
         // status alone never tells the whole story.
         if status.is_success() || status.as_u16() == 422 {
@@ -491,6 +540,59 @@ mod tests {
         assert_eq!(download_timeout_secs(3600), DOWNLOAD_TIMEOUT_MAX);
         assert_eq!(download_timeout_secs(1), DOWNLOAD_TIMEOUT_SECS);
         assert_eq!(download_timeout_secs(45), 45);
+    }
+
+    /// The bucket answers `429` under a burst, and the run that met it has
+    /// already walked the whole tree. A refusal that names a wait is waited out;
+    /// a refusal that does not is asked again on the ladder; and a request that
+    /// is refused every time still ends as an error rather than a hang.
+    #[test]
+    fn a_throttled_request_is_asked_again_and_its_own_wait_is_obeyed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let addr = listener.local_addr().expect("an address");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let reply = if attempt == 0 {
+                    // A wait the hub names itself, one second long.
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 3\r\nConnection: close\r\n\r\nno\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+
+        let cfg = Config {
+            token: "hf_test".into(),
+            bucket: "nobody/nowhere".into(),
+            endpoint: format!("http://{addr}"),
+            root: std::path::PathBuf::from("/tmp"),
+            prefix: "aixodia/root".into(),
+            excludes: Vec::new(),
+            includes: Vec::new(),
+            timeout_secs: 10,
+        };
+        let hub = Hub::new(&cfg).expect("a hub");
+        let held = hub
+            .existing_keys(&["aixodia/root/objects/aa/b".to_string()])
+            .expect("a refused request is asked again, not failed");
+        assert!(held.is_empty());
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "the second ask is the one that lands"
+        );
     }
 
     /// A small file's wait is bounded by its size, not by the allowance; a large
