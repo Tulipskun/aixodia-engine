@@ -223,14 +223,14 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
     // round trips, and nineteen thousand of them is the eight minutes the operator
     // is not willing to wait out. This runs before the object list is read, since
     // a packed entry names no object of its own.
-    let scratch = scratch_dir()?;
+    let scratch = Scratch::new()?;
     let mut lost: Vec<String> = Vec::new();
     let mut shards = pack_shards(
         cfg,
         &mut plan.entries,
         compatible_previous,
         &known,
-        &scratch,
+        scratch.path(),
         reporter,
         &mut lost,
     )?;
@@ -435,7 +435,7 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
             reporter,
             &shards,
             &missing_shards,
-            &scratch,
+            scratch.path(),
             &manifest.entries,
         )?;
         uploaded_bytes += upload_objects(&hub, cfg, reporter, &missing_objects, &owners)?;
@@ -507,10 +507,6 @@ pub fn backup(cfg: &Config, reporter: &Reporter) -> Result<BackupReport> {
         stale.len()
     };
 
-    // The containers were only ever a way to get bytes onto the wire. The scratch
-    // holds them until the manifest that names them is published, and nothing after.
-    let _ = fs::remove_dir_all(&scratch);
-
     let shards_reused = shards.iter().filter(|s| s.temp.is_none()).count();
     let packed = shards.iter().map(|s| s.members).sum::<usize>();
     reporter.set(
@@ -569,6 +565,30 @@ fn scratch_dir() -> Result<PathBuf> {
         source,
     })?;
     Ok(dir)
+}
+
+/// A run's containers, removed when the run ends however it ends.
+///
+/// The success path deleted them and an error path did not, so every failed
+/// backup of this tree left twenty-two gigabytes of containers behind — twice
+/// over on the host this was found on, which is forty-four gigabytes the disk
+/// never got back. A `Drop` cannot be forgotten.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Result<Self> {
+        scratch_dir().map(Self)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Put every file the manifest names into a shard, and say which.
@@ -1018,7 +1038,7 @@ pub fn restore(cfg: &Config, root: &Path, reporter: &Reporter) -> Result<Restore
     // Where a container is held while its members are taken out of it. Not in the
     // tree: what appears there is what the manifest names, and a shard is nobody's
     // file. A v1 restore never writes in it.
-    let scratch = scratch_dir()?;
+    let scratch = Scratch::new()?;
 
     // The unit of work is a range request, not a file. The bucket answers a
     // download at a fraction of a megabyte per second per connection, so one
@@ -1185,7 +1205,7 @@ pub fn restore(cfg: &Config, root: &Path, reporter: &Reporter) -> Result<Restore
             }
             continue;
         }
-        let temp = scratch.join(format!("restore-{at}.shard"));
+        let temp = scratch.path().join(format!("restore-{at}.shard"));
         let ranges = ranges_for(shard.size);
         let index = slots.len();
         slots.push(Slot {
@@ -1284,8 +1304,8 @@ pub fn restore(cfg: &Config, root: &Path, reporter: &Reporter) -> Result<Restore
         );
     }
     // The containers were only ever a way to get many files down at once. What the
-    // tree holds afterwards is what the manifest names.
-    let _ = fs::remove_dir_all(&scratch);
+    // tree holds afterwards is what the manifest names, and the scratch leaves with
+    // the run.
     Ok(RestoreReport {
         name: manifest.name.clone(),
         root: root.display().to_string(),
